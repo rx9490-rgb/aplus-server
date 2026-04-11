@@ -182,7 +182,8 @@ function formatUser(u) {
 const sseClients = new Set();
 
 function broadcastEvent(data) {
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
+  const eventType = data.type || "message";
+  const msg = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const client of sseClients) {
     try { client.write(msg); } catch { sseClients.delete(client); }
   }
@@ -391,7 +392,7 @@ app.post("/api/ads", async (req, res) => {
         [adId,b.title||null,b.text||null,b.type||"text",b.imageData||null,b.videoUrl||null,b.link||null,
          b.active!==false,b.startDelay||180,b.interval||600,b.autoDismiss||null,b.startTime||null,b.endTime||null,Date.now()]);
     }
-    broadcastEvent({ type: "ads_updated" });
+    broadcastEvent({ type: "ad_added", id: adId, title: b.title||null, text: b.text||null, type: b.type||"text", imageData: b.imageData||null, videoUrl: b.videoUrl||null, link: b.link||null, active: b.active!==false, startDelay: b.startDelay||180, interval: b.interval||600, autoDismiss: b.autoDismiss||null });
     res.json({ ok: true, id: adId });
   } catch { res.status(500).json({ error: "server error" }); }
 });
@@ -400,7 +401,7 @@ app.delete("/api/ads/:id", async (req, res) => {
   try {
     if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
     await db.query("DELETE FROM ads WHERE ad_id=$1", [req.params.id]);
-    broadcastEvent({ type: "ads_updated" });
+    broadcastEvent({ type: "ad_deleted", id: req.params.id });
     res.json({ ok: true });
   } catch { res.status(500).json({ error: "server error" }); }
 });
@@ -418,7 +419,7 @@ app.patch("/api/ads/:id", async (req, res) => {
       vals.push(req.params.id);
       await db.query(`UPDATE ads SET ${updates.join(",")} WHERE ad_id=$${i}`, vals);
     }
-    broadcastEvent({ type: "ads_updated" });
+    broadcastEvent({ type: "ad_toggled", id: req.params.id, active: req.body.active });
     res.json({ ok: true });
   } catch { res.status(500).json({ error: "server error" }); }
 });
@@ -603,7 +604,7 @@ app.post("/api/broadcast", async (req, res) => {
   try {
     if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
     const { message, type } = req.body;
-    broadcastEvent({ type: "broadcast", message, notifType: type || "info" });
+    broadcastEvent({ type: "broadcast_msg", message, type: type || "info" });
     res.json({ ok: true, msg: "Broadcast sent" });
   } catch { res.status(500).json({ ok: false }); }
 });
