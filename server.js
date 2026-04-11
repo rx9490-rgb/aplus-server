@@ -102,6 +102,11 @@ async function initDB() {
       key TEXT PRIMARY KEY,
       value JSONB
     );
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_email TEXT PRIMARY KEY,
+      settings JSONB DEFAULT '{}',
+      updated_at BIGINT DEFAULT 0
+    );
   `);
 
   // seed admin
@@ -477,6 +482,34 @@ app.post("/api/settings", async (req, res) => {
     broadcastEvent({ type: "settings_updated", key, value });
     res.json({ ok: true });
   } catch { res.status(500).json({ error: "server error" }); }
+});
+
+// ── User Settings (per-user sync) ────────────────────────────
+app.get("/api/user/settings", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user) return res.json({ ok: false, settings: {} });
+    const result = await db.query("SELECT settings FROM user_settings WHERE user_email=$1", [user.email]);
+    const settings = result.rows.length > 0 ? result.rows[0].settings : {};
+    res.json({ ok: true, settings });
+  } catch { res.json({ ok: false, settings: {} }); }
+});
+
+app.post("/api/user/settings", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user) return res.json({ ok: false });
+    const { settings } = req.body;
+    if (!settings || typeof settings !== "object") return res.json({ ok: false });
+    const allowed = ["theme", "lang", "brightness", "groq_api_key_enc", "google_translate_key"];
+    const filtered = {};
+    for (const k of allowed) { if (settings[k] !== undefined) filtered[k] = settings[k]; }
+    await db.query(
+      "INSERT INTO user_settings (user_email, settings, updated_at) VALUES ($1,$2,$3) ON CONFLICT (user_email) DO UPDATE SET settings=user_settings.settings || $2::jsonb, updated_at=$3",
+      [user.email, JSON.stringify(filtered), Date.now()]
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ ok: false }); }
 });
 
 // ── Users ────────────────────────────────────────────────────
