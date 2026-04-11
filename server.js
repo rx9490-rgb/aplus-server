@@ -484,6 +484,25 @@ app.post("/api/settings", async (req, res) => {
   } catch { res.status(500).json({ error: "server error" }); }
 });
 
+app.put("/api/settings", async (req, res) => {
+  try {
+    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    const body = req.body || {};
+    const skip = ["adminKey"];
+    const updates = {};
+    for (const [k, v] of Object.entries(body)) {
+      if (skip.includes(k)) continue;
+      await db.query("INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2",
+        [k, JSON.stringify(v)]);
+      updates[k] = v;
+    }
+    if (Object.keys(updates).length > 0) {
+      broadcastEvent({ type: "settings", ...updates });
+    }
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "server error" }); }
+});
+
 // ── User Settings (per-user sync) ────────────────────────────
 app.get("/api/user/settings", async (req, res) => {
   try {
