@@ -13,6 +13,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import pg from "pg";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import nodemailer from "nodemailer";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -193,12 +194,19 @@ function checkAdmin(req) {
 }
 
 // ══════════════════════════════════════════════
-// إرسال إيميل استعادة كلمة المرور عبر Resend API
+// إرسال إيميل استعادة كلمة المرور عبر Gmail SMTP
 // ══════════════════════════════════════════════
-const RESEND_API_KEY   = process.env.RESEND_API_KEY   || "";
-const RESEND_FROM      = process.env.RESEND_FROM      || "onboarding@resend.dev";
+const GMAIL_USER  = process.env.GMAIL_USER  || "";
+const GMAIL_PASS  = process.env.GMAIL_APP_PASS || "";
 // FRONTEND_URL: رابط صفحة reset-password.html (يمكن تغييره لرابط Netlify)
-const FRONTEND_URL     = process.env.FRONTEND_URL     || "https://aplus-server-w6wb.onrender.com";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://aplus-server-w6wb.onrender.com";
+
+function _createMailTransport() {
+  return nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: GMAIL_USER, pass: GMAIL_PASS }
+  });
+}
 
 async function sendResetEmail(toEmail, token, fullName) {
   const resetLink = `${FRONTEND_URL}/reset-password.html?token=${token}`;
@@ -262,31 +270,19 @@ async function sendResetEmail(toEmail, token, fullName) {
 </body>
 </html>`;
 
-  if (!RESEND_API_KEY) {
-    // وضع التطوير — اطبع الرابط في الـ console
-    console.log(`\n📧 [DEV - لا يوجد RESEND_API_KEY]\nرابط الاستعادة: ${resetLink}\n`);
+  if (!GMAIL_USER || !GMAIL_PASS) {
+    console.log(`\n📧 [DEV - لا يوجد Gmail]\nرابط الاستعادة: ${resetLink}\n`);
     return true;
   }
 
   try {
-    const resp = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${RESEND_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        from: RESEND_FROM,
-        to: [toEmail],
-        subject: "🔑 استعادة كلمة المرور — A+ الطبي",
-        html: htmlBody
-      })
+    const transporter = _createMailTransport();
+    await transporter.sendMail({
+      from: `"A+ الطبي" <${GMAIL_USER}>`,
+      to: toEmail,
+      subject: "🔑 استعادة كلمة المرور — A+ الطبي",
+      html: htmlBody
     });
-    const data = await resp.json();
-    if (!resp.ok) {
-      console.error("❌ خطأ Resend:", data);
-      return false;
-    }
     console.log(`✅ إيميل استعادة أُرسل إلى: ${toEmail}`);
     return true;
   } catch (err) {
