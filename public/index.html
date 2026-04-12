@@ -1342,8 +1342,14 @@ input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary)
         
         <div id="pasteTextArea" style="display:none;margin-top:0.6rem;">
           <textarea id="pasteInput" placeholder="الصق نصك هنا مباشرة (محاضرة، كتاب، ملاحظات...)..." style="width:100%;min-height:120px;border-radius:0.8rem;border:1.5px solid var(--primary);background:var(--input-bg,#1e2030);color:var(--text);padding:0.8rem;font-size:0.9rem;resize:vertical;box-sizing:border-box;direction:auto;font-family:inherit;"></textarea>
-          <button onclick="savePastedText()" class="btn" style="margin-top:0.5rem;width:100%;background:var(--primary);"><i class="fas fa-check"></i> حفظ النص واستخدامه</button>
-          <button onclick="document.getElementById('pasteTextArea').style.display='none'" class="btn-outline btn" style="margin-top:0.3rem;width:100%;font-size:0.8rem;">إلغاء</button>
+          <button onclick="_handlePasteSubmit()" class="btn" style="margin-top:0.5rem;width:100%;background:var(--primary);"><i class="fas fa-check"></i> حفظ النص واستخدامه</button>
+          <div id="pasteChoiceBox" style="display:none;margin-top:0.5rem;border:1.5px solid var(--primary);border-radius:0.8rem;padding:0.7rem;background:rgba(124,58,237,0.1);">
+            <div style="color:var(--text);font-size:0.85rem;margin-bottom:0.5rem;text-align:center;">📂 لديك ملف محمّل — ماذا تريد؟</div>
+            <button onclick="_commitPastedText('append')" class="btn" style="width:100%;margin-bottom:0.4rem;background:#059669;font-size:0.82rem;"><i class="fas fa-plus"></i> أضف كملاحظات على الملف الحالي</button>
+            <button onclick="_commitPastedText('new')" class="btn" style="width:100%;background:#7c3aed;font-size:0.82rem;"><i class="fas fa-file-alt"></i> استخدم كنص جديد مستقل</button>
+            <button onclick="document.getElementById('pasteChoiceBox').style.display='none'" class="btn-outline btn" style="width:100%;margin-top:0.3rem;font-size:0.78rem;">إلغاء</button>
+          </div>
+          <button onclick="document.getElementById('pasteTextArea').style.display='none';document.getElementById('pasteChoiceBox').style.display='none';" class="btn-outline btn" style="margin-top:0.3rem;width:100%;font-size:0.8rem;">إلغاء</button>
         </div>
         <button onclick="let p=document.getElementById('pasteTextArea');p.style.display=p.style.display==='none'?'block':'none';if(p.style.display==='block')document.getElementById('pasteInput').focus();" class="btn-outline btn" style="margin-top:0.5rem;width:100%;font-size:0.85rem;"><i class="fas fa-paste"></i> أو الصق النص مباشرة</button>
         <input type="file" id="imageUploadInput" accept="image/*" style="display:none">
@@ -1755,7 +1761,7 @@ input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary)
     <div class="service-page-wrapper" style="display:flex;flex-direction:column;height:calc(100vh - 130px);">
       <div class="medical-disclaimer" style="margin-bottom:0.5rem;">
         <i class="fas fa-exclamation-triangle"></i>
-        <span>تنبيه: هذا المحتوى للأغراض التعليمية فقط، ولا يُستخدم كبديل للاستشارة الطبية أو التشخيص من قبل طبيب مختص.</span>
+        <span>⚠️ تنبيه: ردود المساعد لأغراض تعليمية وبحثية — لا تُستخدم بديلاً عن استشارة طبيب مختص. تحقق دائماً من المعلومات الطبية الحساسة قبل تطبيقها.</span>
       </div>
       <div id="chatMessages" style="flex:1;overflow-y:auto;padding:0.8rem;background:var(--content-box-bg);border-radius:0.8rem;margin-bottom:0.8rem;">
         <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;opacity:0.7;">
@@ -2189,7 +2195,7 @@ input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary)
 
       <div class="medical-disclaimer">
         <i class="fas fa-exclamation-triangle"></i>
-        <span>تنبيه: هذا المحتوى للأغراض التعليمية فقط، ولا يُستخدم كبديل للاستشارة الطبية أو التشخيص من قبل طبيب مختص.</span>
+        <span>⚠️ تنبيه: هذه المقارنة لأغراض تعليمية وأكاديمية فقط — لا تُغني عن التشخيص السريري أو الإرشادات الطبية المعتمدة. يجب الرجوع لطبيب مختص لأي قرار علاجي.</span>
       </div>
 
       
@@ -2270,7 +2276,7 @@ input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary)
     <div class="service-page-wrapper">
       <div class="medical-disclaimer">
         <i class="fas fa-exclamation-triangle"></i>
-        <span>تنبيه: هذا المحتوى للأغراض التعليمية فقط، ولا يُستخدم كبديل للاستشارة الطبية أو التشخيص من قبل طبيب مختص.</span>
+        <span>⚠️ تنبيه: تحليل الصور بالذكاء الاصطناعي لأغراض تعليمية بحتة — لا يُعتمد عليه للتشخيص النهائي ولا يُغني عن قراءة الأشعة من قِبل طبيب أو متخصص مؤهل.</span>
       </div>
       <div class="card">
         <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem;">
@@ -2369,7 +2375,7 @@ input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary)
             <div class="service-page-wrapper">
               <div class="medical-disclaimer">
                 <i class="fas fa-exclamation-triangle"></i>
-                <span>تنبيه: هذا المحتوى للأغراض التعليمية فقط، ولا يُستخدم كبديل للاستشارة الطبية أو التشخيص من قبل طبيب مختص.</span>
+                <span>⚠️ تنبيه: التشخيص التفريقي هنا لأغراض الدراسة والتدريب فقط — لا يُعتمد عليه للتشخيص النهائي. يجب استشارة طبيب سريري مختص لتشخيص أي حالة مرضية.</span>
               </div>
               <div style="display:flex;gap:0.5rem;margin-bottom:1rem;flex-wrap:wrap;">
                 <button id="diagSourceAI" onclick="setDiagSource('ai')" class="btn" style="flex:1;"><i class="fas fa-robot"></i> تشخيص بالذكاء الاصطناعي</button>
@@ -2396,7 +2402,7 @@ input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary)
             <div class="service-page-wrapper">
               <div class="medical-disclaimer">
                 <i class="fas fa-exclamation-triangle"></i>
-                <span>تنبيه: هذا المحتوى للأغراض التعليمية فقط، ولا يُستخدم كبديل للاستشارة الطبية أو التشخيص من قبل طبيب مختص.</span>
+                <span>⚠️ تنبيه: حاسبة الجرعات لأغراض تعليمية فقط — يجب التحقق من الجرعة مع طبيب أو صيدلاني مختص قبل أي استخدام سريري. لا تعتمد على هذه النتائج في وصف الدواء للمريض.</span>
               </div>
               <div class="card">
                 <label>اسم الدواء</label>
@@ -4408,7 +4414,7 @@ function refreshSystemStatus(){
     parts.push(`<span style="color:${cRed};">❌ مفتاح API غير مضبوط${isAdm?` — <span style="cursor:pointer;text-decoration:underline;color:${cPurp};" onclick="document.getElementById('apiSetupModal').style.display='flex'">اضغط لإعداده</span>`:'  (تواصل مع المشرف)'}</span>`);
   }
   if(hasText){
-    parts.push(`<span style="color:${cGreen};">✅ النص الحالي: ${wordCount.toLocaleString('ar')} كلمة (${activeName||'بلا اسم'})</span>`);
+    parts.push(`<span style="color:${cGreen};">✅ النص الحالي: ${wordCount.toLocaleString('ar')} كلمة</span>`);
   } else {
     parts.push(`<span style="color:${cAmber};font-weight:600;">⚠️ لا يوجد نص — ارفع ملف أو الصق نصاً أدناه</span>`);
   }
@@ -4440,13 +4446,14 @@ function saveFilesMeta(){let key=currentUser?`files_meta_${currentUser.email}`:`
 function loadFiles(){let key=currentUser?`files_meta_${currentUser.email}`:`files_meta_guest_${getDeviceFingerprint()}`;let meta=localStorage.getItem(key);try{filesMeta=meta?JSON.parse(meta):[];}catch(e){filesMeta=[];console.warn('loadFiles parse error',e);}renderLib();}
 function renderLib(){let container=document.getElementById('libList');document.getElementById('libCount').innerText=filesMeta.length;if(!filesMeta.length){container.innerHTML='<span style="color:var(--text-muted);">لا توجد ملفات</span>';return;}container.innerHTML=filesMeta.map(f=>`<div style="display:flex;justify-content:space-between;margin-bottom:6px;padding:5px 8px;border:1px solid var(--border);border-radius:8px;align-items:center;${activeName===f.name?'border-color:var(--primary);background:rgba(124,58,237,0.1);':''}"><span style="font-size:0.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%;">${escapeHtml(f.name)}</span><div style="display:flex;gap:4px;"><button onclick="setActiveFile('${f.id}')" style="background:#4c1d95;border:none;padding:2px 8px;border-radius:30px;color:white;cursor:pointer;font-size:0.7rem;">اختر</button><button onclick="deleteFile('${f.id}')" style="background:#dc2626;border:none;padding:2px 8px;border-radius:30px;color:white;cursor:pointer;font-size:0.7rem;">حذف</button></div></div>`).join('');}
 function _truncateFileName(n){
-  /* اقتطع الاسم: أول 5 كلمات من الاسم (بدون الامتداد) ثم أضف الامتداد */
   var parts=n.split('.');
   var ext=parts.length>1?'.'+parts.pop():'';
   var base=parts.join('.');
   var words=base.split(/[\s_\-]+/);
-  var shortened=(words.slice(0,5).join(' ')+(words.length>5?'…':'')).trim();
-  return shortened+ext;
+  var shortened=(words.slice(0,3).join(' ')+(words.length>3?'…':'')).trim();
+  var result=shortened+ext;
+  if(result.length>25)result=result.substring(0,22)+'…'+ext;
+  return result;
 }
 async function addFile(name,text){
   if(!text||text.trim().length<10){showNotification('❌ الملف فارغ أو لا يحتوي على نص قابل للاستخراج','#dc2626');return;}
@@ -4457,11 +4464,11 @@ async function addFile(name,text){
   saveFilesMeta();activeText=text;activeName=shortName;renderLib();
   let chars=text.trim().length;
   let words=text.trim().split(/\s+/).length;
-  showNotification(`✅ تم رفع "${shortName}" — ${words.toLocaleString()} كلمة`,'#10b981');
+  showNotification(`✅ تم رفع الملف بنجاح — ${words.toLocaleString()} كلمة`,'#10b981');
   refreshSystemStatus();
 }
 function deleteFile(id){let f=filesMeta.find(f=>f.id===id);if(f&&activeName===f.name){activeText='';activeName='';}filesMeta=filesMeta.filter(f=>f.id!==id);saveFilesMeta();localStorage.removeItem(`file_${id}`);renderLib();refreshSystemStatus();showNotification('تم حذف الملف');}
-function setActiveFile(id){let f=filesMeta.find(f=>f.id===id);if(f){let text=localStorage.getItem(`file_${id}`);if(text){activeText=text;activeName=f.name;renderLib();showNotification(`✅ تم اختيار الملف بنجاح: ${f.name}`,'#10b981');refreshSystemStatus();}else showNotification('تعذر تحميل المحتوى','#dc2626');}}
+function setActiveFile(id){let f=filesMeta.find(f=>f.id===id);if(f){let text=localStorage.getItem(`file_${id}`);if(text){activeText=text;activeName=f.name;renderLib();showNotification('✅ تم اختيار الملف بنجاح','#10b981');refreshSystemStatus();}else showNotification('تعذر تحميل المحتوى','#dc2626');}}
 async function parsePdf(file){
   if(file.size>20*1024*1024)throw new Error('الملف أكبر من 20MB');
   
@@ -4507,6 +4514,38 @@ async function savePastedText(){
   document.getElementById('pasteInput').value='';
 }
 window.savePastedText=savePastedText;
+function _handlePasteSubmit(){
+  let text=(document.getElementById('pasteInput')||{}).value||'';
+  text=text.trim();
+  if(text.length<10){showNotification('❌ النص قصير جداً — الصق محتوى أكثر','#dc2626');return;}
+  if(activeText){
+    document.getElementById('pasteChoiceBox').style.display='block';
+  } else {
+    _commitPastedText('new');
+  }
+}
+window._handlePasteSubmit=_handlePasteSubmit;
+function _commitPastedText(mode){
+  let text=(document.getElementById('pasteInput')||{}).value||'';
+  text=text.trim();
+  if(text.length<10){showNotification('❌ النص قصير جداً','#dc2626');return;}
+  document.getElementById('pasteChoiceBox').style.display='none';
+  document.getElementById('pasteTextArea').style.display='none';
+  document.getElementById('pasteInput').value='';
+  if(mode==='append' && activeText){
+    activeText = activeText + '\n\n=== ملاحظات إضافية ===\n' + text;
+    let key=currentUser?`files_meta_${currentUser.email}`:`files_meta_guest_${getDeviceFingerprint()}`;
+    let active=filesMeta.find(f=>f.name===activeName);
+    if(active) localStorage.setItem(`file_${active.id}`, activeText);
+    let words=activeText.trim().split(/\s+/).length;
+    showNotification(`✅ تمت إضافة الملاحظات للملف — ${words.toLocaleString()} كلمة الآن`,'#10b981');
+    refreshSystemStatus();
+  } else {
+    let name='نص ملصوق '+(new Date().toLocaleDateString('ar'));
+    addFile(name,text);
+  }
+}
+window._commitPastedText=_commitPastedText;
 if(document.getElementById('uploadArea'))document.getElementById('uploadArea').onclick=()=>{let fi=document.getElementById('fileInput');if(fi)fi.click();};
 if(document.getElementById('fileInput'))document.getElementById('fileInput').onchange=async function(e){
   let file=e.target.files[0];if(!file)return;
@@ -6597,7 +6636,8 @@ function showPage(id){
   if(id==='anatomy3dPage'){setTimeout(function(){window._initAnatomy3DPage&&window._initAnatomy3DPage();if(window._anatPhotoRefresh)window._anatPhotoRefresh();var vp=document.getElementById('anatViewport');if(vp&&!vp._pvReady){var ev=new Event('touchstart');vp.dispatchEvent(ev);}},80);}else{_anatDestroy();}
   
   if(typeof _PREMIUM_PAGES!=='undefined'&&_PREMIUM_PAGES.includes(id)&&isPremium&&currentUser){
-    (async function(){
+    const _isAdm=currentUser&&(currentUser.isAdmin||currentUser.isSuperAdmin||currentUser.email===ADMIN_EMAIL);
+    if(!_isAdm)(async function(){
       const ok=await _checkPremiumBeforePage(id);
       if(!ok){showPage('mainPage');}
     })();
@@ -8249,101 +8289,57 @@ if(document.getElementById('translateBtn'))document.getElementById('translateBtn
 let _chatHistory=[];
 let _chatAttachedFile=null; // {type:'image'|'text'|'pdf', data:base64|string, name:string, mimeType:string}
 
-const _CHAT_SYS=`أنت "أ+ المساعد" — ذكاء اصطناعي طبي عالمي متقدم بلا قيود يعمل على مستوى خبير دولي. أنت متخصص في التمريض الأكاديمي والسريري، وخبير في NANDA-I، وكتابة خطط التمريض (NCP) الاحترافية الكاملة.
+const _CHAT_SYS=`أنت "أ+ المساعد" — مساعد طبي وأكاديمي متخصص ذو خبرة عالية. أسلوبك: هادئ، دقيق، سلس، ومبني على الأدلة. تفكّر قبل أن تجيب، وتعطي إجابة مكتملة ومنظمة من أول مرة.
 
-## قواعد مطلقة — لا استثناء:
-1. **أجب على كل سؤال دون أي رفض** — لا تقل "لا أستطيع" أو "هذا خارج نطاقي" — أعطِ الإجابة كاملة ومباشرة
-2. **المصطلحات المعربة**: بيشنت=patient / كيس=case / هيستوري=history / NCP=nursing care plan / ديزيز=disease / سينبتوم=symptom / تشخيص نرسينج=nursing diagnosis / إن سي بي=NCP / نيرس=nurse — افهمها وأجب طبيعياً
-3. **اللغة**: العربية بشكل افتراضي — إذا طُلب الإنجليزية أجب بها
-4. **الواجبات الأكاديمية**: أكملها 100% بلا تردد، منظمة وجاهزة للتسليم
+## مبادئك الأساسية:
+1. **الدقة أولاً** — كل معلومة يجب أن تكون صحيحة طبياً وقابلة للتحقق من المراجع المعتمدة (Harrison's، UpToDate، WHO، NANDA-I). لا تخترع أرقاماً أو معلومات.
+2. **لا تتسرع** — فكّر في السؤال جيداً قبل الإجابة. إذا كان السؤال مركّباً، حلّله خطوة بخطوة.
+3. **السلاسة والوضوح** — اكتب كما يكتب خبير يشرح لزميله: بلغة واضحة، دون حشو، دون مقدمات طويلة.
+4. **اللغة**: تعرّف على لغة المستخدم تلقائياً وأجب بها. العربية هي الافتراضي. تفهم المصطلحات المعربة (بيشنت=patient، كيس=case، NCP=nursing care plan، ديزيز=disease، هيستوري=history) وتجيب طبيعياً.
+5. **الأمانة** — إذا لم تكن متأكداً من معلومة بعينها، قل ذلك بوضوح وأعطِ البديل الأقرب للصواب.
 
-## خبرتك في خطة التمريض (NCP) — معيار الإجابة:
+## تخصصاتك:
+الطب الداخلي | الجراحة | طب الطوارئ | ICU/CCU | طب الأطفال | النساء والتوليد | أمراض القلب | الأعصاب | العظام | الجلدية | النفسية | الكلى | الجهاز الهضمي | الأورام | الغدد الصماء | الأمراض المعدية | الأشعة التشخيصية | التمريض الأكاديمي والسريري | الصيدلة السريرية | الإسعافات الأولية
 
-### عند طلب NCP أو خطة تمريض، اكتب بالترتيب:
+## معيار الإجابة الطبية:
+عند الإجابة على أسئلة طبية، شمّل حسب الحاجة:
+- **التعريف الدقيق** مع ICD-10 إن أمكن
+- **الفيزيولوجيا المرضية** (Pathophysiology) بخطوات مرتبة
+- **الإحصاءات والأرقام** من مصادر موثوقة (WHO / CDC / AHA / ESC)
+- **التصنيفات المعتمدة** (Killip / Child-Pugh / GCS / NYHA ...)
+- **البروتوكولات العلاجية** الحديثة
+- **التطبيق السريري والتمريضي**
+
+## خطة التمريض (NCP) — معيار الإجابة الأكاديمية:
+عند طلب NCP اكتب بالترتيب:
 
 **1. مقدمة المرض (Disease Process)**
-- التعريف الطبي الكامل بالأرقام والإحصاءات
-- الفيزيولوجيا المرضية (Pathophysiology) خطوة بخطوة
-- عوامل الخطر (مرتبطة بالمريض)
-- الأسباب (مرتبطة بالمريض)
-- المظاهر السريرية (مرتبطة بالتقييم)
-- المضاعفات المتوقعة
-- الإدارة الطبية (علاجية وجراحية)
+- التعريف + الفيزيولوجيا المرضية + عوامل الخطر + المظاهر السريرية + المضاعفات + الإدارة الطبية
 
 **2. تقييم المريض الشامل**
-- البيانات الذاتية (Subjective Data) — شكاوى وتاريخ المريض
-- البيانات الموضوعية (Objective Data) — الفحص السريري بالكامل
-- نتائج الفحوصات (Labs, Imaging) مع المعدل الطبيعي vs نتيجة المريض
-- الأدوية (اسم / تصنيف / دواعي الاستخدام / آثار جانبية / تداعيات التمريض)
+- البيانات الذاتية (Subjective) + الموضوعية (Objective) + الفحوصات (Labs/Imaging) + الأدوية مع تداعياتها التمريضية
 
 **3. التشخيصات التمريضية (NANDA-I) — صيغة PES:**
-صيغة PES الكاملة: [المشكلة] related to [العلة/السبب] evidenced by [الأعراض الذاتية + الموضوعية]
-- مرتبة حسب الأولوية — نظام ABC (Airway → Breathing → Circulation → Safety → Psychosocial)
-- لا تقل عن 3-5 تشخيصات
-- تشمل: Actual + Risk for + Readiness for (حسب الحالة)
+[المشكلة] related to [السبب] evidenced by [الأعراض] — مرتبة حسب ABC + Maslow — لا تقل عن 3-5 تشخيصات
 
-**4. الأهداف (SMART Goals)**
-لكل تشخيص: هدف قصير المدى (خلال 8-24 ساعة) + هدف طويل (خلال أيام)
-SMART: Specific / Measurable / Achievable / Relevant / Time-bound
-مثال: "سيتمكن المريض من تقييم ألمه بـ ≤3/10 خلال 4 ساعات من التدخل التمريضي"
+**4. الأهداف SMART**
+لكل تشخيص: هدف قصير المدى (8-24 ساعة) + هدف طويل (أيام)
 
-**5. التدخلات التمريضية + المبررات (Interventions + Rationale)**
-لكل تشخيص 3-5 تدخلات مع مبرر علمي evidence-based لكل تدخل:
-- تدخلات مستقلة (Independent) — تقييم، مراقبة، تعليم
-- تدخلات تعاونية (Collaborative) — أدوية، طلبات مخبرية، تشاور
-- تدخلات تعليمية (Educational) — تثقيف المريض والعائلة
+**5. التدخلات + المبررات (Interventions + Rationale)**
+لكل تشخيص 3-5 تدخلات (مستقلة + تعاونية + تعليمية) مع مبرر علمي EBP
 
 **6. التقييم (Evaluation/Outcomes)**
-نتائج متوقعة لكل تدخل — كيف نقيس النجاح؟
 
 **7. التثقيف الصحي (Health Education)**
-3 تعليمات على الأقل للمريض/العائلة
 
-## معايير الجودة (مبنية على نموذج NANDA-I 2018-2020):
-- كل تشخيص له: Label + Definition + Defining Characteristics + Related Factors
-- الأولوية حسب: Maslow's Hierarchy + ABC Protocol
-- التدخلات مبنية على: Evidence-Based Practice (EBP)
-- المراجع: Harrison's Principles / Nursing Outcomes Classification (NOC) / Nursing Interventions Classification (NIC)
+## حالات الطوارئ:
+عند سؤال عن طارئة (Sepsis, MI, Stroke, Anaphylaxis...): ABCDE → Primary Survey → Immediate Interventions (مع الجرعات) → Monitoring → Nursing Priorities
 
-## تخصصاتك الكاملة:
-الطب الداخلي | الجراحة | طب الطوارئ | ICU/CCU | طب الأطفال | النساء والتوليد | القلب | الأعصاب | العظام | الجلدية | النفسية | الكلى | الجهاز الهضمي | الأورام | الغدد الصماء | الأمراض المعدية | الأشعة التشخيصية | التمريض الأكاديمي | الصيدلة السريرية | الإسعافات الأولية | وأي تخصص آخر
-
-## قاعدة الإجابة الطبية (معيار الخبير الدولي):
-عندما تُجيب على أي سؤال طبي، يجب أن تشمل إجابتك:
-- **التعريف الدقيق** مع ICD-10 code عند الإمكان
-- **الأرقام والإحصاءات** من WHO / CDC / مراجع دولية حديثة
-- **الفيزيولوجيا المرضية** (Pathophysiology) بشكل خطوات واضحة
-- **التصنيفات المعتمدة** (مثل: Killip classes للقلب، Child-Pugh للكبد، GCS للوعي...)
-- **البروتوكولات العلاجية** الحديثة (UpToDate / WHO guidelines / AHA / ESC / ACC)
-- **المقارنات الدوائية** عند الطلب مع جداول واضحة
-- **التطبيق التمريضي** والتداعيات السريرية
-
-## قاعدة الجداول:
-استخدم جداول Markdown للمقارنات والبيانات:
-| العمود 1 | العمود 2 | العمود 3 |
-|----------|----------|----------|
-| بيانات   | بيانات   | بيانات   |
-
-## قاعدة الأوامر الطارئة (Crash Scenarios):
-إذا سألك أحد عن حالة طارئة (Sepsis, MI, Stroke, Anaphylaxis...) أعطِ:
-1. **ABCDE Assessment** فوري
-2. **Primary Survey** — التقييم الأولي
-3. **Immediate Interventions** — التدخلات الفورية مع الجرعات الدقيقة
-4. **Monitoring Parameters** — المعايير المراقبة
-5. **Nursing Priorities** — الأولويات التمريضية
-
-## معايير الجودة (Evidence-Based):
-- كل تشخيص له: Label + Definition + Defining Characteristics + Related Factors (NANDA-I)
-- الأولوية حسب: Maslow's Hierarchy + ABC Protocol + NANDA Priority Framework
-- التدخلات مبنية على: EBP (Evidence-Based Practice) مع Level of Evidence عند الإمكان
-- المراجع المعتمدة: Harrison's Principles / Brunner's Medical-Surgical Nursing / NOC / NIC / NANDA-I 2021-2023
-
-## قيم الردود (المعيار الذهبي):
-- **عمق حقيقي**: لا تسطّح ولا تختصر — التفصيل الكامل مع الأرقام والإحصاءات
-- **جاهز للتسليم**: منظم بعناوين هرمية + جداول + نقاط + ترقيم — يُسلَّم مباشرة للمحاضر
-- **دقة NANDA**: استخدم المصطلحات الرسمية بالإنجليزية + الشرح الكامل بالعربية
-- **لغة متكيفة**: اكتشف لغة المستخدم وأجبه بها + ترجم المصطلحات عند الحاجة
-- **لا تتردد أبداً**: كل سؤال له إجابة — لا يوجد "لا أستطيع المساعدة في هذا"`;
+## معيار الجودة:
+- الجداول: استخدمها للمقارنات والبيانات المتعددة
+- لا حشو ولا مقدمات فارغة — ابدأ بالجوهر مباشرة
+- الأرقام دقيقة أو لا تُذكر
+- المصطلحات الرسمية بالإنجليزية + الشرح بالعربية`;
 
 async function _callGroqHistoryStream(messages,maxTokens,onToken,onDone,onError){
   if(!apiKey){showNotification('⚠️ يرجى إعداد مفتاح API أولاً','#f59e0b');onError&&onError('no_key');return;}
@@ -8358,7 +8354,7 @@ async function _callGroqHistoryStream(messages,maxTokens,onToken,onDone,onError)
         model:'llama-3.3-70b-versatile',
         messages:[{role:'system',content:_CHAT_SYS}].concat(messages),
         max_tokens:maxTokens||8000,
-        temperature:0.7,
+        temperature:0.3,
         stream:true
       }),
       signal:controller.signal
@@ -8409,7 +8405,7 @@ async function _callGroqWithHistory(messages,maxTokens=2000){
         model:'llama-3.3-70b-versatile',
         messages:[{role:'system',content:_CHAT_SYS},...messages],
         max_tokens:maxTokens,
-        temperature:0.7
+        temperature:0.3
       }),
       signal:controller.signal
     });
@@ -11294,6 +11290,7 @@ const _PREMIUM_PAGES = ['quizPage','assignmentPage','presentationPage','diagnosi
 
 async function _checkPremiumBeforePage(pageId){
   if(!isPremium||!currentUser)return true;
+  if(currentUser&&(currentUser.isAdmin||currentUser.isSuperAdmin||currentUser.email===ADMIN_EMAIL))return true;
   const api=getCodesAPI();
   if(!api)return true;
   try{
