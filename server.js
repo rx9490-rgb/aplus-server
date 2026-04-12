@@ -13,6 +13,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import pg from "pg";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import https from "node:https";
 import nodemailer from "nodemailer";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -203,12 +204,11 @@ const RESEND_KEY   = process.env.RESEND_API_KEY || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://aplus-server-w6wb.onrender.com";
 
 async function _sendViaResend(toEmail, subject, htmlBody) {
-  const https = await import('node:https');
   const fromAddr = process.env.RESEND_FROM || "A+ الطبي <onboarding@resend.dev>";
   const body = JSON.stringify({ from: fromAddr, to: [toEmail], subject, html: htmlBody });
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('resend-timeout')), 12000);
-    const req = https.default.request({
+    const req = https.request({
       hostname: 'api.resend.com', path: '/emails', method: 'POST',
       headers: {
         'Authorization': `Bearer ${RESEND_KEY}`,
