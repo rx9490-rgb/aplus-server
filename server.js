@@ -196,18 +196,37 @@ function checkAdmin(req) {
 // ══════════════════════════════════════════════
 // إرسال إيميل استعادة كلمة المرور عبر Gmail SMTP
 // ══════════════════════════════════════════════
-const GMAIL_USER  = process.env.GMAIL_USER  || "";
-const GMAIL_PASS  = process.env.GMAIL_APP_PASS || "";
-// FRONTEND_URL: رابط صفحة reset-password.html (يمكن تغييره لرابط Netlify)
+const GMAIL_USER   = process.env.GMAIL_USER  || "";
+const GMAIL_PASS   = process.env.GMAIL_APP_PASS || "";
+const RESEND_KEY   = process.env.RESEND_API_KEY || "";
+// FRONTEND_URL: رابط صفحة reset-password.html
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://aplus-server-w6wb.onrender.com";
 
-function _createMailTransport() {
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: GMAIL_USER, pass: GMAIL_PASS },
-    connectionTimeout: 8000,
-    greetingTimeout: 8000,
-    socketTimeout: 10000
+async function _sendViaResend(toEmail, subject, htmlBody) {
+  const https = await import('node:https');
+  const fromAddr = process.env.RESEND_FROM || "A+ الطبي <onboarding@resend.dev>";
+  const body = JSON.stringify({ from: fromAddr, to: [toEmail], subject, html: htmlBody });
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('resend-timeout')), 12000);
+    const req = https.default.request({
+      hostname: 'api.resend.com', path: '/emails', method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        clearTimeout(timeout);
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(true);
+        else reject(new Error(`resend-${res.statusCode}: ${d}`));
+      });
+    });
+    req.on('error', e => { clearTimeout(timeout); reject(e); });
+    req.write(body);
+    req.end();
   });
 }
 
@@ -273,13 +292,31 @@ async function sendResetEmail(toEmail, token, fullName) {
 </body>
 </html>`;
 
+  // أولاً: جرّب Resend (أكثر موثوقية على cloud)
+  if (RESEND_KEY) {
+    try {
+      await _sendViaResend(toEmail, "🔑 استعادة كلمة المرور — A+ الطبي", htmlBody);
+      console.log(`✅ [Resend] إيميل أُرسل إلى: ${toEmail}`);
+      return true;
+    } catch (err) {
+      console.error("❌ [Resend] فشل:", err.message);
+    }
+  }
+
+  // ثانياً: fallback لـ Gmail SMTP
   if (!GMAIL_USER || !GMAIL_PASS) {
-    console.log(`\n📧 [DEV - لا يوجد Gmail]\nرابط الاستعادة: ${resetLink}\n`);
+    console.log(`\n📧 [DEV] رابط الاستعادة: ${resetLink}\n`);
     return true;
   }
 
   try {
-    const transporter = _createMailTransport();
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
+      socketTimeout: 10000
+    });
     const timeout = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('timeout')), 12000)
     );
@@ -292,10 +329,10 @@ async function sendResetEmail(toEmail, token, fullName) {
       }),
       timeout
     ]);
-    console.log(`✅ إيميل استعادة أُرسل إلى: ${toEmail}`);
+    console.log(`✅ [Gmail] إيميل أُرسل إلى: ${toEmail}`);
     return true;
   } catch (err) {
-    console.error("❌ خطأ في إرسال الإيميل:", err.message);
+    console.error("❌ [Gmail] خطأ:", err.message);
     return false;
   }
 }
