@@ -204,7 +204,10 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "https://aplus-server-w6wb.onre
 function _createMailTransport() {
   return nodemailer.createTransport({
     service: 'gmail',
-    auth: { user: GMAIL_USER, pass: GMAIL_PASS }
+    auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 10000
   });
 }
 
@@ -277,12 +280,18 @@ async function sendResetEmail(toEmail, token, fullName) {
 
   try {
     const transporter = _createMailTransport();
-    await transporter.sendMail({
-      from: `"A+ الطبي" <${GMAIL_USER}>`,
-      to: toEmail,
-      subject: "🔑 استعادة كلمة المرور — A+ الطبي",
-      html: htmlBody
-    });
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), 12000)
+    );
+    await Promise.race([
+      transporter.sendMail({
+        from: `"A+ الطبي" <${GMAIL_USER}>`,
+        to: toEmail,
+        subject: "🔑 استعادة كلمة المرور — A+ الطبي",
+        html: htmlBody
+      }),
+      timeout
+    ]);
     console.log(`✅ إيميل استعادة أُرسل إلى: ${toEmail}`);
     return true;
   } catch (err) {
