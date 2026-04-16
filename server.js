@@ -155,6 +155,13 @@ async function initDB() {
       used       BOOLEAN DEFAULT FALSE,
       created_at BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+      token      TEXT PRIMARY KEY,
+      email      TEXT NOT NULL,
+      expires_at BIGINT NOT NULL,
+      used       BOOLEAN DEFAULT FALSE,
+      created_at BIGINT NOT NULL
+    );
   `);
 
   // أعمدة جديدة لم تكن موجودة — آمن للتشغيل أكثر من مرة
@@ -165,6 +172,7 @@ async function initDB() {
     `ALTER TABLE codes ADD COLUMN IF NOT EXISTS label TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS login_attempts INTEGER DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
   ];
   for (const sql of safeCols) {
     try { await db.query(sql); } catch {}
@@ -341,7 +349,86 @@ async function sendResetEmail(toEmail, token, fullName) {
 setInterval(() => {
   db.query("DELETE FROM password_reset_tokens WHERE expires_at < $1 OR used = TRUE", [Date.now()])
     .catch(() => {});
+  db.query("DELETE FROM email_verification_tokens WHERE expires_at < $1 OR used = TRUE", [Date.now()])
+    .catch(() => {});
 }, 60 * 60_000);
+
+// ══════════════════════════════════════════════
+// إرسال إيميل تأكيد البريد الإلكتروني
+// ══════════════════════════════════════════════
+async function sendVerificationEmail(toEmail, code, fullName) {
+  const displayName = fullName || "المستخدم";
+  const htmlBody = `<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تأكيد الحساب — A+ الطبي</title></head>
+<body style="margin:0;padding:0;background:#0a0a0f;font-family:'Segoe UI',Tahoma,Arial,sans-serif;direction:rtl;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0f;padding:40px 16px;">
+    <tr><td align="center">
+      <table width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;">
+        <tr><td style="background:linear-gradient(135deg,#065f46 0%,#047857 50%,#064e3b 100%);border-radius:20px 20px 0 0;padding:36px 32px 28px;text-align:center;border:1px solid rgba(16,185,129,0.3);">
+          <div style="font-size:2.5rem;margin-bottom:8px;">⚕️</div>
+          <div style="font-size:1.9rem;font-weight:900;color:#fff;direction:ltr;">A+ الطبي</div>
+          <div style="color:rgba(167,243,208,0.8);font-size:0.78rem;margin-top:4px;">تأكيد البريد الإلكتروني</div>
+          <div style="width:50px;height:2px;background:linear-gradient(90deg,transparent,#10b981,transparent);margin:14px auto 0;"></div>
+        </td></tr>
+        <tr><td style="background:#0a1f17;border:1px solid rgba(16,185,129,0.2);border-top:none;padding:32px;">
+          <h2 style="color:#d1fae5;font-size:1.15rem;font-weight:800;margin:0 0 12px;">أهلاً، ${displayName} 👋</h2>
+          <p style="color:#6ee7b7;font-size:0.9rem;line-height:1.7;margin:0 0 20px;">
+            شكراً لتسجيلك في <strong style="color:#10b981;">A+ الطبي</strong>. أدخل الكود أدناه لتأكيد بريدك الإلكتروني وتفعيل حسابك.
+          </p>
+          <div style="background:#022c22;border:2px solid rgba(16,185,129,0.4);border-radius:16px;padding:28px;text-align:center;margin:16px 0;">
+            <div style="color:#6ee7b7;font-size:0.78rem;margin-bottom:10px;letter-spacing:0.5px;">كود التأكيد</div>
+            <div style="font-size:2.8rem;font-weight:900;letter-spacing:14px;color:#10b981;direction:ltr;font-family:'Courier New',monospace;">${code}</div>
+            <div style="color:#34d399;font-size:0.75rem;margin-top:12px;">⏱️ صالح لمدة 15 دقيقة فقط</div>
+          </div>
+          <div style="background:#071510;border:1px solid rgba(16,185,129,0.15);border-radius:10px;padding:14px 16px;margin-top:16px;">
+            <p style="color:#4a7a60;font-size:0.78rem;margin:0;">إذا لم تسجّل في منصة A+ الطبي، يمكنك تجاهل هذا الإيميل بأمان.</p>
+          </div>
+        </td></tr>
+        <tr><td style="background:#050f0a;border:1px solid rgba(16,185,129,0.15);border-top:none;border-radius:0 0 20px 20px;padding:18px 32px;text-align:center;">
+          <p style="color:#2d5040;font-size:0.72rem;margin:0 0 4px;">هذا الإيميل أُرسل تلقائياً — لا ترد عليه</p>
+          <p style="color:#2d5040;font-size:0.72rem;margin:0;">© 2025 <span style="color:rgba(16,185,129,0.5);">A+ الطبي</span> — جميع الحقوق محفوظة</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  if (RESEND_KEY) {
+    try {
+      await _sendViaResend(toEmail, "🔐 كود تأكيد حسابك — A+ الطبي", htmlBody);
+      console.log(`✅ [Resend] كود التحقق أُرسل إلى: ${toEmail}`);
+      return true;
+    } catch (err) {
+      console.error("❌ [Resend] فشل إرسال التحقق:", err.message);
+    }
+  }
+  if (GMAIL_USER && GMAIL_PASS) {
+    try {
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+        connectionTimeout: 8000,
+        greetingTimeout: 8000,
+        socketTimeout: 10000
+      });
+      await transporter.sendMail({
+        from: `"A+ الطبي" <${GMAIL_USER}>`,
+        to: toEmail,
+        subject: "🔐 كود تأكيد حسابك — A+ الطبي",
+        html: htmlBody
+      });
+      console.log(`✅ [Gmail] كود التحقق أُرسل إلى: ${toEmail}`);
+      return true;
+    } catch (err) {
+      console.error("❌ [Gmail] فشل إرسال التحقق:", err.message);
+    }
+  }
+  console.log(`\n📧 [DEV] كود التحقق لـ ${toEmail}: ${code}\n`);
+  return true;
+}
 
 function hashPassword(password) {
   const salt = randomBytes(16).toString("hex");
@@ -620,16 +707,17 @@ app.post("/api/auth/register", async (req, res) => {
       [norm, fullName?.trim() || "", hashPassword(password), Date.now()]
     );
 
-    // تسجيل دخول تلقائي
-    const token = generateToken();
+    // إرسال كود تأكيد البريد الإلكتروني
+    const verifyCode   = String(Math.floor(100000 + Math.random() * 900000));
+    const verifyExpiry = Date.now() + 15 * 60_000;
+    await db.query("DELETE FROM email_verification_tokens WHERE email=$1", [norm]);
     await db.query(
-      "INSERT INTO sessions (token, user_id, created_at, last_used) VALUES ($1,$2,$3,$3)",
-      [token, norm, Date.now()]
+      "INSERT INTO email_verification_tokens (token, email, expires_at, used, created_at) VALUES ($1,$2,$3,FALSE,$4)",
+      [verifyCode, norm, verifyExpiry, Date.now()]
     );
-    const userRow = await db.query("SELECT * FROM users WHERE email=$1", [norm]);
-
+    await sendVerificationEmail(norm, verifyCode, fullName?.trim() || "");
     broadcastEvent({ type: "users_updated" });
-    res.json({ ok: true, token, user: formatUser(userRow.rows[0]) });
+    res.json({ ok: true, requiresVerification: true, email: norm, msg: "تم إرسال كود التأكيد على بريدك الإلكتروني" });
   } catch (e) {
     console.error("register error:", e.message);
     res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
@@ -663,6 +751,11 @@ app.post("/api/auth/login", async (req, res) => {
     // ❸ فحوصات الحساب
     if (user.deleted_at) return res.json({ ok: false, msg: "هذا الحساب محذوف" });
     if (user.banned)     return res.json({ ok: false, msg: "هذا الحساب محظور من قِبل الإدارة" });
+
+    // ❸٫٥ فحص تأكيد البريد الإلكتروني
+    if (!user.email_verified && !user.is_admin && !user.is_super_admin) {
+      return res.json({ ok: false, requiresVerification: true, email: norm, msg: "⚠️ يرجى تأكيد بريدك الإلكتروني أولاً — راجع صندوق الوارد" });
+    }
 
     // ❹ فحص قفل الحساب
     const lockedUntil = Number(user.locked_until || 0);
@@ -710,6 +803,63 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({ ok: true, token, user: formatUser(user) });
   } catch (e) {
     console.error("login error:", e.message);
+    res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
+  }
+});
+
+// ══════════════════════════════════════════════
+// تأكيد البريد الإلكتروني بالكود
+// ══════════════════════════════════════════════
+app.post("/api/auth/verify-email", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.json({ ok: false, msg: "البريد والكود مطلوبان" });
+    const norm = email.toLowerCase().trim();
+    const rows = await db.query(
+      "SELECT * FROM email_verification_tokens WHERE token=$1 AND email=$2 AND used=FALSE",
+      [String(code).trim(), norm]
+    );
+    if (!rows.rows.length) return res.json({ ok: false, msg: "❌ الكود غير صحيح" });
+    if (Date.now() > rows.rows[0].expires_at)
+      return res.json({ ok: false, msg: "❌ انتهت صلاحية الكود — اطلب كوداً جديداً" });
+
+    await db.query("UPDATE users SET email_verified=TRUE WHERE email=$1", [norm]);
+    await db.query("UPDATE email_verification_tokens SET used=TRUE WHERE token=$1", [String(code).trim()]);
+
+    const token = generateToken();
+    await db.query(
+      "INSERT INTO sessions (token, user_id, created_at, last_used) VALUES ($1,$2,$3,$3)",
+      [token, norm, Date.now()]
+    );
+    const userRow = await db.query("SELECT * FROM users WHERE email=$1", [norm]);
+    console.log(`✅ تم تأكيد البريد: ${norm}`);
+    res.json({ ok: true, token, user: formatUser(userRow.rows[0]) });
+  } catch (e) {
+    console.error("verify-email error:", e.message);
+    res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
+  }
+});
+
+app.post("/api/auth/resend-verification", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.json({ ok: false, msg: "البريد الإلكتروني مطلوب" });
+    const norm = email.toLowerCase().trim();
+    const uRow = await db.query("SELECT * FROM users WHERE email=$1 AND deleted_at IS NULL", [norm]);
+    if (!uRow.rows.length) return res.json({ ok: false, msg: "البريد غير مسجل" });
+    if (uRow.rows[0].email_verified) return res.json({ ok: false, msg: "البريد مؤكد مسبقاً" });
+
+    const code   = String(Math.floor(100000 + Math.random() * 900000));
+    const expiry = Date.now() + 15 * 60_000;
+    await db.query("DELETE FROM email_verification_tokens WHERE email=$1", [norm]);
+    await db.query(
+      "INSERT INTO email_verification_tokens (token, email, expires_at, used, created_at) VALUES ($1,$2,$3,FALSE,$4)",
+      [code, norm, expiry, Date.now()]
+    );
+    await sendVerificationEmail(norm, code, uRow.rows[0].full_name || "");
+    res.json({ ok: true, msg: "تم إرسال كود جديد على بريدك" });
+  } catch (e) {
+    console.error("resend-verification error:", e.message);
     res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
   }
 });
