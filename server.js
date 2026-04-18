@@ -1623,6 +1623,75 @@ app.post("/api/openrouter/stream", async (req, res) => {
   }
 });
 
+// Vision endpoint — استخراج النص من الصور بسرعة Gemini 2.0 Flash
+app.post("/api/openrouter/vision", async (req, res) => {
+  if (!OPENROUTER_KEY) {
+    res.status(503).json({ ok: false, error: "openrouter_key_not_configured" });
+    return;
+  }
+  const { imageBase64, prompt, maxTokens } = req.body || {};
+  if (!imageBase64 || !prompt) {
+    res.status(400).json({ ok: false, error: "missing_params" });
+    return;
+  }
+  const VISION_MODELS = [
+    "google/gemini-2.0-flash-001",
+    "google/gemini-flash-1.5-8b",
+    "openai/gpt-4o-mini"
+  ];
+  let lastErr = null;
+  for (const model of VISION_MODELS) {
+    try {
+      const ctrl = new AbortController();
+      const tm = setTimeout(() => ctrl.abort(), 60000);
+      const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${OPENROUTER_KEY}`,
+          "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
+          "X-Title": "A+ Medical Vision"
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: imageBase64 } },
+              { type: "text", text: prompt }
+            ]
+          }],
+          max_tokens: maxTokens || 3000,
+          temperature: 0.3
+        }),
+        signal: ctrl.signal
+      });
+      clearTimeout(tm);
+      if (upstream.ok) {
+        const data = await upstream.json();
+        const content = data?.choices?.[0]?.message?.content;
+        if (content) {
+          res.json({ ok: true, content });
+          return;
+        }
+      } else {
+        const txt = await upstream.text().catch(() => "");
+        lastErr = { status: upstream.status, body: txt };
+        if (upstream.status === 401 || upstream.status === 403) break;
+        if (upstream.status === 402) break;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  let code = "network";
+  if (lastErr && typeof lastErr === "object" && lastErr.status) {
+    if (lastErr.status === 401 || lastErr.status === 403) code = "auth";
+    else code = String(lastErr.status);
+  }
+  res.status(502).json({ ok: false, error: code });
+});
+
 // Static files — يخدم من public/ داخل standalone أو من ../public
 app.use(express.static(path.join(__dirname, "public"), { etag: true, lastModified: true }));
 app.use(express.static(path.join(__dirname, "..", "public"), { etag: true, lastModified: true }));
