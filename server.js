@@ -193,13 +193,58 @@ async function initDB() {
 }
 
 // ══════════════════════════════════════════════
-// 3. مساعدات الأمان
+// 3. مساعدات الأمان — مُحصَّنة
 // ══════════════════════════════════════════════
-const ADMIN_KEY = "APLUS9490";
+// 🔒 يُقرأ من متغير بيئة (Render Secret) — مع قيمة احتياطية للتطوير فقط
+const ADMIN_KEY = process.env.ADMIN_KEY || "APLUS9490";
+
+if (process.env.NODE_ENV === "production" && ADMIN_KEY === "APLUS9490") {
+  console.warn("⚠️  تحذير: ADMIN_KEY الافتراضي مستخدم في الإنتاج — اضبط متغير البيئة ADMIN_KEY على Render!");
+}
+
+// مقارنة آمنة من الناحية الزمنية (تمنع timing attacks)
+function safeKeyCompare(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch { return false; }
+}
 
 function checkAdmin(req) {
   const key = req.headers["x-admin-key"] || req.query.adminKey || req.body?.adminKey;
-  return key === ADMIN_KEY;
+  return safeKeyCompare(String(key || ""), ADMIN_KEY);
+}
+
+// تحقق مزدوج: مفتاح المدير + جلسة صالحة لمستخدم مدير في DB
+async function checkAdminStrict(req) {
+  if (!checkAdmin(req)) return null;
+  const token = req.headers["x-session-token"] || req.query.token;
+  if (!token) return null;
+  const user = await getSessionUser(token);
+  if (!user) return null;
+  if (!user.is_admin && !user.isAdmin && !user.is_super_admin && !user.isSuperAdmin) return null;
+  return user;
+}
+
+// تسجيل أحداث إدارية حرجة (Audit Log)
+async function auditLog(action, actor, details = {}) {
+  try {
+    await db.query(
+      `CREATE TABLE IF NOT EXISTS audit_log (
+        id SERIAL PRIMARY KEY,
+        action TEXT NOT NULL,
+        actor TEXT,
+        details JSONB,
+        ip TEXT,
+        ts BIGINT NOT NULL
+      )`
+    );
+    await db.query(
+      "INSERT INTO audit_log (action, actor, details, ip, ts) VALUES ($1,$2,$3,$4,$5)",
+      [String(action), String(actor || "unknown"), JSON.stringify(details || {}), String(details.ip || ""), Date.now()]
+    );
+  } catch (e) { console.warn("audit_log error:", e.message); }
 }
 
 // ══════════════════════════════════════════════
