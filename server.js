@@ -1510,10 +1510,12 @@ app.get("/download-pkg", (_req, res) => {
 // 17.5 OpenRouter AI Proxy — مفتاح API محمي خلف السيرفر
 // ══════════════════════════════════════════════
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
+// ⚡ ترتيب النماذج محسّن للسرعة: Gemini Flash أولاً (2-4 ثواني)، ثم GPT-4o-mini، وأخيراً Llama 70B كاحتياطي
 const OPENROUTER_MODELS = [
-  "meta-llama/llama-3.3-70b-instruct",
   "google/gemini-2.0-flash-001",
-  "openai/gpt-4o-mini"
+  "openai/gpt-4o-mini",
+  "google/gemini-flash-1.5-8b",
+  "meta-llama/llama-3.3-70b-instruct"
 ];
 
 app.post("/api/openrouter/stream", async (req, res) => {
@@ -1635,8 +1637,8 @@ app.post("/api/openrouter/vision", async (req, res) => {
     return;
   }
   const VISION_MODELS = [
-    "google/gemini-2.0-flash-001",
     "google/gemini-flash-1.5-8b",
+    "google/gemini-2.0-flash-001",
     "openai/gpt-4o-mini"
   ];
   let lastErr = null;
