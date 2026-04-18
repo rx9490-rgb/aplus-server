@@ -1506,6 +1506,123 @@ app.get("/download-pkg", (_req, res) => {
   res.sendFile(path.join(__dirname, "package.json"));
 });
 
+// ══════════════════════════════════════════════
+// 17.5 OpenRouter AI Proxy — مفتاح API محمي خلف السيرفر
+// ══════════════════════════════════════════════
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_MODELS = [
+  "meta-llama/llama-3.3-70b-instruct",
+  "google/gemini-2.0-flash-001",
+  "openai/gpt-4o-mini"
+];
+
+app.post("/api/openrouter/stream", async (req, res) => {
+  if (!OPENROUTER_KEY) {
+    res.status(503).json({ ok: false, error: "openrouter_key_not_configured" });
+    return;
+  }
+  const { prompt, systemPrompt, maxTokens } = req.body || {};
+  if (!prompt) {
+    res.status(400).json({ ok: false, error: "prompt_required" });
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  const messages = [];
+  if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+  messages.push({ role: "user", content: prompt });
+
+  let lastErr = null;
+  let sentAny = false;
+
+  for (const model of OPENROUTER_MODELS) {
+    if (sentAny) break;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const ctrl = new AbortController();
+        const tm = setTimeout(() => ctrl.abort(), 90000);
+        const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${OPENROUTER_KEY}`,
+            "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
+            "X-Title": "A+ Medical"
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            max_tokens: maxTokens || 3000,
+            stream: true
+          }),
+          signal: ctrl.signal
+        });
+        clearTimeout(tm);
+
+        if (!upstream.ok) {
+          const txt = await upstream.text().catch(() => "");
+          lastErr = { status: upstream.status, body: txt };
+          if (upstream.status === 401 || upstream.status === 403) break;
+          if (upstream.status === 402) break;
+          if (upstream.status === 429) { await sleep(1500); continue; }
+          if (upstream.status >= 500) { await sleep(800); continue; }
+          break;
+        }
+
+        const reader = upstream.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop();
+          for (let line of lines) {
+            line = line.trim();
+            if (!line || line === "data: [DONE]") continue;
+            if (!line.startsWith("data: ")) continue;
+            try {
+              const d = JSON.parse(line.slice(6));
+              const c = d.choices?.[0]?.delta?.content;
+              if (c) {
+                sentAny = true;
+                res.write(`data: ${JSON.stringify({ text: c })}\n\n`);
+              }
+            } catch {}
+          }
+        }
+        res.write(`data: ${JSON.stringify({ msg: "done" })}\n\n`);
+        res.end();
+        return;
+      } catch (e) {
+        lastErr = e;
+        const m = (e?.message || e?.name || String(e)).toLowerCase();
+        if (m.includes("abort") || m.includes("timeout")) { await sleep(500); continue; }
+        await sleep(500);
+      }
+    }
+  }
+
+  if (!sentAny) {
+    let code = "network";
+    if (lastErr && typeof lastErr === "object" && lastErr.status) {
+      if (lastErr.status === 401 || lastErr.status === 403) code = "auth";
+      else code = String(lastErr.status);
+    } else {
+      const m = (lastErr?.message || lastErr?.name || String(lastErr || "")).toLowerCase();
+      if (m.includes("abort") || m.includes("timeout")) code = "timeout";
+    }
+    res.write(`event: error\ndata: ${JSON.stringify({ error: code })}\n\n`);
+    res.end();
+  }
+});
+
 // Static files — يخدم من public/ داخل standalone أو من ../public
 app.use(express.static(path.join(__dirname, "public"), { etag: true, lastModified: true }));
 app.use(express.static(path.join(__dirname, "..", "public"), { etag: true, lastModified: true }));
