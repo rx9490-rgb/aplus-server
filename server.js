@@ -1404,6 +1404,75 @@ app.patch("/api/users/:email/premium", async (req, res) => {
   } catch { res.status(500).json({ error: "server error" }); }
 });
 
+// 📚 Study reward endpoint — تفعيل اشتراك 3 أشهر مجاناً عند إكمال 200 مهمة دراسية
+// Secured: requires valid session token + one-time per user (study_rewarded flag)
+app.post("/api/users/study-reward", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const user = await getSessionUser(token);
+    if (!user) return res.status(401).json({ ok: false, error: "unauthorized" });
+
+    try { await db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS study_rewarded BOOLEAN DEFAULT FALSE"); } catch {}
+
+    const fresh = await db.query("SELECT premium_expiry, study_rewarded FROM users WHERE email=$1", [user.email]);
+    const row = fresh.rows[0] || {};
+    if (row.study_rewarded) {
+      return res.status(409).json({ ok: false, error: "already_rewarded" });
+    }
+
+    const months3 = 3 * 30 * 24 * 60 * 60 * 1000;
+    const base = Math.max(Date.now(), Number(row.premium_expiry) || 0);
+    const newExpiry = base + months3;
+
+    await db.query(
+      "UPDATE users SET premium_expiry=$1, study_rewarded=TRUE WHERE email=$2",
+      [newExpiry, user.email]
+    );
+    invalidateSessionCache(user.email);
+    broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: newExpiry });
+    broadcastEvent({ type: "users_updated" });
+    res.json({ ok: true, premiumExpiry: newExpiry, daysLeft: 90 });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// 🎮 Game reward endpoint — تفعيل الاشتراك فوري عند الفوز باللعبة (بدون تدخل المدير)
+// Secured: requires valid session token + one-time per user (game_rewarded flag)
+app.post("/api/users/game-reward", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const user = await getSessionUser(token);
+    if (!user) return res.status(401).json({ ok: false, error: "unauthorized" });
+
+    // Ensure column exists for tracking one-time game reward
+    try { await db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS game_rewarded BOOLEAN DEFAULT FALSE"); } catch {}
+
+    const fresh = await db.query("SELECT premium_expiry, game_rewarded FROM users WHERE email=$1", [user.email]);
+    const row = fresh.rows[0] || {};
+    if (row.game_rewarded) {
+      return res.status(409).json({ ok: false, error: "already_rewarded" });
+    }
+
+    const month1 = 30 * 24 * 60 * 60 * 1000;
+    const base = Math.max(Date.now(), Number(row.premium_expiry) || 0);
+    const newExpiry = base + month1;
+
+    await db.query(
+      "UPDATE users SET premium_expiry=$1, game_rewarded=TRUE WHERE email=$2",
+      [newExpiry, user.email]
+    );
+    invalidateSessionCache(user.email);
+    broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: newExpiry });
+    broadcastEvent({ type: "users_updated" });
+    res.json({ ok: true, premiumExpiry: newExpiry, daysLeft: 30 });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 app.delete("/api/users/:email", async (req, res) => {
   try {
     if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
