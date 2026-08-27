@@ -82,6 +82,7 @@ async function initDB() {
       rank              TEXT DEFAULT 'طالب ⭐',
       banned            BOOLEAN DEFAULT FALSE,
       activation_code   TEXT,
+      employee_code     TEXT,
       deleted_at        BIGINT,
       created_at        BIGINT DEFAULT 0,
       last_seen         BIGINT DEFAULT 0
@@ -173,9 +174,20 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS login_attempts INTEGER DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
   ];
   for (const sql of safeCols) {
     try { await db.query(sql); } catch {}
+  }
+  try {
+    await db.query("CREATE UNIQUE INDEX IF NOT EXISTS users_employee_code_unique ON users(employee_code) WHERE employee_code IS NOT NULL");
+    await db.query(`
+      UPDATE users
+      SET employee_code = 'EMP-' || UPPER(SUBSTRING(MD5(email || RANDOM()::TEXT), 1, 8))
+      WHERE is_moderator = TRUE AND is_admin = FALSE AND employee_code IS NULL
+    `);
+  } catch (e) {
+    console.warn("employee_code migration warning:", e.message);
   }
 
   // إنشاء حساب الأدمن إذا لم يكن موجوداً
@@ -493,6 +505,10 @@ function verifyPassword(password, stored) {
 
 function generateToken() { return randomBytes(40).toString("hex"); }
 
+function generateEmployeeCode() {
+  return "EMP-" + randomBytes(4).toString("hex").toUpperCase();
+}
+
 // ══════════════════════════════════════════════
 // حماية Brute Force — تتبع IPs المشبوهة في الذاكرة
 // ══════════════════════════════════════════════
@@ -611,6 +627,7 @@ function formatUser(u) {
     rank: u.rank || "طالب ⭐",
     banned: u.banned || false,
     activationCode: u.activation_code || null,
+    employeeCode: u.employee_code || null,
     createdAt: u.created_at || 0,
     lastSeen: u.last_seen || 0,
     loginAttempts: Number(u.login_attempts) || 0,
@@ -755,6 +772,7 @@ app.post("/api/auth/admin-create", async (req, res) => {
     const password = String(body.password || "");
     const isModerator = body.isModerator !== false;
     const permissions = sanitizePermissions(body.permissions);
+    const employeeCode = isModerator ? generateEmployeeCode() : null;
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
       return res.status(400).json({ ok: false, msg: "صيغة البريد الإلكتروني غير صحيحة" });
@@ -772,14 +790,14 @@ app.post("/api/auth/admin-create", async (req, res) => {
     let row;
     if (existing.rows.length) {
       const updated = await db.query(
-        "UPDATE users SET full_name=$1, password_hash=$2, is_admin=FALSE, is_super_admin=FALSE, is_moderator=$3, permissions=$4, banned=FALSE, deleted_at=NULL, email_verified=TRUE, login_attempts=0, locked_until=0, last_seen=$5 WHERE email=$6 RETURNING *",
-        [fullName || email.split("@")[0], hashPassword(password), isModerator, JSON.stringify(permissions), now, email]
+        "UPDATE users SET full_name=$1, password_hash=$2, is_admin=FALSE, is_super_admin=FALSE, is_moderator=$3, permissions=$4, employee_code=COALESCE(employee_code,$5), banned=FALSE, deleted_at=NULL, email_verified=TRUE, login_attempts=0, locked_until=0, last_seen=$6 WHERE email=$7 RETURNING *",
+        [fullName || email.split("@")[0], hashPassword(password), isModerator, JSON.stringify(permissions), employeeCode, now, email]
       );
       row = updated.rows[0];
     } else {
       const inserted = await db.query(
-        "INSERT INTO users (email, full_name, password_hash, is_admin, is_super_admin, is_moderator, permissions, email_verified, created_at, last_seen) VALUES ($1,$2,$3,FALSE,FALSE,$4,$5,TRUE,$6,$6) RETURNING *",
-        [email, fullName || email.split("@")[0], hashPassword(password), isModerator, JSON.stringify(permissions), now]
+        "INSERT INTO users (email, full_name, password_hash, is_admin, is_super_admin, is_moderator, permissions, employee_code, email_verified, created_at, last_seen) VALUES ($1,$2,$3,FALSE,FALSE,$4,$5,$6,TRUE,$7,$7) RETURNING *",
+        [email, fullName || email.split("@")[0], hashPassword(password), isModerator, JSON.stringify(permissions), employeeCode, now]
       );
       row = inserted.rows[0];
     }
@@ -987,6 +1005,43 @@ app.get("/api/auth/me", async (req, res) => {
     if (!user || user.banned) return res.json({ ok: false });
     res.json({ ok: true, user: formatUser(user) });
   } catch { res.json({ ok: false }); }
+});
+
+// رمز الموظف — يُنشأ تلقائياً للحسابات القديمة التي لا تملك رمزاً
+app.get("/api/auth/employee-code", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user) return res.status(401).json({ ok: false, msg: "غير مصرح" });
+    if (!user.is_moderator || user.is_admin || user.is_super_admin) {
+      return res.status(403).json({ ok: false, msg: "هذا الحساب ليس حساب موظف" });
+    }
+    if (user.employee_code) {
+      return res.json({ ok: true, employeeCode: user.employee_code });
+    }
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const code = generateEmployeeCode();
+        const updated = await db.query(
+          "UPDATE users SET employee_code=$1 WHERE email=$2 AND employee_code IS NULL RETURNING employee_code",
+          [code, user.email]
+        );
+        if (updated.rows.length) {
+          invalidateSessionCache(user.email);
+          broadcastEvent({ type: "users_updated" });
+          return res.json({ ok: true, employeeCode: updated.rows[0].employee_code });
+        }
+        const fresh = await db.query("SELECT employee_code FROM users WHERE email=$1", [user.email]);
+        return res.json({ ok: true, employeeCode: fresh.rows[0]?.employee_code || null });
+      } catch (e) {
+        if (attempt === 4) throw e;
+      }
+    }
+    res.status(500).json({ ok: false, msg: "تعذر إنشاء رمز الموظف" });
+  } catch (e) {
+    console.error("employee-code error:", e.message);
+    res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
+  }
 });
 
 app.post("/api/auth/logout", async (req, res) => {
