@@ -12,7 +12,7 @@ import compression from "compression";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import pg from "pg";
-import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 import https from "node:https";
 import nodemailer from "nodemailer";
 import path from "node:path";
@@ -181,11 +181,7 @@ async function initDB() {
   }
   try {
     await db.query("CREATE UNIQUE INDEX IF NOT EXISTS users_employee_code_unique ON users(employee_code) WHERE employee_code IS NOT NULL");
-    await db.query(`
-      UPDATE users
-      SET employee_code = 'EMP-' || UPPER(SUBSTRING(MD5(email || RANDOM()::TEXT), 1, 8))
-      WHERE is_moderator = TRUE AND is_admin = FALSE AND employee_code IS NULL
-    `);
+    await ensureEmployeeCodes();
   } catch (e) {
     console.warn("employee_code migration warning:", e.message);
   }
@@ -506,7 +502,38 @@ function verifyPassword(password, stored) {
 function generateToken() { return randomBytes(40).toString("hex"); }
 
 function generateEmployeeCode() {
-  return "EMP-" + randomBytes(4).toString("hex").toUpperCase();
+  return String(randomInt(1000, 10000));
+}
+
+async function getUniqueEmployeeCode() {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const code = generateEmployeeCode();
+    const found = await db.query("SELECT 1 FROM users WHERE employee_code=$1 LIMIT 1", [code]);
+    if (!found.rows.length) return code;
+  }
+  throw new Error("لا توجد رموز موظفين متاحة");
+}
+
+async function ensureEmployeeCodes() {
+  const rows = await db.query(
+    "SELECT email, employee_code FROM users WHERE is_moderator=TRUE AND is_admin=FALSE AND deleted_at IS NULL ORDER BY email"
+  );
+  const used = new Set(
+    rows.rows.map((row) => String(row.employee_code || "")).filter((code) => /^\d{4}$/.test(code))
+  );
+  for (const row of rows.rows) {
+    if (/^\d{4}$/.test(String(row.employee_code || ""))) continue;
+    let code = null;
+    for (let attempt = 0; attempt < 100 && !code; attempt++) {
+      const candidate = generateEmployeeCode();
+      if (used.has(candidate)) continue;
+      const collision = await db.query("SELECT 1 FROM users WHERE employee_code=$1 LIMIT 1", [candidate]);
+      if (!collision.rows.length) code = candidate;
+    }
+    if (!code) throw new Error("لا توجد رموز موظفين متاحة");
+    await db.query("UPDATE users SET employee_code=$1 WHERE email=$2", [code, row.email]);
+    used.add(code);
+  }
 }
 
 // ══════════════════════════════════════════════
@@ -772,7 +799,7 @@ app.post("/api/auth/admin-create", async (req, res) => {
     const password = String(body.password || "");
     const isModerator = body.isModerator !== false;
     const permissions = sanitizePermissions(body.permissions);
-    const employeeCode = isModerator ? generateEmployeeCode() : null;
+    const requestedEmployeeCode = String(body.employeeCode || "").trim();
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
       return res.status(400).json({ ok: false, msg: "صيغة البريد الإلكتروني غير صحيحة" });
@@ -780,17 +807,35 @@ app.post("/api/auth/admin-create", async (req, res) => {
     if (password.length < 6) {
       return res.status(400).json({ ok: false, msg: "كلمة المرور 6 أحرف على الأقل" });
     }
+    if (isModerator && requestedEmployeeCode && !/^\d{4}$/.test(requestedEmployeeCode)) {
+      return res.status(400).json({ ok: false, msg: "رمز الموظف يجب أن يكون 4 أرقام فقط" });
+    }
 
     const existing = await db.query("SELECT email, deleted_at FROM users WHERE email=$1", [email]);
     if (existing.rows.length && !existing.rows[0].deleted_at) {
       return res.status(409).json({ ok: false, exists: true, msg: "البريد الإلكتروني مسجل مسبقاً" });
+    }
+    let employeeCode = null;
+    if (isModerator) {
+      if (requestedEmployeeCode) {
+        const owner = await db.query(
+          "SELECT email FROM users WHERE employee_code=$1 AND email<>$2 LIMIT 1",
+          [requestedEmployeeCode, email]
+        );
+        if (owner.rows.length) {
+          return res.status(409).json({ ok: false, msg: "رمز الموظف مستخدم مسبقاً، اختر رمزاً آخر" });
+        }
+        employeeCode = requestedEmployeeCode;
+      } else {
+        employeeCode = await getUniqueEmployeeCode();
+      }
     }
 
     const now = Date.now();
     let row;
     if (existing.rows.length) {
       const updated = await db.query(
-        "UPDATE users SET full_name=$1, password_hash=$2, is_admin=FALSE, is_super_admin=FALSE, is_moderator=$3, permissions=$4, employee_code=COALESCE(employee_code,$5), banned=FALSE, deleted_at=NULL, email_verified=TRUE, login_attempts=0, locked_until=0, last_seen=$6 WHERE email=$7 RETURNING *",
+        "UPDATE users SET full_name=$1, password_hash=$2, is_admin=FALSE, is_super_admin=FALSE, is_moderator=$3, permissions=$4, employee_code=$5, banned=FALSE, deleted_at=NULL, email_verified=TRUE, login_attempts=0, locked_until=0, last_seen=$6 WHERE email=$7 RETURNING *",
         [fullName || email.split("@")[0], hashPassword(password), isModerator, JSON.stringify(permissions), employeeCode, now, email]
       );
       row = updated.rows[0];
@@ -1540,6 +1585,20 @@ app.patch("/api/users/:email", async (req, res) => {
       add("premium_expiry", Math.trunc(expiry));
     }
     if (typeof body.activationCode !== "undefined") add("activation_code", body.activationCode ? String(body.activationCode).slice(0, 200) : null);
+    if (typeof body.employeeCode !== "undefined") {
+      const employeeCode = String(body.employeeCode || "").trim();
+      if (!/^\d{4}$/.test(employeeCode)) {
+        return res.status(400).json({ ok: false, msg: "رمز الموظف يجب أن يكون 4 أرقام فقط" });
+      }
+      const owner = await db.query(
+        "SELECT email FROM users WHERE employee_code=$1 AND email<>$2 LIMIT 1",
+        [employeeCode, email]
+      );
+      if (owner.rows.length) {
+        return res.status(409).json({ ok: false, msg: "رمز الموظف مستخدم مسبقاً، اختر رمزاً آخر" });
+      }
+      add("employee_code", employeeCode);
+    }
     if (typeof body.password !== "undefined" && String(body.password).length > 0) {
       const password = String(body.password);
       if (password.length < 6) return res.status(400).json({ ok: false, msg: "كلمة المرور 6 أحرف على الأقل" });
