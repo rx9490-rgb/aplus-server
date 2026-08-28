@@ -226,7 +226,7 @@ function safeKeyCompare(a, b) {
 
 function checkAdmin(req) {
   const key = req.headers["x-admin-key"] || req.query.adminKey || req.body?.adminKey;
-  return safeKeyCompare(String(key || ""), ADMIN_KEY);
+  return !!ADMIN_KEY && safeKeyCompare(String(key || ""), ADMIN_KEY);
 }
 
 // تحقق مزدوج: مفتاح المدير + جلسة صالحة لمستخدم مدير في DB
@@ -238,6 +238,20 @@ async function checkAdminStrict(req) {
   if (!user) return null;
   if (!user.is_admin && !user.isAdmin && !user.is_super_admin && !user.isSuperAdmin) return null;
   return user;
+}
+
+// مصادقة الإدارة بالطريقة الصحيحة للواجهة:
+// لا نضع ADMIN_KEY داخل JavaScript العام؛ نستخدم جلسة المدير، مع إبقاء
+// مفتاح البيئة متاحاً للطلبات الخلفية/التكاملات القديمة.
+async function isAdminRequest(req) {
+  if (checkAdmin(req)) return true;
+  const token = req.headers["x-session-token"] || req.query.token;
+  if (!token) return false;
+  const user = await getSessionUser(token);
+  return !!(user && (
+    user.is_admin || user.isAdmin ||
+    user.is_super_admin || user.isSuperAdmin
+  ));
 }
 
 // تسجيل أحداث إدارية حرجة (Audit Log)
@@ -796,7 +810,7 @@ app.get("/api/stream", async (req, res) => {
 // إنشاء حساب موظف/مشرف من لوحة الإدارة — يتم الحفظ في قاعدة البيانات مباشرة
 app.post("/api/auth/admin-create", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ ok: false, error: "forbidden", msg: "مفتاح الإدارة غير صحيح" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
 
     const body = req.body || {};
     const fullName = String(body.fullName || "").trim().slice(0, 120);
@@ -1244,7 +1258,7 @@ app.patch("/api/auth/update", async (req, res) => {
 // ══════════════════════════════════════════════
 app.get("/api/codes/list", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const all = await db.query("SELECT * FROM codes ORDER BY created_at DESC");
     res.json(all.rows.map((c) => ({
       id: c.id, code: c.code, type: c.type,
@@ -1280,7 +1294,7 @@ app.get("/api/codes/user-status", async (req, res) => {
 
 app.post("/api/codes/generate", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const { count = 1, type = "premium", durationDays, months = 1, maxUses = 1, expiresAt, label } = req.body;
     const actualDays = durationDays || Math.max(1, parseInt(months, 10) || 1) * 30;
     const generated = [];
@@ -1347,7 +1361,7 @@ app.post("/api/codes/redeem", async (req, res) => {
 
 app.delete("/api/codes/:id", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const val = decodeURIComponent(req.params.id);
     await db.query("DELETE FROM codes WHERE id=$1 OR code=$1", [val]);
     broadcastEvent({ type: "codes_updated" });
@@ -1357,7 +1371,7 @@ app.delete("/api/codes/:id", async (req, res) => {
 
 app.patch("/api/codes/:id", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const updates = [], vals = [];
     let i = 1;
     if (req.body.active !== undefined) { updates.push(`active=$${i++}`); vals.push(req.body.active); }
@@ -1388,7 +1402,7 @@ app.get("/api/ads/list", async (_req, res) => {
 
 app.post("/api/ads", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const b   = req.body;
     const adId = b.id || randomBytes(8).toString("hex");
     const ex  = await db.query("SELECT ad_id FROM ads WHERE ad_id=$1", [adId]);
@@ -1416,7 +1430,7 @@ app.post("/api/ads", async (req, res) => {
 
 app.delete("/api/ads/:id", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     await db.query("DELETE FROM ads WHERE ad_id=$1", [req.params.id]);
     broadcastEvent({ type: "ads_updated" });
     res.json({ ok: true });
@@ -1425,7 +1439,7 @@ app.delete("/api/ads/:id", async (req, res) => {
 
 app.patch("/api/ads/:id", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const updates = [], vals = [];
     let i = 1;
     if (req.body.active !== undefined) { updates.push(`active=$${i++}`);  vals.push(req.body.active); }
@@ -1445,7 +1459,7 @@ app.patch("/api/ads/:id", async (req, res) => {
 // ══════════════════════════════════════════════
 app.get("/api/feedback/list", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const all = await db.query("SELECT * FROM feedback ORDER BY created_at DESC");
     res.json(all.rows.map((f) => ({
       id: f.feedback_id, userEmail: f.user_email, userName: f.user_name,
@@ -1471,7 +1485,7 @@ app.post("/api/feedback", async (req, res) => {
 
 app.patch("/api/feedback/:id/read", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     await db.query("UPDATE feedback SET read=TRUE WHERE feedback_id=$1", [req.params.id]);
     res.json({ ok: true });
   } catch { res.status(500).json({ ok: false }); }
@@ -1479,7 +1493,7 @@ app.patch("/api/feedback/:id/read", async (req, res) => {
 
 app.delete("/api/feedback/:id", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     await db.query("DELETE FROM feedback WHERE feedback_id=$1", [req.params.id]);
     res.json({ ok: true });
   } catch { res.status(500).json({ ok: false }); }
@@ -1488,9 +1502,31 @@ app.delete("/api/feedback/:id", async (req, res) => {
 // ══════════════════════════════════════════════
 // 12. Settings — الإعدادات
 // ══════════════════════════════════════════════
+// إعدادات آمنة للواجهة العامة فقط — لا تُرجع مفاتيح API أو بيانات الإدارة.
+const PUBLIC_SETTING_KEYS = new Set([
+  "systemName", "primaryColor", "social_links", "sala_store_url",
+  "adsEnabled", "servicesOrder", "screenBanners", "socialFooterText",
+  "svcSettings", "subscriptionPrice", "allowRegistration",
+  "welcomeMessage", "allFree", "allFreeStamp"
+]);
+
+app.get("/api/public/settings", async (_req, res) => {
+  try {
+    const all = await db.query("SELECT key, value FROM settings");
+    const result = {};
+    for (const row of all.rows) {
+      if (PUBLIC_SETTING_KEYS.has(row.key)) result[row.key] = row.value;
+    }
+    res.set("Cache-Control", "no-store");
+    res.json(result);
+  } catch {
+    res.json({});
+  }
+});
+
 app.get("/api/settings", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const all = await db.query("SELECT * FROM settings");
     const result = {};
     for (const row of all.rows) result[row.key] = row.value;
@@ -1500,7 +1536,7 @@ app.get("/api/settings", async (req, res) => {
 
 app.post("/api/settings", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const { key, value } = req.body;
     await db.query(
       "INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2",
@@ -1513,7 +1549,7 @@ app.post("/api/settings", async (req, res) => {
 
 app.put("/api/settings", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const body = req.body || {};
     const skip = ["adminKey"];
     for (const [k, v] of Object.entries(body)) {
@@ -1562,7 +1598,7 @@ app.post("/api/user/settings", async (req, res) => {
 // تعديل المستخدم من لوحة الإدارة — المسار الموحد الذي تستخدمه الواجهة
 app.patch("/api/users/:email", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ ok: false, error: "forbidden", msg: "مفتاح الإدارة غير صحيح" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
 
     const email = decodeURIComponent(req.params.email || "").toLowerCase().trim();
     if (!email) return res.status(400).json({ ok: false, msg: "البريد الإلكتروني مطلوب" });
@@ -1643,7 +1679,7 @@ app.patch("/api/users/:email", async (req, res) => {
 });
 app.get("/api/users/list", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const all = await db.query(
       "SELECT * FROM users WHERE deleted_at IS NULL ORDER BY created_at DESC"
     );
@@ -1653,7 +1689,7 @@ app.get("/api/users/list", async (req, res) => {
 
 app.patch("/api/users/:email/ban", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const { banned } = req.body;
     const email = decodeURIComponent(req.params.email);
     await db.query("UPDATE users SET banned=$1 WHERE email=$2", [!!banned, email]);
@@ -1666,7 +1702,7 @@ app.patch("/api/users/:email/ban", async (req, res) => {
 // رفع قفل Brute Force عن حساب (إدارة فقط)
 app.patch("/api/users/:email/unlock", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const email = decodeURIComponent(req.params.email);
     await db.query(
       "UPDATE users SET login_attempts=0, locked_until=0 WHERE email=$1",
@@ -1681,7 +1717,7 @@ app.patch("/api/users/:email/unlock", async (req, res) => {
 
 app.patch("/api/users/:email/role", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const { isAdmin, isModerator } = req.body;
     const email = decodeURIComponent(req.params.email);
     await db.query(
@@ -1696,7 +1732,7 @@ app.patch("/api/users/:email/role", async (req, res) => {
 
 app.patch("/api/users/:email/premium", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const email    = decodeURIComponent(req.params.email);
     const { premiumExpiry, activationCode } = req.body;
     await db.query(
@@ -1781,7 +1817,7 @@ app.post("/api/users/game-reward", async (req, res) => {
 
 app.delete("/api/users/:email", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const email = decodeURIComponent(req.params.email);
     await db.query("UPDATE users SET deleted_at=$1 WHERE email=$2", [Date.now(), email]);
     await db.query("DELETE FROM sessions WHERE user_id=$1", [email]);
@@ -1796,7 +1832,7 @@ app.delete("/api/users/:email", async (req, res) => {
 // ══════════════════════════════════════════════
 app.get("/api/subscriptions/list", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const now = Date.now();
     const all = await db.query(
       "SELECT * FROM users WHERE premium_expiry > 0 AND deleted_at IS NULL ORDER BY premium_expiry DESC"
@@ -1817,7 +1853,7 @@ app.get("/api/subscriptions/list", async (req, res) => {
 // ══════════════════════════════════════════════
 app.post("/api/broadcast", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const { message, notifType, targetEmail } = req.body;
     if (!message) return res.json({ ok: false });
     broadcastEvent({ type: "broadcast", message, notifType: notifType || "info" }, targetEmail || null);
@@ -1830,7 +1866,7 @@ app.post("/api/broadcast", async (req, res) => {
 // ══════════════════════════════════════════════
 app.get("/api/stats", async (req, res) => {
   try {
-    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const now = Date.now();
     const [users, codes, subs, feedback] = await Promise.all([
       db.query("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL"),
