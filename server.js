@@ -186,28 +186,33 @@ async function initDB() {
     console.warn("employee_code migration warning:", e.message);
   }
 
-  // إنشاء حساب الأدمن إذا لم يكن موجوداً
-  const ADMIN_EMAIL = "tx.9490@gmail.com";
-  const ADMIN_PASS  = "Aa0010@@";
-  const ex = await db.query("SELECT email FROM users WHERE email=$1", [ADMIN_EMAIL]);
-  if (!ex.rows.length) {
-    await db.query(
-      `INSERT INTO users (email, full_name, password_hash, is_admin, is_super_admin, is_moderator, created_at)
-       VALUES ($1,$2,$3,TRUE,TRUE,TRUE,$4)`,
-      [ADMIN_EMAIL, "المدير الرئيسي", hashPassword(ADMIN_PASS), Date.now()]
-    );
-    console.log("✅ حساب الأدمن أُنشئ");
+  // إنشاء حساب الأدمن من أسرار الخادم فقط — لا تضع بيانات الدخول في الكود
+  const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
+  const ADMIN_PASS  = process.env.ADMIN_PASS  || "";
+  if (ADMIN_EMAIL && ADMIN_PASS) {
+    const ex = await db.query("SELECT email FROM users WHERE email=$1", [ADMIN_EMAIL]);
+    if (!ex.rows.length) {
+      await db.query(
+        `INSERT INTO users (email, full_name, password_hash, is_admin, is_super_admin, is_moderator, created_at)
+         VALUES ($1,$2,$3,TRUE,TRUE,TRUE,$4)`,
+        [ADMIN_EMAIL, "المدير الرئيسي", hashPassword(ADMIN_PASS), Date.now()]
+      );
+      console.log("✅ حساب الأدمن أُنشئ");
+    }
+  } else {
+    console.warn("⚠️ ADMIN_EMAIL و ADMIN_PASS غير مضبوطين — لن يُنشأ حساب أدمن تلقائياً");
   }
 }
 
 // ══════════════════════════════════════════════
 // 3. مساعدات الأمان — مُحصَّنة
 // ══════════════════════════════════════════════
-// 🔒 يُقرأ من متغير بيئة (Render Secret) — مع قيمة احتياطية للتطوير فقط
-const ADMIN_KEY = process.env.ADMIN_KEY || "APLUS9490";
+// 🔒 يُقرأ من متغير بيئة (Render Secret) فقط
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
 
-if (process.env.NODE_ENV === "production" && ADMIN_KEY === "APLUS9490") {
-  console.warn("⚠️  تحذير: ADMIN_KEY الافتراضي مستخدم في الإنتاج — اضبط متغير البيئة ADMIN_KEY على Render!");
+if (!ADMIN_KEY) {
+  console.error("❌ ADMIN_KEY غير مضبوط — اضبطه في أسرار Render قبل التشغيل");
+  if (process.env.NODE_ENV === "production") process.exit(1);
 }
 
 // مقارنة آمنة من الناحية الزمنية (تمنع timing attacks)
