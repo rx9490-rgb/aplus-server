@@ -46,13 +46,14 @@ const db = {
   async query(text, params, retries = 3) {
     let lastError;
     for (let i = 0; i < retries; i++) {
-      const client = await pool.connect();
+      let client = null;
       try {
+        client = await pool.connect();
         const result = await client.query(text, params);
-        client.release();      // نجح → أغلق مرة واحدة
+        client.release();
         return result;
       } catch (e) {
-        client.release(true);  // فشل → أغلق مع إشارة الخطأ (مرة واحدة فقط)
+        if (client) client.release(true);
         lastError = e;
         if (i < retries - 1) await sleep(300 * (i + 1));
       }
@@ -60,6 +61,11 @@ const db = {
     throw lastError;
   }
 };
+
+// يبدأ HTTP فوراً، وتنتظر طلبات الدخول جاهزية قاعدة البيانات
+let dbReady = false;
+let dbInitError = null;
+let dbInitPromise = Promise.resolve();
 
 // ══════════════════════════════════════════════
 // 2. إنشاء الجداول تلقائياً مع أعمدة جديدة
@@ -758,9 +764,12 @@ app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 // ══════════════════════════════════════════════
 // 6. Health & Ping
 // ══════════════════════════════════════════════
-app.get("/api/healthz", (_req, res) =>
-  res.json({ status: "ok", time: Date.now(), clients: sseClients.size })
-);
+app.get("/api/healthz", (_req, res) => {
+  if (!dbReady) {
+    return res.status(503).json({ status: "starting", message: "قاعدة البيانات قيد التشغيل" });
+  }
+  res.json({ status: "ok", time: Date.now(), clients: sseClients.size });
+});
 
 app.get("/ping", (_req, res) => res.send("pong"));
 
@@ -925,6 +934,11 @@ app.post("/api/auth/register", async (req, res) => {
 
 app.post("/api/auth/login", async (req, res) => {
   try {
+    // يمنع فشل الدخول أثناء استيقاظ Render أو قاعدة البيانات
+    await dbInitPromise;
+    if (dbInitError) {
+      return res.status(503).json({ ok: false, msg: "قاعدة البيانات غير جاهزة، أعد المحاولة بعد قليل" });
+    }
     const ip = getClientIp(req);
 
     // ❶ فحص حظر IP
@@ -2279,30 +2293,33 @@ function startCleanup() {
 // ══════════════════════════════════════════════
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
-initDB()
+// افتح المنفذ أولاً حتى يستجيب Render للفحص، ثم جهّز قاعدة البيانات
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`\n🚀 A+ Medical Server v5.0 يعمل على المنفذ ${PORT}`);
+  console.log(`🔴 بث مباشر SSE مفعّل`);
+  startAntiSleep();
+  startCleanup();
+});
+
+// Keep-alive للـ HTTP server
+server.keepAliveTimeout = 120_000;
+server.headersTimeout   = 125_000;
+
+dbInitPromise = initDB()
   .then(() => {
-    const server = app.listen(PORT, "0.0.0.0", () => {
-      console.log(`\n🚀 A+ Medical Server v5.0 يعمل على المنفذ ${PORT}`);
-      console.log(`🔴 بث مباشر SSE مفعّل`);
-      console.log(`💎 قاعدة بيانات متصلة`);
-      startAntiSleep();
-      startCleanup();
-    });
-
-    // Keep-alive للـ HTTP server
-    server.keepAliveTimeout = 120_000;
-    server.headersTimeout   = 125_000;
-
-    // إغلاق نظيف
-    process.on("SIGTERM", () => {
-      console.log("⏹ إغلاق نظيف...");
-      server.close(() => pool.end());
-    });
-    process.on("SIGINT", () => {
-      server.close(() => pool.end());
-    });
+    dbReady = true;
+    console.log(`💎 قاعدة البيانات متصلة`);
   })
   .catch((err) => {
-    console.error("❌ فشل تشغيل قاعدة البيانات:", err);
-    process.exit(1);
+    console.error("❌ فشل تشغيل قاعدة البيانات:", err?.message || err);
+    dbInitError = err;
   });
+
+// إغلاق نظيف
+process.on("SIGTERM", () => {
+  console.log("⏹ إغلاق نظيف...");
+  server.close(() => pool.end());
+});
+process.on("SIGINT", () => {
+  server.close(() => pool.end());
+});
