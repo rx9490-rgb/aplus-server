@@ -1581,18 +1581,10 @@ app.post("/api/user/settings", async (req, res) => {
     const user = await getSessionUser(req.headers["x-session-token"]);
     if (!user) return res.json({ ok: false });
     const { settings } = req.body;
-    const current = await db.query(
-      "SELECT settings FROM user_settings WHERE user_email=$1",
-      [user.email]
-    );
-    const previousSettings = current.rows[0]?.settings;
-    const safePrevious = previousSettings && typeof previousSettings === "object" ? previousSettings : {};
-    const safeIncoming = settings && typeof settings === "object" ? settings : {};
-    const mergedSettings = { ...safePrevious, ...safeIncoming };
     await db.query(
       `INSERT INTO user_settings (user_email, settings, updated_at) VALUES ($1,$2,$3)
        ON CONFLICT (user_email) DO UPDATE SET settings=$2, updated_at=$3`,
-      [user.email, JSON.stringify(mergedSettings), Date.now()]
+      [user.email, JSON.stringify(settings || {}), Date.now()]
     );
     res.json({ ok: true });
   } catch { res.json({ ok: false }); }
