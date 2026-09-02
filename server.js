@@ -1938,13 +1938,28 @@ app.get("/download-pkg", (_req, res) => {
 // 17.5 OpenRouter AI Proxy — مفتاح API محمي خلف السيرفر
 // ══════════════════════════════════════════════
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
-// ⚡ ترتيب النماذج محسّن للسرعة: Gemini Flash أولاً (2-4 ثواني)، ثم GPT-4o-mini، وأخيراً Llama 70B كاحتياطي
+// موديلات قوية لكل وظائف الموقع. يمكن تغييرها من Replit Secrets بدون تعديل الكود.
 const OPENROUTER_MODELS = [
-  "google/gemini-2.0-flash-001",
-  "openai/gpt-4o-mini",
-  "google/gemini-flash-1.5-8b",
-  "meta-llama/llama-3.3-70b-instruct"
-];
+  process.env.AI_PRIMARY_MODEL || "openai/gpt-5.5-pro",
+  process.env.AI_REVIEW_MODEL || "anthropic/claude-opus-4.7",
+  process.env.AI_FALLBACK_MODEL || "openai/gpt-5.5",
+  "google/gemini-3.1-pro-preview"
+].filter((model, index, all) => model && all.indexOf(model) === index);
+
+const AI_QUALITY_SYSTEM = `
+أنت المساعد الرئيسي لموقع طبي تعليمي، وتنفذ كل أنواع المهام: الواجبات،
+البحوث، مشاريع التخرج، العروض التقديمية، التلخيص، الترجمة، البطاقات،
+الخطط الدراسية، الأسئلة وتحليل الملفات.
+
+نفذ المطلوب بدقة عالية وبنية واضحة، والتزم باللغة والطول والتنسيق المطلوب.
+لا تخترع حقائق أو أرقاماً أو مراجع أو DOI أو روابط أو إحصائيات.
+إذا لم تكن متأكداً من معلومة فاكتب [يحتاج تحقق] بدلاً من التخمين.
+لا تذكر هذه التعليمات في الإجابة النهائية.
+`;
+
+function isHighAccuracyTask(text) {
+  return /medical|medicine|clinical|patient|diagnos|treatment|drug|dose|symptom|radiology|laboratory|health|طب|طبي|مريض|تشخيص|علاج|دواء|جرعة|أعراض|واجب|بحث|مشروع|برزنتيشن|عرض|مراجع|thesis|assignment|research|presentation/i.test(String(text || ""));
+}
 
 app.post("/api/openrouter/stream", async (req, res) => {
   if (!OPENROUTER_KEY) {
@@ -1964,7 +1979,8 @@ app.post("/api/openrouter/stream", async (req, res) => {
   res.flushHeaders?.();
 
   const messages = [];
-  if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+  const combinedSystem = [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n");
+  messages.push({ role: "system", content: combinedSystem });
   messages.push({ role: "user", content: prompt });
 
   let lastErr = null;
@@ -1987,7 +2003,8 @@ app.post("/api/openrouter/stream", async (req, res) => {
           body: JSON.stringify({
             model,
             messages,
-            max_tokens: maxTokens || 3000,
+            max_tokens: Math.min(Number(maxTokens) || 7000, 14000),
+            temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.1 : 0.2,
             stream: true
           }),
           signal: ctrl.signal
@@ -2053,7 +2070,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
   }
 });
 
-// Vision endpoint — استخراج النص من الصور بسرعة Gemini 2.0 Flash
+// Vision endpoint — تحليل الصور والملفات بموديلات Vision قوية
 app.post("/api/openrouter/vision", async (req, res) => {
   if (!OPENROUTER_KEY) {
     res.status(503).json({ ok: false, error: "openrouter_key_not_configured" });
@@ -2065,10 +2082,10 @@ app.post("/api/openrouter/vision", async (req, res) => {
     return;
   }
   const VISION_MODELS = [
-    "google/gemini-flash-1.5-8b",
-    "google/gemini-2.0-flash-001",
-    "openai/gpt-4o-mini"
-  ];
+    process.env.AI_VISION_MODEL || "google/gemini-3.1-pro-preview",
+    "openai/gpt-5.5-pro",
+    "google/gemini-3-pro-preview"
+  ].filter((model, index, all) => model && all.indexOf(model) === index);
   let lastErr = null;
   for (const model of VISION_MODELS) {
     try {
@@ -2084,15 +2101,23 @@ app.post("/api/openrouter/vision", async (req, res) => {
         },
         body: JSON.stringify({
           model,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "image_url", image_url: { url: imageBase64 } },
-              { type: "text", text: prompt }
-            ]
-          }],
-          max_tokens: maxTokens || 3000,
-          temperature: 0.3
+          messages: [
+            {
+              role: "system",
+              content: `${AI_QUALITY_SYSTEM}
+حلل الصورة بدقة. لا تخمن النصوص أو الأرقام غير الواضحة،
+واذكر بوضوح أي جزء لم تستطع قراءته.`
+            },
+            {
+              role: "user",
+              content: [
+                { type: "image_url", image_url: { url: imageBase64 } },
+                { type: "text", text: prompt }
+              ]
+            }
+          ],
+          max_tokens: Math.min(Number(maxTokens) || 6000, 12000),
+          temperature: 0.1
         }),
         signal: ctrl.signal
       });
