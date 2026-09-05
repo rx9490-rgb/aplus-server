@@ -1956,6 +1956,10 @@ const OPENROUTER_MODELS = [
   safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "meta-llama/llama-3.3-70b-instruct"),
   "deepseek/deepseek-chat-v3.1"
 ].filter((model, index, all) => model && all.indexOf(model) === index);
+const ARABIC_MODEL = safeOpenRouterModel(
+  process.env.AI_ARABIC_MODEL,
+  "google/gemini-2.5-pro"
+);
 
 const AI_QUALITY_SYSTEM = `
 أنت المساعد الرئيسي لموقع طبي تعليمي، وتنفذ كل أنواع المهام: الواجبات،
@@ -1997,8 +2001,13 @@ app.post("/api/openrouter/stream", async (req, res) => {
 
   let lastErr = null;
   let sentAny = false;
+  const requestText = `${systemPrompt || ""}\n${prompt}`;
+  const isArabicRequest = /[\u0600-\u06ff]/.test(requestText);
+  const requestModels = isArabicRequest
+    ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
+    : OPENROUTER_MODELS;
 
-  for (const model of OPENROUTER_MODELS) {
+  for (const model of requestModels) {
     if (sentAny) break;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -2081,7 +2090,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
       code,
       status: lastErr?.status || null,
       body: String(lastErr?.body || "").slice(0, 500),
-      models: OPENROUTER_MODELS
+      models: requestModels
     });
     res.write(`event: error\ndata: ${JSON.stringify({ error: code })}\n\n`);
     res.end();
