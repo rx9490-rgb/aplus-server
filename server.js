@@ -1938,12 +1938,22 @@ app.get("/download-pkg", (_req, res) => {
 // 17.5 OpenRouter AI Proxy — مفتاح API محمي خلف السيرفر
 // ══════════════════════════════════════════════
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
-// موديلات قوية لكل وظائف الموقع. يمكن تغييرها من Replit Secrets بدون تعديل الكود.
+// OpenRouter model IDs must include the provider prefix. Invalid/old environment
+// values are ignored so the server does not fall back to the broken Groq model.
+function safeOpenRouterModel(value, fallback) {
+  const model = String(value || "").trim();
+  if (!model || !model.includes("/") || model === "llama-3.3-70b-versatile") {
+    return fallback;
+  }
+  return model;
+}
+// Stable model IDs currently available on OpenRouter. They can still be
+// overridden through Replit Secrets with AI_*_MODEL when needed.
 const OPENROUTER_MODELS = [
-  process.env.AI_PRIMARY_MODEL || "openai/gpt-5.5-pro",
-  process.env.AI_REVIEW_MODEL || "anthropic/claude-opus-4.7",
-  process.env.AI_FALLBACK_MODEL || "openai/gpt-5.5",
-  "google/gemini-3.1-pro-preview"
+  safeOpenRouterModel(process.env.AI_PRIMARY_MODEL, "openai/gpt-4.1-mini"),
+  safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "google/gemini-2.5-pro"),
+  safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "meta-llama/llama-3.3-70b-instruct"),
+  "deepseek/deepseek-chat-v3.1"
 ].filter((model, index, all) => model && all.indexOf(model) === index);
 
 const AI_QUALITY_SYSTEM = `
@@ -1963,6 +1973,7 @@ function isHighAccuracyTask(text) {
 
 app.post("/api/openrouter/stream", async (req, res) => {
   if (!OPENROUTER_KEY) {
+    console.error("[OpenRouter] OPENROUTER_API_KEY is not configured");
     res.status(503).json({ ok: false, error: "openrouter_key_not_configured" });
     return;
   }
@@ -2065,6 +2076,12 @@ app.post("/api/openrouter/stream", async (req, res) => {
       const m = (lastErr?.message || lastErr?.name || String(lastErr || "")).toLowerCase();
       if (m.includes("abort") || m.includes("timeout")) code = "timeout";
     }
+    console.error("[OpenRouter] all models failed", {
+      code,
+      status: lastErr?.status || null,
+      body: String(lastErr?.body || "").slice(0, 500),
+      models: OPENROUTER_MODELS
+    });
     res.write(`event: error\ndata: ${JSON.stringify({ error: code })}\n\n`);
     res.end();
   }
@@ -2073,6 +2090,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
 // Vision endpoint — تحليل الصور والملفات بموديلات Vision قوية
 app.post("/api/openrouter/vision", async (req, res) => {
   if (!OPENROUTER_KEY) {
+    console.error("[OpenRouter Vision] OPENROUTER_API_KEY is not configured");
     res.status(503).json({ ok: false, error: "openrouter_key_not_configured" });
     return;
   }
@@ -2082,9 +2100,9 @@ app.post("/api/openrouter/vision", async (req, res) => {
     return;
   }
   const VISION_MODELS = [
-    process.env.AI_VISION_MODEL || "google/gemini-3.1-pro-preview",
-    "openai/gpt-5.5-pro",
-    "google/gemini-3-pro-preview"
+    safeOpenRouterModel(process.env.AI_VISION_MODEL, "google/gemini-2.5-flash"),
+    "openai/gpt-4.1-mini",
+    "qwen/qwen2.5-vl-72b-instruct"
   ].filter((model, index, all) => model && all.indexOf(model) === index);
   let lastErr = null;
   for (const model of VISION_MODELS) {
