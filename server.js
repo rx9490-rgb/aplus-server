@@ -1950,6 +1950,7 @@ function safeOpenRouterModel(value, fallback) {
 // Stable model IDs currently available on OpenRouter. They can still be
 // overridden through Replit Secrets with AI_*_MODEL when needed.
 const OPENROUTER_MODELS = [
+  "openrouter/auto",
   safeOpenRouterModel(process.env.AI_PRIMARY_MODEL, "openai/gpt-4.1-mini"),
   safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "google/gemini-2.5-pro"),
   safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "meta-llama/llama-3.3-70b-instruct"),
