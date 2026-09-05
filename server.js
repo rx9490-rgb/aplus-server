@@ -260,6 +260,72 @@ async function isAdminRequest(req) {
   ));
 }
 
+// حماية استخدام الذكاء الاصطناعي — لا تسمح لأي شخص باستنزاف مفتاح OpenRouter
+// من خلال استدعاء /api/openrouter مباشرة خارج الواجهة.
+const aiUsage = new Map();
+const AI_PER_MINUTE_LIMIT = Math.max(1, Number(process.env.AI_REQUESTS_PER_MINUTE || 8));
+const AI_PER_DAY_LIMIT = Math.max(AI_PER_MINUTE_LIMIT, Number(process.env.AI_REQUESTS_PER_DAY || 30));
+const AI_MAX_TOKENS_PER_REQUEST = Math.max(1000, Number(process.env.AI_MAX_TOKENS_PER_REQUEST || 6000));
+const AI_MAX_TOKENS_PER_DAY = Math.max(
+  AI_MAX_TOKENS_PER_REQUEST,
+  Number(process.env.AI_MAX_TOKENS_PER_DAY || 30000)
+);
+const AI_MAX_PROMPT_CHARS = Math.max(
+  10_000,
+  Number(process.env.AI_MAX_PROMPT_CHARS || 60_000)
+);
+const AI_MAX_IMAGE_CHARS = Math.max(
+  1_000_000,
+  Number(process.env.AI_MAX_IMAGE_CHARS || 12_000_000)
+);
+
+async function requireAiUser(req, res, requestedTokens = 0) {
+  const auth = String(req.headers.authorization || "");
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const token = req.headers["x-session-token"] || bearer;
+  const user = await getSessionUser(token);
+  if (!user) {
+    res.status(401).json({ ok: false, error: "login_required" });
+    return null;
+  }
+  if (user.banned) {
+    res.status(403).json({ ok: false, error: "account_blocked" });
+    return null;
+  }
+
+  const now = Date.now();
+  const key = String(user.email || req.ip || "unknown");
+  const old = aiUsage.get(key);
+  const record = old && now - old.dayStart < 86_400_000
+    ? old
+    : { minuteStart: now, minuteCount: 0, dayStart: now, dayCount: 0, tokenCount: 0 };
+  if (now - record.minuteStart >= 60_000) {
+    record.minuteStart = now;
+    record.minuteCount = 0;
+  }
+  const reservedTokens = Math.min(
+    Math.max(Number(requestedTokens) || 3500, 1000),
+    AI_MAX_TOKENS_PER_REQUEST
+  );
+  if (
+    record.minuteCount >= AI_PER_MINUTE_LIMIT ||
+    record.dayCount >= AI_PER_DAY_LIMIT ||
+    record.tokenCount + reservedTokens > AI_MAX_TOKENS_PER_DAY
+  ) {
+    res.status(429).json({
+      ok: false,
+      error: "ai_usage_limit",
+      message: "تم تجاوز حد استخدام الذكاء الاصطناعي مؤقتاً."
+    });
+    return null;
+  }
+  record.minuteCount += 1;
+  record.dayCount += 1;
+  record.tokenCount += reservedTokens;
+  aiUsage.set(key, record);
+  return user;
+}
+
 // تسجيل أحداث إدارية حرجة (Audit Log)
 async function auditLog(action, actor, details = {}) {
   try {
@@ -756,6 +822,12 @@ app.use("/api", rateLimit({
   windowMs: 60_000, max: 600,
   standardHeaders: true, legacyHeaders: false,
   skip: (req) => req.path.startsWith("/auth"), // لا تعيد احتساب auth
+}));
+app.use("/api/openrouter", rateLimit({
+  windowMs: 60_000,
+  max: Math.max(1, Number(process.env.AI_GLOBAL_PER_MINUTE || 20)),
+  standardHeaders: true,
+  legacyHeaders: false
 }));
 
 app.use(express.json({ limit: "100mb" }));
@@ -1950,15 +2022,14 @@ function safeOpenRouterModel(value, fallback) {
 // Stable model IDs currently available on OpenRouter. They can still be
 // overridden through Replit Secrets with AI_*_MODEL when needed.
 const OPENROUTER_MODELS = [
-  "openrouter/auto",
-  safeOpenRouterModel(process.env.AI_PRIMARY_MODEL, "openai/gpt-4.1-mini"),
-  safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "google/gemini-2.5-pro"),
+  safeOpenRouterModel(process.env.AI_PRIMARY_MODEL, "google/gemini-2.5-flash"),
+  safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "openai/gpt-4.1-mini"),
   safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "meta-llama/llama-3.3-70b-instruct"),
   "deepseek/deepseek-chat-v3.1"
 ].filter((model, index, all) => model && all.indexOf(model) === index);
 const ARABIC_MODEL = safeOpenRouterModel(
   process.env.AI_ARABIC_MODEL,
-  "google/gemini-2.5-pro"
+  "google/gemini-2.5-flash"
 );
 
 const AI_QUALITY_SYSTEM = `
@@ -1987,6 +2058,16 @@ app.post("/api/openrouter/stream", async (req, res) => {
     res.status(400).json({ ok: false, error: "prompt_required" });
     return;
   }
+  if (String(prompt).length > AI_MAX_PROMPT_CHARS) {
+    res.status(413).json({ ok: false, error: "prompt_too_large" });
+    return;
+  }
+  const aiUser = await requireAiUser(req, res, maxTokens);
+  if (!aiUser) return;
+  const safeMaxTokens = Math.min(
+    Math.max(Number(maxTokens) || 3500, 1000),
+    AI_MAX_TOKENS_PER_REQUEST
+  );
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -2006,14 +2087,26 @@ app.post("/api/openrouter/stream", async (req, res) => {
   const requestModels = isArabicRequest
     ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
     : OPENROUTER_MODELS;
+  let clientGone = false;
+  res.on("close", () => {
+    if (!res.writableEnded) clientGone = true;
+  });
+  console.log("[AI] stream request", {
+    user: aiUser.email,
+    promptChars: String(prompt).length,
+    maxTokens: safeMaxTokens,
+    models: requestModels
+  });
 
   for (const model of requestModels) {
+    if (clientGone) return;
     if (sentAny) break;
       /* لا نعيد الطلب نفسه مرتين لكل نموذج؛ ننتقل إلى النموذج الاحتياطي
          حتى لا تتراكم الطلبات وتظهر للمستخدم كأن الخدمة متقطعة. */
       for (let attempt = 0; attempt < 1; attempt++) {
       try {
         const ctrl = new AbortController();
+        if (clientGone) return;
         const tm = setTimeout(() => ctrl.abort(), 90000);
         const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
@@ -2027,7 +2120,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
           body: JSON.stringify({
             model,
             messages,
-            max_tokens: Math.min(Number(maxTokens) || 7000, 14000),
+            max_tokens: safeMaxTokens,
             temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.1 : 0.2,
             stream: true
           }),
@@ -2055,6 +2148,10 @@ app.post("/api/openrouter/stream", async (req, res) => {
         let attemptText = "";
         let upstreamError = null;
         while (true) {
+          if (clientGone) {
+            ctrl.abort();
+            return;
+          }
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
@@ -2132,6 +2229,25 @@ app.post("/api/openrouter/vision", async (req, res) => {
     res.status(400).json({ ok: false, error: "missing_params" });
     return;
   }
+  if (
+    String(prompt).length > AI_MAX_PROMPT_CHARS ||
+    String(imageBase64).length > AI_MAX_IMAGE_CHARS
+  ) {
+    res.status(413).json({ ok: false, error: "payload_too_large" });
+    return;
+  }
+  const aiUser = await requireAiUser(req, res, maxTokens);
+  if (!aiUser) return;
+  const safeMaxTokens = Math.min(
+    Math.max(Number(maxTokens) || 2000, 1000),
+    Math.min(AI_MAX_TOKENS_PER_REQUEST, 3500)
+  );
+  console.log("[AI] vision request", {
+    user: aiUser.email,
+    promptChars: String(prompt).length,
+    imageChars: String(imageBase64).length,
+    maxTokens: safeMaxTokens
+  });
   const VISION_MODELS = [
     safeOpenRouterModel(process.env.AI_VISION_MODEL, "google/gemini-2.5-flash"),
     "openai/gpt-4.1-mini",
@@ -2167,7 +2283,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
               ]
             }
           ],
-          max_tokens: Math.min(Number(maxTokens) || 6000, 12000),
+          max_tokens: safeMaxTokens,
           temperature: 0.1
         }),
         signal: ctrl.signal
