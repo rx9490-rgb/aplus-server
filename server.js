@@ -2011,7 +2011,12 @@ app.get("/download-pkg", (_req, res) => {
 // ══════════════════════════════════════════════
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 /* Gemini مباشر — يُحفظ في Secrets ولا يصل إلى المتصفح */
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_GEMINI_API_KEY || "";
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  process.env.GEMINI_KEY ||
+  "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 // OpenRouter model IDs must include the provider prefix. Invalid/old environment
 // values are ignored so the server does not fall back to the broken Groq model.
@@ -2105,8 +2110,13 @@ app.post("/api/ai/call", async (req, res) => {
     );
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      console.error("[Gemini] upstream error", response.status, data?.error?.message || "");
-      res.status(502).json({ ok: false, error: `gemini_${response.status}` });
+      const upstreamMessage = String(data?.error?.message || "").slice(0, 240);
+      console.error("[Gemini] upstream error", response.status, upstreamMessage);
+      res.status(502).json({
+        ok: false,
+        error: `gemini_${response.status}`,
+        detail: upstreamMessage || undefined
+      });
       return;
     }
     const content = (data?.candidates?.[0]?.content?.parts || [])
@@ -2114,7 +2124,9 @@ app.post("/api/ai/call", async (req, res) => {
       .join("")
       .trim();
     if (!content) {
-      res.status(502).json({ ok: false, error: "gemini_empty_response" });
+      const finishReason = data?.candidates?.[0]?.finishReason || "unknown";
+      console.error("[Gemini] empty response", finishReason);
+      res.status(502).json({ ok: false, error: "gemini_empty_response", detail: finishReason });
       return;
     }
     res.json({ ok: true, content, provider: "gemini", model: GEMINI_MODEL });
