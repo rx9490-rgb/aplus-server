@@ -2017,7 +2017,7 @@ const GEMINI_API_KEY =
   process.env.GOOGLE_API_KEY ||
   process.env.GEMINI_KEY ||
   "";
-const GEMINI_MODEL = String(process.env.GEMINI_MODEL || "gemini-2.5-flash")
+const GEMINI_MODEL = String(process.env.GEMINI_MODEL || "gemini-3.6-flash")
   .trim()
   .replace(/^models\//i, "");
 const GEMINI_KEY_READY = String(GEMINI_API_KEY).trim().length > 0;
