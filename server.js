@@ -2010,6 +2010,17 @@ app.get("/download-pkg", (_req, res) => {
 // 17.5 OpenRouter AI Proxy — مفتاح API محمي خلف السيرفر
 // ══════════════════════════════════════════════
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
+/* Gemini مباشر — يُحفظ في Secrets ولا يصل إلى المتصفح */
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  process.env.GEMINI_KEY ||
+  "";
+const GEMINI_MODEL = String(process.env.GEMINI_MODEL || "gemini-2.5-flash")
+  .trim()
+  .replace(/^models\//i, "");
+const GEMINI_KEY_READY = String(GEMINI_API_KEY).trim().length > 0;
 // OpenRouter model IDs must include the provider prefix. Invalid/old environment
 // values are ignored so the server does not fall back to the broken Groq model.
 function safeOpenRouterModel(value, fallback) {
@@ -2046,6 +2057,104 @@ const AI_QUALITY_SYSTEM = `
 function isHighAccuracyTask(text) {
   return /medical|medicine|clinical|patient|diagnos|treatment|drug|dose|symptom|radiology|laboratory|health|طب|طبي|مريض|تشخيص|علاج|دواء|جرعة|أعراض|واجب|بحث|مشروع|برزنتيشن|عرض|مراجع|thesis|assignment|research|presentation/i.test(String(text || ""));
 }
+
+// ══════════════════════════════════════════════
+// Gemini مباشر — المسار الأساسي للواجبات الأكاديمية
+// ══════════════════════════════════════════════
+app.post("/api/ai/call", async (req, res) => {
+  const { provider = "gemini", prompt, systemPrompt = "", maxTokens } = req.body || {};
+  if (provider !== "gemini") {
+    res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
+    return;
+  }
+  if (!GEMINI_KEY_READY) {
+    console.error("[Gemini] GEMINI_API_KEY is not configured");
+    res.status(503).json({ ok: false, error: "gemini_key_not_configured" });
+    return;
+  }
+  if (!prompt) {
+    res.status(400).json({ ok: false, error: "prompt_required" });
+    return;
+  }
+  if (String(prompt).length > AI_MAX_PROMPT_CHARS) {
+    res.status(413).json({ ok: false, error: "prompt_too_large" });
+    return;
+  }
+  const aiUser = await requireAiUser(req, res, maxTokens);
+  if (!aiUser) return;
+
+  const safeMaxTokens = Math.min(
+    Math.max(Number(maxTokens) || 7000, 1000),
+    AI_MAX_TOKENS_PER_REQUEST
+  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": String(GEMINI_API_KEY).trim()
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{
+              text: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n")
+            }]
+          },
+          contents: [{ role: "user", parts: [{ text: String(prompt) }] }],
+          generationConfig: {
+            maxOutputTokens: safeMaxTokens,
+            temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.15 : 0.25,
+            topP: 0.9
+          }
+        }),
+        signal: controller.signal
+      }
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const upstreamMessage = String(data?.error?.message || "").slice(0, 240);
+      console.error("[Gemini] upstream error", response.status, upstreamMessage);
+      res.status(502).json({
+        ok: false,
+        error: `gemini_${response.status}`,
+        detail: upstreamMessage || undefined
+      });
+      return;
+    }
+    const content = (data?.candidates?.[0]?.content?.parts || [])
+      .map((part) => part?.text || "")
+      .join("")
+      .trim();
+    if (!content) {
+      const finishReason = data?.candidates?.[0]?.finishReason || "unknown";
+      console.error("[Gemini] empty response", finishReason);
+      res.status(502).json({ ok: false, error: "gemini_empty_response", detail: finishReason });
+      return;
+    }
+    res.json({ ok: true, content, provider: "gemini", model: GEMINI_MODEL });
+  } catch (error) {
+    const message = error?.name === "AbortError" ? "timeout" : "network";
+    console.error("[Gemini] request failed", message, error?.message || "");
+    res.status(502).json({ ok: false, error: `gemini_${message}` });
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
+// فحص آمن للسيرفر — لا يعرض المفتاح، لكنه يؤكد أن Render قرأه
+app.get("/api/ai/status", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "gemini",
+    configured: GEMINI_KEY_READY,
+    model: GEMINI_MODEL,
+    route: "/api/ai/call"
+  });
+});
 
 app.post("/api/openrouter/stream", async (req, res) => {
   if (!OPENROUTER_KEY) {
