@@ -2051,6 +2051,26 @@ function isAssignmentTask(text) {
   return /assignment|academic\s+assignment|academic\s+paper|coursework|واجب|واجب\s+أكاديمي|بحث\s+جامعي|مشروع\s+تخرج|تعليمات\s+الدكتور|متطلبات\s+الواجب/i.test(String(text || ""));
 }
 
+function isFormAssignmentTask(text) {
+  return /nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|shift\s*[ab]|assigned\s+patients|responsible\s+nurse|delegated\s+nurse|break\s+time|narcotic\s+check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s+drug|sterile\s+supply|hazardous\s+materials|o2\s+and\s+suction|fire\s+plan|red\s+code|rescue\s+person|extinguisher|ورقة\s+واجب\s+تمريض|شفت\s*[أب]|مرضى\s+مكلفون|خطة\s+الحريق|الأدوية\s+الخاضعة|عربة\s+الطوارئ|المواد\s+المعقمة/i.test(String(text || ""));
+}
+
+const FORM_ASSIGNMENT_RULES = `
+هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
+إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
+- أخرج نموذجاً منظماً بعناوين واضحة للشفت A ثم الشفت B.
+- املأ فقط البيانات الموجودة في الطلب أو التعليمات.
+- لا تخترع أسماء ممرضين أو مرضى أو أوقاتاً أو أرقاماً أو توقيعات.
+- عند غياب قيمة، اكتب [يُستكمل] داخل الخانة بدلاً من اختراعها.
+- حافظ على جميع الحقول: Floor/Unit، Head Nurse، Total Patients، CPR Team، Date،
+  Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time،
+  Narcotic Check، Emergency & Defibrillator، High Alert Cabinet & Refrigerator،
+  Controlled Drug، Sterile Supply، Hazardous Materials، O2 and Suction،
+  Rescue Person، Red Code، Activate Alarm، Extinguisher Use، Signature.
+- لا تكتب مقدمة أو خاتمة أو مراجع أو شرحاً خارج النموذج.
+- استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
+`;
+
 async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
@@ -2097,8 +2117,13 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
+  const formTask = isFormAssignmentTask(prompt);
+  const effectiveSystemPrompt = [
+    systemPrompt,
+    formTask ? FORM_ASSIGNMENT_RULES : ""
+  ].filter(Boolean).join("\n\n");
   const draftMessages = [
-    { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+    { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
     { role: "user", content: String(prompt) }
   ];
   const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
@@ -2115,6 +2140,9 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
 لا تخترع مراجع أو DOI أو أرقاماً. إذا كانت المراجع غير قابلة للتحقق، احذف الادعاء أو اكتب [يحتاج تحقق].
 أخرج نص الواجب النهائي فقط.
+${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
+${FORM_ASSIGNMENT_RULES}
+تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
@@ -2125,7 +2153,7 @@ ${String(draft.content).slice(0, 50000)}
   const reviewed = await openRouterCompletion(
     reviewModel,
     [
-      { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+      { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
       { role: "user", content: reviewPrompt }
     ],
     maxTokens,
