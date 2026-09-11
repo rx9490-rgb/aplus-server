@@ -2010,19 +2010,8 @@ app.get("/download-pkg", (_req, res) => {
 // 17.5 OpenRouter AI Proxy — مفتاح API محمي خلف السيرفر
 // ══════════════════════════════════════════════
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
-/* Gemini مباشر — يُحفظ في Secrets ولا يصل إلى المتصفح */
-const GEMINI_API_KEY =
-  process.env.GEMINI_API_KEY ||
-  process.env.GOOGLE_GEMINI_API_KEY ||
-  process.env.GOOGLE_API_KEY ||
-  process.env.GEMINI_KEY ||
-  "";
-const GEMINI_MODEL = String(process.env.GEMINI_MODEL || "gemini-3.6-flash")
-  .trim()
-  .replace(/^models\//i, "");
-const GEMINI_KEY_READY = String(GEMINI_API_KEY).trim().length > 0;
 // OpenRouter model IDs must include the provider prefix. Invalid/old environment
-// values are ignored so the server does not fall back to the broken Groq model.
+// values are ignored so the server does not fall back to an invalid model.
 function safeOpenRouterModel(value, fallback) {
   const model = String(value || "").trim();
   if (!model || !model.includes("/") || model === "llama-3.3-70b-versatile") {
@@ -2059,7 +2048,8 @@ function isHighAccuracyTask(text) {
 }
 
 // ══════════════════════════════════════════════
-// Gemini مباشر — المسار الأساسي للواجبات الأكاديمية
+// OpenRouter — المسار الموحد باستخدام مفتاح المشروع
+// لا يعتمد هذا المسار على GEMINI_API_KEY المباشر.
 // ══════════════════════════════════════════════
 app.post("/api/ai/call", async (req, res) => {
   const { provider = "gemini", prompt, systemPrompt = "", maxTokens } = req.body || {};
@@ -2067,9 +2057,9 @@ app.post("/api/ai/call", async (req, res) => {
     res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
     return;
   }
-  if (!GEMINI_KEY_READY) {
-    console.error("[Gemini] GEMINI_API_KEY is not configured");
-    res.status(503).json({ ok: false, error: "gemini_key_not_configured" });
+  if (!OPENROUTER_KEY) {
+    console.error("[OpenRouter] OPENROUTER_API_KEY is not configured");
+    res.status(503).json({ ok: false, error: "openrouter_key_not_configured" });
     return;
   }
   if (!prompt) {
@@ -2087,61 +2077,80 @@ app.post("/api/ai/call", async (req, res) => {
     Math.max(Number(maxTokens) || 7000, 1000),
     AI_MAX_TOKENS_PER_REQUEST
   );
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 120000);
+
+  const requestText = `${systemPrompt || ""}\n${prompt}`;
+  const isArabicRequest = /[\u0600-\u06ff]/.test(requestText);
+  const requestModels = isArabicRequest
+    ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
+    : OPENROUTER_MODELS;
+  let lastError = null;
+
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": String(GEMINI_API_KEY).trim()
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{
-              text: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n")
-            }]
+    const messages = [
+      { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+      { role: "user", content: String(prompt) }
+    ];
+
+    for (const model of requestModels) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 120000);
+      try {
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${OPENROUTER_KEY}`,
+            "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
+            "X-Title": "A+ Medical"
           },
-          contents: [{ role: "user", parts: [{ text: String(prompt) }] }],
-          generationConfig: {
-            maxOutputTokens: safeMaxTokens,
-            temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.15 : 0.25,
-            topP: 0.9
-          }
-        }),
-        signal: controller.signal
+          body: JSON.stringify({
+            model,
+            messages,
+            max_tokens: safeMaxTokens,
+            temperature: isHighAccuracyTask(requestText) ? 0.1 : 0.2,
+            stream: false
+          }),
+          signal: controller.signal
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          lastError = {
+            status: response.status,
+            message: String(data?.error?.message || "").slice(0, 240)
+          };
+          console.error("[OpenRouter] model failed", model, response.status, lastError.message);
+          if (response.status === 401 || response.status === 403 || response.status === 402) break;
+          continue;
+        }
+        const content = String(data?.choices?.[0]?.message?.content || "").trim();
+        if (!content) {
+          lastError = { status: 502, message: "empty_response" };
+          continue;
+        }
+        res.json({ ok: true, content, provider: "openrouter", model });
+        return;
+      } catch (error) {
+        lastError = {
+          status: error?.name === "AbortError" ? 504 : 503,
+          message: error?.name === "AbortError" ? "timeout" : (error?.message || "network")
+        };
+        console.error("[OpenRouter] model request failed", model, lastError.message);
+        continue;
+      } finally {
+        clearTimeout(timeout);
       }
-    );
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const upstreamMessage = String(data?.error?.message || "").slice(0, 240);
-      console.error("[Gemini] upstream error", response.status, upstreamMessage);
-      res.status(502).json({
-        ok: false,
-        error: `gemini_${response.status}`,
-        detail: upstreamMessage || undefined
-      });
-      return;
     }
-    const content = (data?.candidates?.[0]?.content?.parts || [])
-      .map((part) => part?.text || "")
-      .join("")
-      .trim();
-    if (!content) {
-      const finishReason = data?.candidates?.[0]?.finishReason || "unknown";
-      console.error("[Gemini] empty response", finishReason);
-      res.status(502).json({ ok: false, error: "gemini_empty_response", detail: finishReason });
-      return;
-    }
-    res.json({ ok: true, content, provider: "gemini", model: GEMINI_MODEL });
+
+    const retryable = lastError?.status >= 500 || lastError?.status === 429;
+    res.status(retryable ? 503 : 502).json({
+      ok: false,
+      error: retryable ? "openrouter_temporarily_unavailable" : "openrouter_request_failed",
+      detail: lastError?.message || undefined
+    });
   } catch (error) {
     const message = error?.name === "AbortError" ? "timeout" : "network";
-    console.error("[Gemini] request failed", message, error?.message || "");
-    res.status(502).json({ ok: false, error: `gemini_${message}` });
-  } finally {
-    clearTimeout(timeout);
+    console.error("[OpenRouter] request failed", message, error?.message || "");
+    res.status(503).json({ ok: false, error: `openrouter_${message}` });
   }
 });
 
@@ -2149,9 +2158,9 @@ app.post("/api/ai/call", async (req, res) => {
 app.get("/api/ai/status", (_req, res) => {
   res.json({
     ok: true,
-    service: "gemini",
-    configured: GEMINI_KEY_READY,
-    model: GEMINI_MODEL,
+    service: "openrouter",
+    configured: Boolean(OPENROUTER_KEY),
+    models: OPENROUTER_MODELS,
     route: "/api/ai/call"
   });
 });
