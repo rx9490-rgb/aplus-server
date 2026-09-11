@@ -2130,7 +2130,7 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
-  const formTask = isFormAssignmentTask(prompt);
+  const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
     systemPrompt,
     formTask ? FORM_ASSIGNMENT_RULES : ""
