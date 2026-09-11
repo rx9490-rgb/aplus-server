@@ -2055,6 +2055,16 @@ function isFormAssignmentTask(text) {
   return /nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|shift\s*[ab]|assigned\s+patients|responsible\s+nurse|delegated\s+nurse|break\s+time|narcotic\s+check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s+drug|sterile\s+supply|hazardous\s+materials|o2\s+and\s+suction|fire\s+plan|red\s+code|rescue\s+person|extinguisher|ورقة\s+واجب\s+تمريض|شفت\s*[أب]|مرضى\s+مكلفون|خطة\s+الحريق|الأدوية\s+الخاضعة|عربة\s+الطوارئ|المواد\s+المعقمة/i.test(String(text || ""));
 }
 
+function requiresComparisonTable(text) {
+  return /comparison\s+table|comparative\s+table|include\s+(?:one\s+)?(?:clear\s+)?comparison|جدول\s+مقارنة|جدول\s+مقارن|مقارنة\s+واضحة/i.test(String(text || ""));
+}
+
+function containsMarkdownTable(text) {
+  const lines = String(text || "").split(/\r?\n/).map((line) => line.trim());
+  return lines.filter((line) => /^\|.+\|$/.test(line)).length >= 3
+    && lines.some((line) => /^\|?\s*:?-{3,}/.test(line));
+}
+
 const FORM_ASSIGNMENT_RULES = `
 هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
 إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
@@ -2132,7 +2142,35 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
   const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
   if (!draft.ok) return draft;
 
-  // مراجعة مستقلة: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
+  // تدقيق مستقل للمتطلبات قبل إعادة الصياغة النهائية.
+  const criticModel = OPENROUTER_MODELS.find((model) => model === "deepseek/deepseek-chat-v3.1")
+    || OPENROUTER_MODELS.find((model) => model === "openai/gpt-4.1-mini")
+    || primaryModel;
+  const audit = await openRouterCompletion(
+    criticModel,
+    [
+      {
+        role: "system",
+        content: `أنت مدقق متطلبات أكاديمية صارم. لا تكتب الواجب من جديد.
+استخرج بصمت كل شرط صريح في الطلب، ثم افحص المسودة: الأقسام، الجداول، اللغة،
+عدد الكلمات، التنسيق، المراجع، الأمثلة، وأي حقول مطلوبة. اذكر النواقص
+والتصحيحات فقط في نقاط قصيرة. لا تخترع معلومات أو مراجع.
+${formTask ? FORM_ASSIGNMENT_RULES : ""}`
+      },
+      {
+        role: "user",
+        content: `الطلب الأصلي:
+${String(prompt).slice(0, 60000)}
+
+المسودة:
+${String(draft.content).slice(0, 50000)}`
+      }
+    ],
+    Math.min(2400, maxTokens),
+    0.05
+  );
+
+  // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
   const reviewModel = OPENROUTER_MODELS.find((model) => model === "openai/gpt-4.1-mini")
     || OPENROUTER_MODELS.find((model) => model === "deepseek/deepseek-chat-v3.1")
     || primaryModel;
@@ -2147,6 +2185,9 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
+
+تقرير تدقيق المتطلبات:
+${audit.ok ? audit.content : "نفّذ تدقيقاً داخلياً شاملاً قبل إخراج النسخة النهائية."}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
@@ -2163,7 +2204,37 @@ ${String(draft.content).slice(0, 50000)}
     maxTokens,
     0.1
   );
-  return reviewed.ok ? reviewed : draft;
+  if (!reviewed.ok) return draft;
+
+  // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
+  if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
+    const repaired = await openRouterCompletion(
+      reviewModel,
+      [
+        {
+          role: "system",
+          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n")
+        },
+        {
+          role: "user",
+          content: `أصلح هذه النسخة النهائية فقط.
+الطلب الأصلي يشترط جدول مقارنة واضحاً، لكنه غير موجود.
+أضف جدول Markdown حقيقياً متعدد الصفوف في القسم الأنسب، مع إبقاء بقية النص كما هو.
+لا تحذف أي قسم، ولا تضف شرحاً عن التعديل، وأخرج الواجب كاملاً فقط.
+
+الطلب:
+${String(prompt).slice(0, 60000)}
+
+النسخة الحالية:
+${String(reviewed.content).slice(0, 60000)}`
+        }
+      ],
+      maxTokens,
+      0.05
+    );
+    return repaired.ok ? repaired : reviewed;
+  }
+  return reviewed;
 }
 
 // ══════════════════════════════════════════════
