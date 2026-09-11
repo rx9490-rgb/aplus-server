@@ -2142,34 +2142,6 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
   const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
   if (!draft.ok) return draft;
 
-  // تدقيق مستقل للمتطلبات قبل إعادة الصياغة النهائية.
-  const criticModel = OPENROUTER_MODELS.find((model) => model === "deepseek/deepseek-chat-v3.1")
-    || OPENROUTER_MODELS.find((model) => model === "openai/gpt-4.1-mini")
-    || primaryModel;
-  const audit = await openRouterCompletion(
-    criticModel,
-    [
-      {
-        role: "system",
-        content: `أنت مدقق متطلبات أكاديمية صارم. لا تكتب الواجب من جديد.
-استخرج بصمت كل شرط صريح في الطلب، ثم افحص المسودة: الأقسام، الجداول، اللغة،
-عدد الكلمات، التنسيق، المراجع، الأمثلة، وأي حقول مطلوبة. اذكر النواقص
-والتصحيحات فقط في نقاط قصيرة. لا تخترع معلومات أو مراجع.
-${formTask ? FORM_ASSIGNMENT_RULES : ""}`
-      },
-      {
-        role: "user",
-        content: `الطلب الأصلي:
-${String(prompt).slice(0, 60000)}
-
-المسودة:
-${String(draft.content).slice(0, 50000)}`
-      }
-    ],
-    Math.min(2400, maxTokens),
-    0.05
-  );
-
   // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
   const reviewModel = OPENROUTER_MODELS.find((model) => model === "openai/gpt-4.1-mini")
     || OPENROUTER_MODELS.find((model) => model === "deepseek/deepseek-chat-v3.1")
@@ -2185,9 +2157,6 @@ ${String(draft.content).slice(0, 50000)}`
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
-
-تقرير تدقيق المتطلبات:
-${audit.ok ? audit.content : "نفّذ تدقيقاً داخلياً شاملاً قبل إخراج النسخة النهائية."}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
