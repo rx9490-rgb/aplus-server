@@ -2047,6 +2047,93 @@ function isHighAccuracyTask(text) {
   return /medical|medicine|clinical|patient|diagnos|treatment|drug|dose|symptom|radiology|laboratory|health|طب|طبي|مريض|تشخيص|علاج|دواء|جرعة|أعراض|واجب|بحث|مشروع|برزنتيشن|عرض|مراجع|thesis|assignment|research|presentation/i.test(String(text || ""));
 }
 
+function isAssignmentTask(text) {
+  return /assignment|academic\s+assignment|academic\s+paper|coursework|واجب|واجب\s+أكاديمي|بحث\s+جامعي|مشروع\s+تخرج|تعليمات\s+الدكتور|متطلبات\s+الواجب/i.test(String(text || ""));
+}
+
+async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENROUTER_KEY}`,
+        "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
+        "X-Title": "A+ Medical"
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        max_tokens: maxTokens,
+        temperature,
+        stream: false
+      }),
+      signal: controller.signal
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        message: String(data?.error?.message || "").slice(0, 240)
+      };
+    }
+    const content = String(data?.choices?.[0]?.message?.content || "").trim();
+    return content
+      ? { ok: true, content, model }
+      : { ok: false, status: 502, message: "empty_response" };
+  } catch (error) {
+    return {
+      ok: false,
+      status: error?.name === "AbortError" ? 504 : 503,
+      message: error?.name === "AbortError" ? "timeout" : (error?.message || "network")
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
+  const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
+  const draftMessages = [
+    { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+    { role: "user", content: String(prompt) }
+  ];
+  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
+  if (!draft.ok) return draft;
+
+  // مراجعة مستقلة: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
+  const reviewModel = OPENROUTER_MODELS.find((model) => model === "openai/gpt-4.1-mini")
+    || OPENROUTER_MODELS.find((model) => model === "deepseek/deepseek-chat-v3.1")
+    || primaryModel;
+  const reviewPrompt = `
+أنت محرر أكاديمي ومراجع جودة نهائي.
+أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
+صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
+لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
+لا تخترع مراجع أو DOI أو أرقاماً. إذا كانت المراجع غير قابلة للتحقق، احذف الادعاء أو اكتب [يحتاج تحقق].
+أخرج نص الواجب النهائي فقط.
+
+الطلب الأصلي وتعليمات الدكتور:
+${String(prompt).slice(0, 60000)}
+
+المسودة:
+${String(draft.content).slice(0, 50000)}
+`;
+  const reviewed = await openRouterCompletion(
+    reviewModel,
+    [
+      { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+      { role: "user", content: reviewPrompt }
+    ],
+    maxTokens,
+    0.1
+  );
+  return reviewed.ok ? reviewed : draft;
+}
+
 // ══════════════════════════════════════════════
 // OpenRouter — المسار الموحد باستخدام مفتاح المشروع
 // لا يعتمد هذا المسار على GEMINI_API_KEY المباشر.
@@ -2086,6 +2173,25 @@ app.post("/api/ai/call", async (req, res) => {
   let lastError = null;
 
   try {
+    if (isAssignmentTask(requestText)) {
+      const qualityResult = await generateAssignmentWithReview(
+        prompt,
+        systemPrompt,
+        safeMaxTokens,
+        isArabicRequest
+      );
+      if (qualityResult.ok) {
+        res.json({
+          ok: true,
+          content: qualityResult.content,
+          provider: "openrouter-quality-pipeline",
+          models: [isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0], qualityResult.model]
+        });
+        return;
+      }
+      lastError = qualityResult;
+    }
+
     const messages = [
       { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
       { role: "user", content: String(prompt) }
