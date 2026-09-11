@@ -2087,21 +2087,6 @@ function containsMarkdownTable(text) {
     && lines.some((line) => /^\|?\s*:?-{3,}/.test(line));
 }
 
-function hasRequiredFormSections(text) {
-  const value = String(text || "");
-  return /comparison\s+table|جدول\s+مقارنة/i.test(value)
-    && /critical\s+reflection|التأمل\s+النقدي|انعكاس\s+نقدي/i.test(value)
-    && /references|المراجع\s+العلمية|المراجع/i.test(value);
-}
-
-function normalizeAssignmentForPdf(text) {
-  return String(text || "")
-    .replace(/\u000c/g, "")
-    .replace(/<!--\s*(?:page\s*break|pagebreak)\s*-->/gi, "\n")
-    .replace(/\n{4,}/g, "\n\n")
-    .trim();
-}
-
 const FORM_ASSIGNMENT_RULES = `
 هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
 إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
@@ -2111,21 +2096,13 @@ const FORM_ASSIGNMENT_RULES = `
   وضع في أعلى الناتج: "نموذج تدريبي — البيانات افتراضية".
 - لا تنسب البيانات الافتراضية إلى مستشفى أو أشخاص حقيقيين، ولا تستخدم معلومات شخصية حقيقية.
 - لا تترك خانات أساسية فارغة أو تكتب [يُستكمل] عندما يمكن إكمالها ببيانات تدريبية افتراضية.
-- لا تختلق توقيعاً؛ اكتب في نهاية كل شفت:
-  "Student Signature: ____________________    Date: ______________"
+- لا تختلق توقيعاً؛ اكتب "[توقيع الطالب مطلوب]" في نهاية كل شفت.
 - حافظ على جميع الحقول: Floor/Unit، Head Nurse، Total Patients، CPR Team، Date،
   Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time،
   Narcotic Check، Emergency & Defibrillator، High Alert Cabinet & Refrigerator،
   Controlled Drug، Sterile Supply، Hazardous Materials، O2 and Suction،
   Rescue Person، Red Code، Activate Alarm، Extinguisher Use، Signature.
-- بعد جدولَي Shift A وShift B أضف الأقسام التالية، ولا تترك أي قسم فارغاً:
-  1) Comparison Table — جدول Markdown حقيقي يقارن Shift A وShift B في 4 حقول على الأقل.
-  2) Critical Reflection — تأمل نقدي من فقرتين إلى ثلاث فقرات عن التفويض، التواصل، وسلامة المرضى.
-  3) References — ثلاثة مراجع علمية موثوقة مرتبطة بالتمريض وسلامة المرضى.
-- لا تختلق توقيعاً أو توقيعاً إلكترونياً؛ اكتب خطاً واضحاً:
-  "Student Signature: ____________________    Date: ______________"
-- لا تستخدم فواصل صفحات أو عناوين منفصلة في أسفل صفحة، ولا تترك أسطرًا فارغة كثيرة
-  قد تنتج صفحات بيضاء عند تحويل النص إلى PDF.
+- لا تكتب مقدمة أو خاتمة أو مراجع أو شرحاً خارج النموذج.
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
 `;
 
@@ -2219,38 +2196,8 @@ ${String(draft.content).slice(0, 50000)}
   );
   if (!reviewed.ok) return draft;
 
-  if (formTask && (!hasRequiredFormSections(reviewed.content) || !containsMarkdownTable(reviewed.content))) {
-    const repaired = await openRouterCompletion(
-      reviewModel,
-      [
-        {
-          role: "system",
-          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n")
-        },
-        {
-          role: "user",
-          content: `أصلح هذه النسخة النهائية لتصبح مكتملة وجاهزة للتسليم.
-لا تحذف جداول Shift A أو Shift B أو أي حقل من حقول النموذج.
-أضف بعد الجداول مباشرة وبمحتوى غير فارغ:
-1. Comparison Table: جدول Markdown حقيقي يقارن الشفتين.
-2. Critical Reflection: فقرتان أو ثلاث فقرات.
-3. References: ثلاثة مراجع علمية موثوقة.
-أضف خانة توقيع يدوية فقط، ولا تخترع توقيعاً.
-لا تضع عناوين منفصلة في صفحات فارغة ولا تستخدم فواصل صفحات.
-أخرج الواجب كاملاً فقط.
-
-النسخة الحالية:
-${String(reviewed.content).slice(0, 60000)}`
-        }
-      ],
-      maxTokens,
-      0.1
-    );
-    if (repaired.ok) reviewed.content = repaired.content;
-  }
-
   // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
-  if ((requiresComparisonTable(prompt) || formTask) && !containsMarkdownTable(reviewed.content)) {
+  if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
     const repaired = await openRouterCompletion(
       reviewModel,
       [
@@ -2275,11 +2222,8 @@ ${String(reviewed.content).slice(0, 60000)}`
       maxTokens,
       0.05
     );
-    const result = repaired.ok ? repaired : reviewed;
-    result.content = normalizeAssignmentForPdf(result.content);
-    return result;
+    return repaired.ok ? repaired : reviewed;
   }
-  reviewed.content = normalizeAssignmentForPdf(reviewed.content);
   return reviewed;
 }
 
