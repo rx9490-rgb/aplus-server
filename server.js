@@ -2069,6 +2069,27 @@ function isHighAccuracyTask(text) {
   return /medical|medicine|clinical|patient|diagnos|treatment|drug|dose|symptom|radiology|laboratory|health|طب|طبي|مريض|تشخيص|علاج|دواء|جرعة|أعراض|واجب|بحث|مشروع|برزنتيشن|عرض|مراجع|thesis|assignment|research|presentation/i.test(String(text || ""));
 }
 
+function isSummaryTask(text) {
+  return /summar|summary|abstract|outline|تلخيص|ملخص|اختصار|خلاصة|لخّص|لخص/i.test(String(text || ""));
+}
+
+const SUMMARY_SOURCE_RULES = `
+هذه مهمة تلخيص، ومصدر المعلومات الوحيد هو النص أو الملف الذي أرسله المستخدم.
+- لا تضف أي معلومة أو استنتاج أو مثال أو تفسير غير موجود صراحةً في المصدر.
+- لا تستخدم معلوماتك العامة أو مصادر خارجية حتى لو بدت صحيحة.
+- حافظ على معنى المصدر وترتيب أفكاره، ولا تغيّر درجة اليقين أو الأرقام أو الأسماء.
+- إذا كانت المعلومة غير موجودة في المصدر، احذفها ولا تستبدلها بتخمين.
+- أخرج التلخيص فقط، من دون تقييم للمصدر أو تعليق على طريقة العمل.
+`;
+
+function buildAiSystemPrompt(systemPrompt, requestText) {
+  return [
+    AI_QUALITY_SYSTEM,
+    isSummaryTask(requestText) ? SUMMARY_SOURCE_RULES : "",
+    systemPrompt
+  ].filter(Boolean).join("\n\n");
+}
+
 function isAssignmentTask(text) {
   return /assignment|academic\s+assignment|academic\s+paper|coursework|s?heet|worksheet|form|واجب|واجب\s+أكاديمي|نموذج|ورقة|بحث\s+جامعي|مشروع\s+تخرج|تعليمات\s+الدكتور|متطلبات\s+الواجب/i.test(String(text || ""));
 }
@@ -2155,6 +2176,7 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
   const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
     systemPrompt,
+    isSummaryTask(`${systemPrompt || ""}\n${prompt || ""}`) ? SUMMARY_SOURCE_RULES : "",
     formTask ? FORM_ASSIGNMENT_RULES : ""
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
@@ -2286,7 +2308,7 @@ app.post("/api/ai/call", async (req, res) => {
     }
 
     const messages = [
-      { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+      { role: "system", content: buildAiSystemPrompt(systemPrompt, requestText) },
       { role: "user", content: String(prompt) }
     ];
 
@@ -2392,8 +2414,8 @@ app.post("/api/openrouter/stream", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
-  const messages = [];
-  const combinedSystem = [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n");
+   const messages = [];
+   const combinedSystem = buildAiSystemPrompt(systemPrompt, `${systemPrompt || ""}\n${prompt}`);
   messages.push({ role: "system", content: combinedSystem });
   messages.push({ role: "user", content: prompt });
 
@@ -2588,7 +2610,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
           messages: [
             {
               role: "system",
-              content: `${AI_QUALITY_SYSTEM}
+               content: `${buildAiSystemPrompt("", prompt)}
 حلل الصورة بدقة. لا تخمن النصوص أو الأرقام غير الواضحة،
 واذكر بوضوح أي جزء لم تستطع قراءته.`
             },
