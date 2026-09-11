@@ -2014,23 +2014,45 @@ const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 // values are ignored so the server does not fall back to an invalid model.
 function safeOpenRouterModel(value, fallback) {
   const model = String(value || "").trim();
-  if (!model || !model.includes("/") || model === "llama-3.3-70b-versatile") {
+  if (
+    !model
+    || !model.includes("/")
+    || model === "llama-3.3-70b-versatile"
+    || model === "anthropic/claude-3.5-sonnet"
+  ) {
     return fallback;
   }
   return model;
 }
-// Stable model IDs currently available on OpenRouter. They can still be
-// overridden through Replit Secrets with AI_*_MODEL when needed.
+// نماذج OpenRouter المستخدمة بالترتيب:
+// Gemini ثم GPT للمراجعة، وبعدها Claude وDeepSeek وQwen وLlama كبدائل.
+// كل الطلبات تمر من OPENROUTER_API_KEY، ولا نحتاج مفاتيح منفصلة.
+//
+// Blackbox اختياري لأن اسم الموديل يتغير حسب ما هو متاح في OpenRouter.
+// لتفعيله أضف AI_BLACKBOX_MODEL بالمعرّف الظاهر في OpenRouter.
 const OPENROUTER_MODELS = [
   safeOpenRouterModel(process.env.AI_PRIMARY_MODEL, "google/gemini-2.5-flash"),
   safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "openai/gpt-4.1-mini"),
-  safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "meta-llama/llama-3.3-70b-instruct"),
-  "deepseek/deepseek-chat-v3.1"
+  safeOpenRouterModel(process.env.AI_CLAUDE_MODEL, "anthropic/claude-sonnet-4"),
+  safeOpenRouterModel(process.env.AI_DEEPSEEK_MODEL, "deepseek/deepseek-chat-v3.1"),
+  safeOpenRouterModel(process.env.AI_QWEN_MODEL, "qwen/qwen-2.5-72b-instruct"),
+  safeOpenRouterModel(process.env.AI_LLAMA_MODEL, "meta-llama/llama-3.3-70b-instruct"),
+  safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "deepseek/deepseek-chat-v3.1"),
+  ...(process.env.AI_BLACKBOX_MODEL
+    ? [safeOpenRouterModel(process.env.AI_BLACKBOX_MODEL, "")]
+    : [])
 ].filter((model, index, all) => model && all.indexOf(model) === index);
 const ARABIC_MODEL = safeOpenRouterModel(
   process.env.AI_ARABIC_MODEL,
   "google/gemini-2.5-flash"
 );
+const REVIEW_MODELS = [
+  safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "openai/gpt-4.1-mini"),
+  safeOpenRouterModel(process.env.AI_CLAUDE_MODEL, "anthropic/claude-sonnet-4"),
+  safeOpenRouterModel(process.env.AI_DEEPSEEK_MODEL, "deepseek/deepseek-chat-v3.1"),
+  safeOpenRouterModel(process.env.AI_QWEN_MODEL, "qwen/qwen-2.5-72b-instruct"),
+  safeOpenRouterModel(process.env.AI_LLAMA_MODEL, "meta-llama/llama-3.3-70b-instruct")
+].filter((model, index, all) => model && all.indexOf(model) === index);
 
 const AI_QUALITY_SYSTEM = `
 أنت المساعد الرئيسي لموقع طبي تعليمي، وتنفذ كل أنواع المهام: الواجبات،
@@ -2143,8 +2165,7 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
   if (!draft.ok) return draft;
 
   // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
-  const reviewModel = OPENROUTER_MODELS.find((model) => model === "openai/gpt-4.1-mini")
-    || OPENROUTER_MODELS.find((model) => model === "deepseek/deepseek-chat-v3.1")
+  const reviewModel = REVIEW_MODELS.find((model) => OPENROUTER_MODELS.includes(model))
     || primaryModel;
   const reviewPrompt = `
 أنت محرر أكاديمي ومراجع جودة نهائي.
