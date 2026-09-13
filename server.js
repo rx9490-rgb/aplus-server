@@ -2073,19 +2073,25 @@ function isSummaryTask(text) {
   return /summar|summary|abstract|outline|تلخيص|ملخص|اختصار|خلاصة|لخّص|لخص/i.test(String(text || ""));
 }
 
-const SUMMARY_SOURCE_RULES = `
-هذه مهمة تلخيص، ومصدر المعلومات الوحيد هو النص أو الملف الذي أرسله المستخدم.
+function isExplanationTask(text) {
+  return /explain|explanation|detailed explanation|شرح|الشرح|اشرح|تفسير|فسّر|فسر/i.test(String(text || ""));
+}
+
+const SOURCE_ONLY_RULES = `
+هذه مهمة مرتبطة بمصدر يرسله المستخدم، ومصدر المعلومات الوحيد هو النص أو الملف المرفق.
 - لا تضف أي معلومة أو استنتاج أو مثال أو تفسير غير موجود صراحةً في المصدر.
 - لا تستخدم معلوماتك العامة أو مصادر خارجية حتى لو بدت صحيحة.
 - حافظ على معنى المصدر وترتيب أفكاره، ولا تغيّر درجة اليقين أو الأرقام أو الأسماء.
 - إذا كانت المعلومة غير موجودة في المصدر، احذفها ولا تستبدلها بتخمين.
-- أخرج التلخيص فقط، من دون تقييم للمصدر أو تعليق على طريقة العمل.
+- عند الحاجة إلى شرح عبارة من المصدر، أعد صياغتها وتبسيطها فقط دون إضافة معلومة جديدة.
+- إذا طلب المستخدم شيئًا لا يجيب عنه المصدر، اكتب بوضوح: [غير مذكور في النص].
 `;
 
 function buildAiSystemPrompt(systemPrompt, requestText) {
+  const sourceBound = isSummaryTask(requestText) || isExplanationTask(requestText);
   return [
     AI_QUALITY_SYSTEM,
-    isSummaryTask(requestText) ? SUMMARY_SOURCE_RULES : "",
+    sourceBound ? SOURCE_ONLY_RULES : "",
     systemPrompt
   ].filter(Boolean).join("\n\n");
 }
@@ -2176,7 +2182,7 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
   const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
     systemPrompt,
-    isSummaryTask(`${systemPrompt || ""}\n${prompt || ""}`) ? SUMMARY_SOURCE_RULES : "",
+    (isSummaryTask(`${systemPrompt || ""}\n${prompt || ""}`) || isExplanationTask(`${systemPrompt || ""}\n${prompt || ""}`)) ? SOURCE_ONLY_RULES : "",
     formTask ? FORM_ASSIGNMENT_RULES : ""
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
