@@ -263,16 +263,16 @@ async function isAdminRequest(req) {
 // حماية استخدام الذكاء الاصطناعي — لا تسمح لأي شخص باستنزاف مفتاح OpenRouter
 // من خلال استدعاء /api/openrouter مباشرة خارج الواجهة.
 const aiUsage = new Map();
-const AI_PER_MINUTE_LIMIT = Math.max(1, Number(process.env.AI_REQUESTS_PER_MINUTE || 8));
-const AI_PER_DAY_LIMIT = Math.max(AI_PER_MINUTE_LIMIT, Number(process.env.AI_REQUESTS_PER_DAY || 30));
+const AI_PER_MINUTE_LIMIT = Math.max(1, Number(process.env.AI_REQUESTS_PER_MINUTE || 20));
+const AI_PER_DAY_LIMIT = Math.max(AI_PER_MINUTE_LIMIT, Number(process.env.AI_REQUESTS_PER_DAY || 120));
 const AI_MAX_TOKENS_PER_REQUEST = Math.max(1000, Number(process.env.AI_MAX_TOKENS_PER_REQUEST || 6000));
 const AI_MAX_TOKENS_PER_DAY = Math.max(
   AI_MAX_TOKENS_PER_REQUEST,
-  Number(process.env.AI_MAX_TOKENS_PER_DAY || 30000)
+  Number(process.env.AI_MAX_TOKENS_PER_DAY || 120000)
 );
 const AI_MAX_PROMPT_CHARS = Math.max(
   10_000,
-  Number(process.env.AI_MAX_PROMPT_CHARS || 60_000)
+  Number(process.env.AI_MAX_PROMPT_CHARS || 100_000)
 );
 const AI_MAX_IMAGE_CHARS = Math.max(
   1_000_000,
@@ -2517,6 +2517,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
                 attemptText += c;
                 sentAny = true;
                 res.write(`data: ${JSON.stringify({ text: c })}\n\n`);
+                res.flush?.();
               }
             } catch {}
           }
@@ -2530,6 +2531,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
           continue;
         }
         res.write(`data: ${JSON.stringify({ msg: "done" })}\n\n`);
+        res.flush?.();
         res.end();
         return;
       } catch (e) {
@@ -2557,7 +2559,13 @@ app.post("/api/openrouter/stream", async (req, res) => {
       body: String(lastErr?.body || "").slice(0, 500),
       models: requestModels
     });
-    res.write(`event: error\ndata: ${JSON.stringify({ error: code })}\n\n`);
+    let detail = "";
+    try {
+      const parsed = JSON.parse(String(lastErr?.body || ""));
+      detail = String(parsed?.error?.message || parsed?.message || "").slice(0, 240);
+    } catch {}
+    res.write(`event: error\ndata: ${JSON.stringify({ error: code, detail })}\n\n`);
+    res.flush?.();
     res.end();
   }
 });
