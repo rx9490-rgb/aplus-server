@@ -2124,29 +2124,24 @@ function containsMarkdownTable(text) {
 }
 
 const FORM_ASSIGNMENT_RULES = `
-هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
-إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
-- أخرج نموذجاً منظماً بعناوين واضحة للشفت A ثم الشفت B.
-- إذا لم يزوّد المستخدم بيانات فعلية وكان المطلوب نموذجاً مكتملاً، أنشئ بيانات تدريبية افتراضية متسقة
-  (أسماء غير حقيقية، مرضى بأرقام رمزية، أوقات منطقية، وعدد مرضى متوافق مع الجدول)،
-  وضع في أعلى الناتج: "نموذج تدريبي — البيانات افتراضية".
-- لا تنسب البيانات الافتراضية إلى مستشفى أو أشخاص حقيقيين، ولا تستخدم معلومات شخصية حقيقية.
-- لا تترك خانات أساسية فارغة أو تكتب [يُستكمل] عندما يمكن إكمالها ببيانات تدريبية افتراضية.
-- لا تغيّر أسماء الحقول أو تستبدلها بوصف عام. حافظ على بنية النموذج الأصلية.
-- في Safety Checks يجب أن يظهر لكل معدة/عنصر: الحالة "Checked/Locked" أو
-  ما يقابلها بالعربية بوضوح، واسم "Responsible Nurse" / "الممرض المسؤول".
-  لا تكتب "تم التعامل مع الفحوصات" بدلاً من الحالة أو اسم المسؤول.
-- في Fire Plan (RACE) اكتب المهام الأربع منفصلة: Rescue/Remove،
-  Alarm، Confine/Close، Extinguish/Evacuate، مع تعيين المسؤول عن كل مهمة.
-- لا تختلق توقيعاً بخط اليد. إذا أعطى المستخدم اسم الطالب فاكتبه في خانة الاسم،
-  واترك خانة التوقيع بخط واضح لإضافته فعلياً قبل التسليم.
-- حافظ على جميع الحقول: Floor/Unit، Head Nurse، Total Patients، CPR Team، Date،
-  Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time،
-  Narcotic Check، Emergency & Defibrillator، High Alert Cabinet & Refrigerator،
-  Controlled Drug، Sterile Supply، Hazardous Materials، O2 and Suction،
-  Rescue Person، Red Code، Activate Alarm، Extinguisher Use، Signature.
-- لا تكتب مقدمة أو خاتمة أو مراجع أو شرحاً خارج النموذج.
-- استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
+هذا طلب تعبئة Nursing Assignment Sheet، وليس مقالاً أو تقريراً.
+اتبع ورقة الـPDF حرفياً وبأقل تنسيق ممكن:
+- أخرج جدولاً مدمجاً للشفت A وجدولاً مدمجاً للشفت B فقط، بلا غلاف أو مقدمة أو خاتمة أو مراجع أو رابط موقع.
+- لكل شفت اكتب Basic Info: Floor/Unit، Head Nurse، Total Patients، CPR Team، Date.
+- في Staffing اكتب Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time.
+- في Safety Checks اكتب الصفوف السبعة كاملة: Narcotic Check، Emergency & Defibrillator،
+  High Alert Cabinet & Refrigerator، Controlled Drug، Sterile Supply، Hazardous Materials،
+  O2 and Suction. لكل صف اكتب Checked/Locked واسم Responsible Nurse.
+- اجعل Total Patients مساوياً لعدد أرقام المرضى الفريدة في Assigned Patients في الشفت نفسه.
+- استخدم تاريخاً واحداً متطابقاً في الشفت A وB، ولا تخلط بين سنوات أو صيغ مختلفة.
+- في Fire Plan اكتب أربع مهام RACE بلا تكرار:
+  1) Rescue Person (R)، 2) Red Code / Activate Alarm (A)،
+  3) Confine / Close Doors (C)، 4) Extinguisher Use / Evacuate (E).
+  لا تكتب Red Code وActivate Alarm كصفين منفصلين، ولا تحذف Confine.
+- لا تضف عبارة "نموذج تدريبي" أو "البيانات افتراضية" أو رابطاً خارجياً.
+- استخدم أسماء تدريبية مختصرة وأرقام مرضى رمزية فقط عند عدم تزويد المستخدم ببيانات،
+  ولا تنسبها إلى مستشفى أو أشخاص حقيقيين.
+- لا تختلق توقيعاً. اترك في نهاية كل شفت: Signature: ____________________.
 `;
 
 function formOutputNeedsRepair(prompt, content) {
@@ -2154,9 +2149,9 @@ function formOutputNeedsRepair(prompt, content) {
   const text = String(content || "");
   const hasBasicInfo = /(basic\s*info|المعلومات\s+الأساسية|القسم|عدد\s+المرضى|head\s*nurse|التاريخ)/i.test(text);
   const hasStaffing = /(staffing|توزيع\s+الكادر|الممرض\s+المسؤول|الممرض[ةه]?\s+المفوض|break\s*time|وقت\s+الاستراحة)/i.test(text);
-  const hasSafetyStatus = /(safety\s*checks|فحوصات\s+السلامة|checked\s*\/\s*locked|checked|locked|تم\s+الفحص|مقفل|مغلق)/i.test(text);
+  const hasSafetyStatus = /(narcotic\s*check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s*drug|sterile\s*supply|hazardous\s*materials|o2\s*and\s*suction|فحوصات\s+السلامة|checked\s*\/\s*locked|تم\s+الفحص|مقفل|مغلق)/i.test(text);
   const hasResponsibleNurse = /(responsible\s+nurse|الممرض[ةه]?\s+المسؤول[ةه]?|اسم\s+الممرض)/i.test(text);
-  const hasRace = /(\bRACE\b|rescue|remove|alarm|confine|close|extinguish|evacuate|خطة\s+الحريق)/i.test(text);
+  const hasRace = /rescue[\s\S]{0,500}(?:red\s*code|activate\s*alarm|alarm)[\s\S]{0,500}(?:confine|close\s+doors)[\s\S]{0,500}(?:extinguisher|evacuate|إخلاء)/i.test(text);
   const hasSignature = /(signature|التوقيع|توقيع\s+الطالب)/i.test(text);
   return !(hasBasicInfo && hasStaffing && hasSafetyStatus && hasResponsibleNurse && hasRace && hasSignature);
 }
@@ -2264,10 +2259,14 @@ ${String(draft.content).slice(0, 50000)}
           role: "user",
           content: `هذه نسخة نموذج تمريضي ناقصة. أصلحها وأخرج النموذج كاملاً فقط.
 لا تحذف أي خانة أو صف موجود.
+أخرج جدول الشفت A وجدول الشفت B فقط وبنفس حقول ورقة PDF.
 أكمل Basic Info وStaffing وSafety Checks وFire Plan (RACE) وSignature.
-في Safety Checks استخدم صراحةً Checked/Locked أو ترجمتها الواضحة،
-واكتب اسم Responsible Nurse/الممرض المسؤول لكل فحص.
-في RACE اكتب المهام الأربع منفصلة مع المسؤول.
+في Safety Checks أكمل الصفوف السبعة كلها، واستخدم صراحةً Checked/Locked
+واكتب اسم Responsible Nurse لكل فحص.
+في RACE استخدم أربع مهام فقط: Rescue، Red Code / Activate Alarm،
+Confine / Close Doors، Extinguisher Use / Evacuate. لا تكرر Red Code وActivate Alarm.
+اجعل التاريخ واحداً وعدد المرضى مساوياً لعدد المرضى المعيّنين.
+احذف الغلاف والروابط وعبارة "نموذج تدريبي" وأي شرح خارج الجدولين.
 لا تزور توقيعاً بخط اليد: إذا لم يوجد اسم طالب في الطلب فاترك خط التوقيع واضحاً لإضافته فعلياً.
 
 الطلب الأصلي:
@@ -2933,3 +2932,4 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   server.close(() => pool.end());
 });
+
