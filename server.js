@@ -2149,7 +2149,14 @@ const FORM_ASSIGNMENT_RULES = `
   وضع في أعلى الناتج: "نموذج تدريبي — البيانات افتراضية".
 - لا تنسب البيانات الافتراضية إلى مستشفى أو أشخاص حقيقيين، ولا تستخدم معلومات شخصية حقيقية.
 - لا تترك خانات أساسية فارغة أو تكتب [يُستكمل] عندما يمكن إكمالها ببيانات تدريبية افتراضية.
-- لا تختلق توقيعاً؛ اكتب "[توقيع الطالب مطلوب]" في نهاية كل شفت.
+- لا تغيّر أسماء الحقول أو تستبدلها بوصف عام. حافظ على بنية النموذج الأصلية.
+- في Safety Checks يجب أن يظهر لكل معدة/عنصر: الحالة "Checked/Locked" أو
+  ما يقابلها بالعربية بوضوح، واسم "Responsible Nurse" / "الممرض المسؤول".
+  لا تكتب "تم التعامل مع الفحوصات" بدلاً من الحالة أو اسم المسؤول.
+- في Fire Plan (RACE) اكتب المهام الأربع منفصلة: Rescue/Remove،
+  Alarm، Confine/Close، Extinguish/Evacuate، مع تعيين المسؤول عن كل مهمة.
+- لا تختلق توقيعاً بخط اليد. إذا أعطى المستخدم اسم الطالب فاكتبه في خانة الاسم،
+  واترك خانة التوقيع بخط واضح لإضافته فعلياً قبل التسليم.
 - حافظ على جميع الحقول: Floor/Unit، Head Nurse، Total Patients، CPR Team، Date،
   Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time،
   Narcotic Check، Emergency & Defibrillator، High Alert Cabinet & Refrigerator،
@@ -2158,6 +2165,18 @@ const FORM_ASSIGNMENT_RULES = `
 - لا تكتب مقدمة أو خاتمة أو مراجع أو شرحاً خارج النموذج.
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
 `;
+
+function formOutputNeedsRepair(prompt, content) {
+  if (!isFormAssignmentTask(prompt)) return false;
+  const text = String(content || "");
+  const hasBasicInfo = /(basic\s*info|المعلومات\s+الأساسية|القسم|عدد\s+المرضى|head\s*nurse|التاريخ)/i.test(text);
+  const hasStaffing = /(staffing|توزيع\s+الكادر|الممرض\s+المسؤول|الممرض[ةه]?\s+المفوض|break\s*time|وقت\s+الاستراحة)/i.test(text);
+  const hasSafetyStatus = /(safety\s*checks|فحوصات\s+السلامة|checked\s*\/\s*locked|checked|locked|تم\s+الفحص|مقفل|مغلق)/i.test(text);
+  const hasResponsibleNurse = /(responsible\s+nurse|الممرض[ةه]?\s+المسؤول[ةه]?|اسم\s+الممرض)/i.test(text);
+  const hasRace = /(\bRACE\b|rescue|remove|alarm|confine|close|extinguish|evacuate|خطة\s+الحريق)/i.test(text);
+  const hasSignature = /(signature|التوقيع|توقيع\s+الطالب)/i.test(text);
+  return !(hasBasicInfo && hasStaffing && hasSafetyStatus && hasResponsibleNurse && hasRace && hasSignature);
+}
 
 async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
   const controller = new AbortController();
@@ -2253,6 +2272,38 @@ ${String(draft.content).slice(0, 50000)}
     0.1
   );
   if (!reviewed.ok) return draft;
+
+  // فحص بنيوي للنموذج: يعيد الإصلاح فقط عند فقدان خانة أساسية.
+  if (formOutputNeedsRepair(prompt, reviewed.content)) {
+    const repairedForm = await openRouterCompletion(
+      reviewModel,
+      [
+        {
+          role: "system",
+          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n")
+        },
+        {
+          role: "user",
+          content: `هذه نسخة نموذج تمريضي ناقصة. أصلحها وأخرج النموذج كاملاً فقط.
+لا تحذف أي خانة أو صف موجود.
+أكمل Basic Info وStaffing وSafety Checks وFire Plan (RACE) وSignature.
+في Safety Checks استخدم صراحةً Checked/Locked أو ترجمتها الواضحة،
+واكتب اسم Responsible Nurse/الممرض المسؤول لكل فحص.
+في RACE اكتب المهام الأربع منفصلة مع المسؤول.
+لا تزور توقيعاً بخط اليد: إذا لم يوجد اسم طالب في الطلب فاترك خط التوقيع واضحاً لإضافته فعلياً.
+
+الطلب الأصلي:
+${String(prompt).slice(0, 60000)}
+
+النسخة الحالية:
+${String(reviewed.content).slice(0, 60000)}`
+        }
+      ],
+      maxTokens,
+      0.05
+    );
+    if (repairedForm.ok) reviewed.content = repairedForm.content;
+  }
 
   // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
   if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
