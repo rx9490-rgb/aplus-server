@@ -2394,6 +2394,97 @@ function isAssignmentTask(text) {
   return /assignment|academic\s+assignment|academic\s+paper|coursework|s?heet|worksheet|form|واجب|واجب\s+أكاديمي|نموذج|ورقة|بحث\s+جامعي|مشروع\s+تخرج|تعليمات\s+الدكتور|متطلبات\s+الواجب/i.test(String(text || ""));
 }
 
+function isAssignmentGradingTask(text) {
+  return /grade|grading|score|scoring|mark|marks|evaluate|evaluation|rubric|assessment|feedback|تقييم|قيّم|قيم|درجة|درجات|تصحيح|تصحيح\s+الواجب|ملاحظات\s+على\s+الواجب/i.test(String(text || ""));
+}
+
+const ASSIGNMENT_GRADING_RULES = `
+أنت مقيّم أكاديمي دقيق. قيّم الواجب الموجود في طلب المستخدم، ولا تنشئ واجباً جديداً.
+الدرجة النهائية يجب أن تكون رقماً واحداً من 0 إلى 10 فقط، ويمكن أن تكون عشرية حتى منزلة واحدة.
+اعتمد على نص الواجب وتعليمات المستخدم أو rubric إن وُجدت.
+إذا كانت معلومات التقييم غير كافية، قيّم الموجود فقط واذكر ما ينقص بدلاً من اختلاقه.
+أعد النتيجة بصيغة JSON صحيحة فقط، دون Markdown أو أي نص خارج JSON:
+{
+  "score": 0,
+  "summary": "ملخص قصير للتقييم",
+  "strengths": ["نقطة قوة"],
+  "weaknesses": ["نقطة تحتاج تحسيناً"],
+  "improvements": ["اقتراح عملي"]
+}
+`;
+
+function clampAssignmentScore(value) {
+  const score = Number(value);
+  if (!Number.isFinite(score)) return null;
+  return Math.round(Math.min(10, Math.max(0, score)) * 10) / 10;
+}
+
+function parseAssignmentGrade(content) {
+  const raw = String(content || "").trim();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    const jsonBlock = raw.match(/\{[\s\S]*\}/);
+    if (jsonBlock) {
+      try { parsed = JSON.parse(jsonBlock[0]); } catch {}
+    }
+  }
+
+  let score = clampAssignmentScore(parsed?.score);
+  if (score === null) {
+    const scoreMatch = raw.match(/(?:score|grade|mark|الدرجة|العلامة|التقييم)\s*[:：=\-]?\s*(10(?:\.0)?|[0-9](?:\.[0-9])?)\s*(?:\/\s*10|من\s*10|out\s+of\s+10)?/i);
+    score = clampAssignmentScore(scoreMatch?.[1]);
+  }
+  if (score === null) return null;
+
+  const list = (value) => Array.isArray(value)
+    ? value.map((item) => String(item).trim()).filter(Boolean).slice(0, 8)
+    : [];
+  return {
+    score,
+    summary: String(parsed?.summary || parsed?.feedback || raw).trim().slice(0, 2000),
+    strengths: list(parsed?.strengths),
+    weaknesses: list(parsed?.weaknesses),
+    improvements: list(parsed?.improvements)
+  };
+}
+
+function formatAssignmentGrade(grade) {
+  const lines = [
+    `الدرجة: ${grade.score}/10`,
+    "",
+    `التقييم: ${grade.summary || "تم تقييم الواجب وفق المحتوى والتعليمات المتاحة."}`
+  ];
+  if (grade.strengths.length) lines.push("", "نقاط القوة:", ...grade.strengths.map((item) => `- ${item}`));
+  if (grade.weaknesses.length) lines.push("", "نقاط تحتاج تحسيناً:", ...grade.weaknesses.map((item) => `- ${item}`));
+  if (grade.improvements.length) lines.push("", "اقتراحات التحسين:", ...grade.improvements.map((item) => `- ${item}`));
+  return lines.join("\n");
+}
+
+async function gradeAssignment(prompt, systemPrompt, maxTokens, isArabicRequest, files = []) {
+  const model = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
+  const messages = [
+    {
+      role: "system",
+      content: [AI_QUALITY_SYSTEM, ASSIGNMENT_GRADING_RULES, systemPrompt].filter(Boolean).join("\n\n")
+    },
+    { role: "user", content: buildAiUserContent(prompt, files) }
+  ];
+  const result = await openRouterCompletion(model, messages, Math.min(maxTokens, 3000), 0.1, files);
+  if (!result.ok) return result;
+  const grade = parseAssignmentGrade(result.content);
+  if (!grade) {
+    return { ok: false, status: 502, message: "invalid_grade_response" };
+  }
+  return {
+    ...result,
+    content: formatAssignmentGrade(grade),
+    score: grade.score,
+    grade
+  };
+}
+
 function isFormAssignmentTask(text) {
   return /nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|s?heet|worksheet|form|shift\s*[ab]|assigned\s+patients|responsible\s+nurse|delegated\s+nurse|break\s+time|narcotic\s+check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s+drug|sterile\s+supply|hazardous\s+materials|o2\s+and\s+suction|fire\s+plan|red\s+code|rescue\s+person|extinguisher|ورقة\s+واجب\s+تمريض|نموذج|شفت\s*[أب]|مرضى\s+مكلفون|خطة\s+الحريق|الأدوية\s+الخاضعة|عربة\s+الطوارئ|المواد\s+المعقمة/i.test(String(text || ""));
 }
@@ -2599,6 +2690,32 @@ app.post("/api/ai/call", async (req, res) => {
 
   try {
     if (isAssignmentTask(requestText)) {
+      if (isAssignmentGradingTask(requestText)) {
+        const gradeResult = await gradeAssignment(
+          prompt,
+          systemPrompt,
+          safeMaxTokens,
+          isArabicRequest,
+          normalizedFiles.files
+        );
+        if (gradeResult.ok) {
+          res.json({
+            ok: true,
+            content: gradeResult.content,
+            score: gradeResult.score,
+            grade: gradeResult.grade,
+            provider: "openrouter-assignment-grader",
+            model: gradeResult.model
+          });
+          return;
+        }
+        res.status(gradeResult.status >= 500 ? 503 : 502).json({
+          ok: false,
+          error: "assignment_grading_failed"
+        });
+        return;
+      }
+
       const qualityResult = await generateAssignmentWithReview(
         prompt,
         systemPrompt,
