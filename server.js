@@ -1,4 +1,3 @@
-
 /**
  * ╔══════════════════════════════════════════════════════════╗
  * ║   A+ Medical Platform — Ultra Server v5.0               ║
@@ -2075,19 +2074,24 @@ function isAssignmentTask(text) {
 }
 
 function isFormAssignmentTask(text) {
-  return /nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|s?heet|worksheet|form|shift\s*[ab]|assigned\s+patients|responsible\s+nurse|delegated\s+nurse|break\s+time|narcotic\s+check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s+drug|sterile\s+supply|hazardous\s+materials|o2\s+and\s+suction|fire\s+plan|red\s+code|rescue\s+person|extinguisher|ورقة\s+واجب\s+تمريض|نموذج|شفت\s*[أب]|مرضى\s+مكلفون|خطة\s+الحريق|الأدوية\s+الخاضعة|عربة\s+الطوارئ|المواد\s+المعقمة/i.test(String(text || ""));
-}
-
-function isObstetricComparisonTask(text) {
-  return /vaginal\s+delivery|normal\s+vaginal\s+delivery|\bNVD\b|cesarean|caesarean|c-section|elective\s+.*emergency\s+cesarean|ولادة\s+طبيعي[ةه]|قيصرية|عملية\s+قيصرية/i.test(String(text || ""));
-}
-
-function isBilingualAssignmentTask(text) {
-  return /(?:arabic.*english|english.*arabic|both\s+languages|bilingual|باللغتين|عربي.*(?:إنجليزي|انجليزي)|(?:إنجليزي|انجليزي).*عربي)/i.test(String(text || ""));
+  const value = String(text || "");
+  if (/nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|shift\s*[ab]|ورقة\s+واجب\s+تمريض|نموذج\s+واجب\s+تمريض|شفت\s*[أب]/i.test(value)) {
+    return true;
+  }
+  const signals = [
+    /assigned\s+patients/i, /responsible\s+nurse/i, /delegated\s+nurse/i,
+    /break\s+time/i, /narcotic\s+check/i, /emergency\s*(?:&|and)\s*defibrillator/i,
+    /high\s*alert/i, /controlled\s+drug/i, /sterile\s+supply/i,
+    /hazardous\s+materials/i, /o2\s+and\s+suction/i, /fire\s+plan/i,
+    /red\s+code/i, /rescue\s+person/i, /extinguisher/i,
+    /مرضى\s+مكلفون/i, /خطة\s+الحريق/i, /الأدوية\s+الخاضعة/i,
+    /عربة\s+الطوارئ/i, /المواد\s+المعقمة/i
+  ];
+  return signals.filter((pattern) => pattern.test(value)).length >= 2;
 }
 
 function requiresComparisonTable(text) {
-  return /comparison\s+table|comparative\s+table|include\s+(?:one\s+)?(?:clear\s+)?comparison|جدول\s+مقارنة|جدول\s+مقارن|مقارنة\s+واضحة/i.test(String(text || ""));
+  return /comparison\s+table|comparative\s+table|(?:include|add|provide|use|required|must|complete|fill)\s+(?:one\s+)?(?:clear\s+)?table|table\s+(?:is\s+)?(?:required|needed|requested)|جدول\s+مقارنة|جدول\s+مقارن|(?:أضف|أدرج|استخدم|املأ|مطلوب|يتطلب)\s*.{0,35}جدول/i.test(String(text || ""));
 }
 
 function containsMarkdownTable(text) {
@@ -2115,43 +2119,15 @@ const FORM_ASSIGNMENT_RULES = `
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
 `;
 
-const NURSING_SHEET_COMPLETENESS_RULES = `
-قائمة تحقق إلزامية لنموذج Nursing Assignment Sheet:
-- أنشئ Shift A وShift B، وكل شفت في جدول مستقل.
-- يجب أن يحتوي كل شفت على: Unit/Floor، Head Nurse، Patient Count، Date، CPR Team.
-- أدرج: Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time.
-- أدرج: Narcotics، Emergency Cart/Defibrillator، High-Alert Medication،
-  Controlled Drugs، Sterile Supplies، Hazardous Materials، O2/Suction.
-- أدرج خطة الحريق بأدوار منفصلة: Rescue، Red Code، Activate Alarm، Extinguisher.
-- اختم كل شفت بـ [Student Signature] ولا تخترع توقيعاً.
-- إذا لم توجد بيانات، استخدم بيانات تدريبية رمزية متسقة، واجعل Patient Count
-  مطابقاً لعدد المرضى، وضع عبارة "Training Data — Fictional".
+const ASSIGNMENT_FORMAT_RULES = `
+قاعدة تنسيق إلزامية:
+- التزم حرفياً بتعليمات الدكتور وبنوع الإخراج المطلوب.
+- لا تنشئ أي جدول من تلقاء نفسك. المقارنة أو عنوان Comparative Analysis لا يعنيان
+  أن الجدول مطلوب.
+- استخدم نصاً متصلاً بعناوين واضحة إذا كان المطلوب تقريراً أو مقالاً أو نصاً.
+- استخدم جدولاً فقط إذا طلب الدكتور جدولاً صراحةً أو كان المطلوب نموذجاً جدولياً.
+- عند عدم وضوح التنسيق، اتبع صيغة التعليمات الأصلية ولا تضف عناصر شكلية من عندك.
 `;
-
-const OBSTETRIC_COMPARISON_RULES = `
-اكتب تقريراً تمريضياً مقارناً كاملاً عن NVD مقابل elective/emergency C-Section.
-يجب تضمين: مقدمة وهدف، التحضير قبل العملية، أدوار التمريض أثناء العملية،
-الرعاية الفورية بعد الولادة/العملية، إدارة الألم، والوقاية من المضاعفات.
-غطِّ تحديداً: تقييم الأم والجنين، الموافقة والفحوصات وIV، المراقبة، counts،
-التوثيق، النزيف/نغمة الرحم، الجرح أو العجان، البول والحركة، الرضاعة،
-العدوى، الجلطات، مشاكل التخدير، وعلامات الخطر والتصعيد.
-أضف جدول مقارنة Markdown متعدد الصفوف يشمل: Preparation، Intraoperative Roles،
-Immediate Postoperative Care، Pain Management، Complication Prevention،
-Patient Education. ميّز بوضوح بين elective وemergency C-Section.
-لا تخترع أرقاماً أو مراجع أو بيانات مرضى.
-`;
-
-const BILINGUAL_ASSIGNMENT_RULES = `
-إذا طُلبت اللغتان، أخرج نسختين كاملتين: English كاملة ثم العربية كاملة.
-حافظ على نفس الأقسام والجداول وكل البنود؛ لا تقدم ترجمة مختصرة أو جزئية.
-`;
-
-function containsRequiredNursingSheetSections(text) {
-  const value = String(text || "").toLowerCase();
-  return ["shift a", "shift b", "head nurse", "patient", "narcotic",
-    "emergency", "sterile", "o2", "rescue", "alarm", "extinguisher",
-    "signature"].every((term) => value.includes(term));
-}
 
 async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
   const controller = new AbortController();
@@ -2199,16 +2175,11 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
-  const assignmentText = `${systemPrompt || ""}\n${prompt || ""}`;
-  const formTask = isFormAssignmentTask(assignmentText);
-  const obstetricTask = isObstetricComparisonTask(assignmentText);
-  const bilingualTask = isBilingualAssignmentTask(assignmentText);
+  const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
     systemPrompt,
-    formTask ? FORM_ASSIGNMENT_RULES : "",
-    formTask ? NURSING_SHEET_COMPLETENESS_RULES : "",
-    obstetricTask ? OBSTETRIC_COMPARISON_RULES : "",
-    bilingualTask ? BILINGUAL_ASSIGNMENT_RULES : ""
+    ASSIGNMENT_FORMAT_RULES,
+    formTask ? FORM_ASSIGNMENT_RULES : ""
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
@@ -2225,15 +2196,14 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
 صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
 لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
+احذف أي جدول أُضيف من تلقاء نفسه إذا لم تطلبه تعليمات الدكتور، وحافظ على النص
+المتصل والعناوين فقط في التقارير والمقالات.
 لا تخترع مراجع أو DOI أو أرقاماً علمية. في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
 وبيانات طاقم افتراضية متسقة إذا لم يقدم المستخدم بيانات فعلية، مع إبقاء وسم "البيانات افتراضية".
 أخرج نص الواجب النهائي فقط.
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
-${NURSING_SHEET_COMPLETENESS_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
-${obstetricTask ? `\n${OBSTETRIC_COMPARISON_RULES}` : ""}
-${bilingualTask ? `\n${BILINGUAL_ASSIGNMENT_RULES}` : ""}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
@@ -2252,8 +2222,34 @@ ${String(draft.content).slice(0, 50000)}
   );
   if (!reviewed.ok) return draft;
 
+  const tableRequired = formTask || requiresComparisonTable(`${systemPrompt || ""}\n${prompt || ""}`);
+  if (!tableRequired && containsMarkdownTable(reviewed.content)) {
+    const repaired = await openRouterCompletion(
+      reviewModel,
+      [
+        {
+          role: "system",
+          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n")
+        },
+        {
+          role: "user",
+          content: `أعد كتابة النص التالي دون أي جداول.
+تعليمات الدكتور لا تطلب جدولاً؛ احذف الجداول فقط وحوّل محتواها إلى فقرات أو نقاط
+عند الحاجة، مع الحفاظ على كل المعلومات والعناوين وعدم إضافة أي محتوى جديد.
+أخرج الواجب النهائي فقط.
+
+النص:
+${String(reviewed.content).slice(0, 60000)}`
+        }
+      ],
+      maxTokens,
+      0.05
+    );
+    if (repaired.ok) return repaired;
+  }
+
   // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
-  if ((requiresComparisonTable(prompt) || obstetricTask) && !containsMarkdownTable(reviewed.content)) {
+  if (tableRequired && !containsMarkdownTable(reviewed.content)) {
     const repaired = await openRouterCompletion(
       reviewModel,
       [
@@ -2274,24 +2270,6 @@ ${String(prompt).slice(0, 60000)}
 النسخة الحالية:
 ${String(reviewed.content).slice(0, 60000)}`
         }
-      ],
-      maxTokens,
-      0.05
-    );
-    return repaired.ok ? repaired : reviewed;
-  }
-  if (formTask && !containsRequiredNursingSheetSections(reviewed.content)) {
-    const repaired = await openRouterCompletion(
-      reviewModel,
-      [
-        { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
-        { role: "user", content: `أعد إخراج نموذج Nursing Assignment Sheet كاملاً.
-أضف كل خانة ناقصة، مع Shift A وShift B في جدولين مستقلين، ولا تكتب شرحاً.
-
-${NURSING_SHEET_COMPLETENESS_RULES}
-
-النموذج الحالي:
-${String(reviewed.content).slice(0, 60000)}` }
       ],
       maxTokens,
       0.05
