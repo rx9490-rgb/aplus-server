@@ -62,6 +62,21 @@ const db = {
   }
 };
 
+async function withTransaction(work) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // يبدأ HTTP فوراً، وتنتظر طلبات الدخول جاهزية قاعدة البيانات
 let dbReady = false;
 let dbInitError = null;
@@ -168,6 +183,15 @@ async function initDB() {
       expires_at BIGINT NOT NULL,
       used       BOOLEAN DEFAULT FALSE,
       created_at BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS paylink_orders (
+      transaction_no TEXT PRIMARY KEY,
+      order_number   TEXT UNIQUE NOT NULL,
+      user_email     TEXT NOT NULL,
+      amount         NUMERIC(12,2) NOT NULL,
+      order_status   TEXT DEFAULT 'pending',
+      created_at     BIGINT NOT NULL,
+      confirmed_at   BIGINT
     );
   `);
 
@@ -278,6 +302,14 @@ const AI_MAX_IMAGE_CHARS = Math.max(
   1_000_000,
   Number(process.env.AI_MAX_IMAGE_CHARS || 12_000_000)
 );
+const AI_MAX_FILE_CHARS = Math.max(
+  1_000_000,
+  Number(process.env.AI_MAX_FILE_CHARS || 24_000_000)
+);
+const AI_MAX_FILES = Math.max(
+  1,
+  Math.min(5, Number(process.env.AI_MAX_FILES || 3))
+);
 
 async function requireAiUser(req, res, requestedTokens = 0) {
   const auth = String(req.headers.authorization || "");
@@ -355,6 +387,15 @@ const RESEND_KEY   = process.env.RESEND_API_KEY || "";
 // FRONTEND_URL: رابط صفحة reset-password.html
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://aplus-server-w6wb.onrender.com";
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 async function _sendViaResend(toEmail, subject, htmlBody) {
   const fromAddr = process.env.RESEND_FROM || "A+ الطبي <onboarding@resend.dev>";
   const body = JSON.stringify({ from: fromAddr, to: [toEmail], subject, html: htmlBody });
@@ -384,7 +425,8 @@ async function _sendViaResend(toEmail, subject, htmlBody) {
 
 async function sendResetEmail(toEmail, token, fullName) {
   const resetLink = `${FRONTEND_URL}/reset-password.html?token=${token}`;
-  const displayName = fullName || "المستخدم";
+  const displayName = escapeHtml(fullName || "المستخدم");
+  const safeResetLink = escapeHtml(resetLink);
 
   const htmlBody = `
 <!DOCTYPE html>
@@ -420,7 +462,7 @@ async function sendResetEmail(toEmail, token, fullName) {
 
           <!-- CTA Button -->
           <div style="text-align:center;margin:28px 0;">
-            <a href="${resetLink}" style="display:inline-block;padding:15px 40px;background:linear-gradient(135deg,#d4af37,#b8960c,#d4af37);color:#0a0a0f;font-size:1rem;font-weight:900;text-decoration:none;border-radius:12px;letter-spacing:0.3px;box-shadow:0 6px 24px rgba(212,175,55,0.4);">
+             <a href="${safeResetLink}" style="display:inline-block;padding:15px 40px;background:linear-gradient(135deg,#d4af37,#b8960c,#d4af37);color:#0a0a0f;font-size:1rem;font-weight:900;text-decoration:none;border-radius:12px;letter-spacing:0.3px;box-shadow:0 6px 24px rgba(212,175,55,0.4);">
               🔑 إعادة تعيين كلمة المرور
             </a>
           </div>
@@ -428,7 +470,7 @@ async function sendResetEmail(toEmail, token, fullName) {
           <!-- Link fallback -->
           <div style="background:#0d0819;border:1px solid #2a1f48;border-radius:10px;padding:14px 16px;margin-top:16px;">
             <p style="color:#7a6d9a;font-size:0.75rem;margin:0 0 6px;">أو انسخ هذا الرابط في متصفحك:</p>
-            <p style="color:#8b7bd4;font-size:0.72rem;word-break:break-all;margin:0;direction:ltr;text-align:left;">${resetLink}</p>
+             <p style="color:#8b7bd4;font-size:0.72rem;word-break:break-all;margin:0;direction:ltr;text-align:left;">${safeResetLink}</p>
           </div>
         </td></tr>
 
@@ -501,7 +543,7 @@ setInterval(() => {
 // إرسال إيميل تأكيد البريد الإلكتروني
 // ══════════════════════════════════════════════
 async function sendVerificationEmail(toEmail, code, fullName) {
-  const displayName = fullName || "المستخدم";
+  const displayName = escapeHtml(fullName || "المستخدم");
   const htmlBody = `<!DOCTYPE html>
 <html dir="rtl" lang="ar">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -763,10 +805,11 @@ function broadcastEvent(data, targetEmail = null) {
   const eventType = data.type || "message";
   const payload   = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
   const dead = [];
+  const recipientEmail = targetEmail || data.email || null;
 
   for (const [id, client] of sseClients) {
-    // إذا كان الحدث مخصصاً لمستخدم معين → أرسل فقط لذلك المستخدم (تجاهل المجهولين)
-    if (targetEmail && client._email !== targetEmail) continue;
+    // الأحداث التي تحتوي بريداً إلكترونياً مخصصة لذلك المستخدم فقط.
+    if (recipientEmail && client._email !== recipientEmail) continue;
     try {
       client.write(payload);
     } catch {
@@ -798,8 +841,18 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: false,
 }));
+const configuredOrigins = new Set([
+  FRONTEND_URL,
+  "https://aplus.blog",
+  "https://www.aplus.blog",
+  ...(process.env.ALLOWED_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean)
+]);
+
 app.use(cors({
-  origin: "*",
+  origin: (origin, callback) => {
+    if (!origin || configuredOrigins.has(origin)) return callback(null, true);
+    return callback(new Error("origin_not_allowed"));
+  },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type","Authorization","x-session-token",
@@ -830,8 +883,96 @@ app.use("/api/openrouter", rateLimit({
   legacyHeaders: false
 }));
 
-app.use(express.json({ limit: "100mb" }));
-app.use(express.urlencoded({ extended: true, limit: "100mb" }));
+app.use(express.json({ limit: "32mb" }));
+app.use(express.urlencoded({ extended: true, limit: "32mb" }));
+
+// دعم FormData للملفات بدون حفظها على القرص؛ تُمرّر لاحقاً إلى OpenRouter كـ data URL.
+app.use((req, res, next) => {
+  const contentType = String(req.headers["content-type"] || "");
+  if (!contentType.toLowerCase().startsWith("multipart/form-data")) return next();
+
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  const boundary = boundaryMatch?.[1] || boundaryMatch?.[2];
+  const contentLength = Number(req.headers["content-length"] || 0);
+  const maxBodyBytes = 32 * 1024 * 1024;
+  if (!boundary) return res.status(400).json({ ok: false, error: "multipart_boundary_required" });
+  if (contentLength > maxBodyBytes) {
+    return res.status(413).json({ ok: false, error: "request_too_large" });
+  }
+
+  const chunks = [];
+  let received = 0;
+  let stopped = false;
+  req.on("data", (chunk) => {
+    if (stopped) return;
+    received += chunk.length;
+    if (received > maxBodyBytes) {
+      stopped = true;
+      req.destroy();
+      return res.status(413).json({ ok: false, error: "request_too_large" });
+    }
+    chunks.push(chunk);
+  });
+  req.on("error", (error) => {
+    if (!res.headersSent) next(error);
+  });
+  req.on("end", () => {
+    if (stopped || res.headersSent) return;
+    try {
+      const raw = Buffer.concat(chunks);
+      const marker = Buffer.from(`--${boundary}`);
+      const parsed = {};
+      const files = [];
+      let cursor = raw.indexOf(marker);
+
+      while (cursor !== -1) {
+        const partStart = cursor + marker.length;
+        if (raw.subarray(partStart, partStart + 2).toString() === "--") break;
+        const nextMarker = raw.indexOf(marker, partStart);
+        if (nextMarker === -1) break;
+
+        let part = raw.subarray(partStart, nextMarker);
+        if (part.subarray(0, 2).toString() === "\r\n") part = part.subarray(2);
+        if (part.subarray(-2).toString() === "\r\n") part = part.subarray(0, -2);
+        const separator = Buffer.from("\r\n\r\n");
+        const headerEnd = part.indexOf(separator);
+        if (headerEnd === -1) {
+          cursor = nextMarker;
+          continue;
+        }
+
+        const headers = part.subarray(0, headerEnd).toString("utf8");
+        const payload = part.subarray(headerEnd + separator.length);
+        const disposition = headers.match(/content-disposition:[^\r\n]*/i)?.[0] || "";
+        const name = disposition.match(/(?:^|;)\s*name="([^"]*)"/i)?.[1];
+        const filename = disposition.match(/(?:^|;)\s*filename="([^"]*)"/i)?.[1];
+        if (!name) {
+          cursor = nextMarker;
+          continue;
+        }
+
+        if (filename) {
+          const partType = headers.match(/content-type:\s*([^\r\n;]+)/i)?.[1]?.trim() || "";
+          const inferredType = getFileMimeType(filename, partType) || partType;
+          files.push({
+            filename,
+            mimeType: inferredType,
+            fileData: `data:${inferredType || "application/octet-stream"};base64,${payload.toString("base64")}`
+          });
+        } else {
+          parsed[name] = payload.toString("utf8");
+        }
+        cursor = nextMarker;
+      }
+
+      if (files.length) parsed.files = files;
+      req.body = parsed;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+});
 
 // ══════════════════════════════════════════════
 // 6. Health & Ping
@@ -1996,7 +2137,8 @@ app.get("/download-reset-page", (_req, res) => {
   });
 });
 
-app.get("/download-server", (_req, res) => {
+app.get("/download-server", async (req, res) => {
+  if (!(await isAdminRequest(req))) return res.status(404).send("Not found");
   res.setHeader("Content-Disposition", 'attachment; filename="server.js"');
   res.setHeader("Content-Type", "application/javascript");
   res.sendFile(path.join(__dirname, "server.js"));
@@ -2023,6 +2165,185 @@ function safeOpenRouterModel(value, fallback) {
     return fallback;
   }
   return model;
+}
+
+const AI_FILE_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif"
+]);
+
+const AI_FILE_EXTENSIONS = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  txt: "text/plain",
+  md: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  gif: "image/gif"
+};
+
+function getFileMimeType(filename, value) {
+  const explicit = String(value || "").toLowerCase().split(";")[0].trim();
+  if (AI_FILE_MIME_TYPES.has(explicit)) return explicit;
+  const extension = String(filename || "").toLowerCase().split(".").pop();
+  return AI_FILE_EXTENSIONS[extension] || "";
+}
+
+function normalizeFileName(filename, index) {
+  const original = path.basename(String(filename || `document-${index + 1}`));
+  const cleaned = original.replace(/[^\w.\-()\u0600-\u06ff ]/g, "_").trim();
+  return (cleaned || `document-${index + 1}`).slice(0, 120);
+}
+
+function normalizeAiFiles(body) {
+  const input = body && typeof body === "object" ? body : {};
+  let entries = [];
+
+  if (Array.isArray(input.files)) {
+    entries.push(...input.files.map((file, index) => (
+      typeof file === "string"
+        ? {
+            filename: input.fileNames?.[index] || `document-${index + 1}`,
+            mimeType: input.fileTypes?.[index],
+            fileData: file
+          }
+        : file
+    )));
+  }
+  if (input.file && (typeof input.file === "object" || typeof input.file === "string")) {
+    entries.push(
+      typeof input.file === "string"
+        ? {
+            filename: input.fileName || input.filename || "document",
+            mimeType: input.fileType || input.mimeType || input.contentType,
+            fileData: input.file
+          }
+        : input.file
+    );
+  }
+
+  const legacyData = input.fileData
+    ?? input.file_data
+    ?? input.fileBase64
+    ?? input.file_base64
+    ?? input.fileContent
+    ?? input.file_content;
+  if (legacyData) {
+    entries.push({
+      filename: input.fileName || input.filename || "document",
+      mimeType: input.fileType || input.mimeType || input.contentType,
+      fileData: legacyData
+    });
+  }
+
+  if (!entries.length) return { files: [], error: null };
+  if (entries.length > AI_MAX_FILES) {
+    return { files: [], error: "too_many_files" };
+  }
+
+  const files = [];
+  let totalChars = 0;
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!entry || typeof entry !== "object") {
+      return { files: [], error: "invalid_file" };
+    }
+
+    const filename = normalizeFileName(entry.filename || entry.name, index);
+    const mimeType = getFileMimeType(
+      filename,
+      entry.mimeType || entry.mime_type || entry.type || entry.contentType
+    );
+    if (!mimeType) return { files: [], error: "unsupported_file_type" };
+
+    let fileData = entry.fileData ?? entry.file_data ?? entry.data ?? entry.url ?? entry.fileUrl;
+    if (!fileData && entry.text !== undefined && mimeType.startsWith("text/")) {
+      fileData = Buffer.from(String(entry.text), "utf8").toString("base64");
+    }
+    if (typeof fileData !== "string" || !fileData.trim()) {
+      return { files: [], error: "file_data_required" };
+    }
+
+    fileData = fileData.trim();
+    if (/^https?:\/\//i.test(fileData)) {
+      if (!/^https:\/\//i.test(fileData)) {
+        return { files: [], error: "only_https_file_urls_allowed" };
+      }
+    } else if (/^data:/i.test(fileData)) {
+      const dataUrlPattern = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i;
+      const match = fileData.match(dataUrlPattern);
+      if (!match || match[1].toLowerCase() !== mimeType) {
+        return { files: [], error: "invalid_file_data_url" };
+      }
+      fileData = `data:${mimeType};base64,${match[2].replace(/\s/g, "")}`;
+    } else {
+      if (!/^[a-z0-9+/=\s]+$/i.test(fileData)) {
+        return { files: [], error: "invalid_base64_file" };
+      }
+      fileData = `data:${mimeType};base64,${fileData.replace(/\s/g, "")}`;
+    }
+
+    totalChars += fileData.length;
+    if (fileData.length > AI_MAX_FILE_CHARS || totalChars > AI_MAX_FILE_CHARS) {
+      return { files: [], error: "file_too_large" };
+    }
+    files.push({ filename, mimeType, fileData });
+  }
+
+  return { files, error: null };
+}
+
+function buildAiUserContent(prompt, files = []) {
+  const content = [{ type: "text", text: String(prompt || "") }];
+  for (const file of files) {
+    if (file.mimeType.startsWith("image/")) {
+      content.push({
+        type: "image_url",
+        image_url: { url: file.fileData }
+      });
+    } else {
+      content.push({
+        type: "file",
+        file: {
+          filename: file.filename,
+          file_data: file.fileData
+        }
+      });
+    }
+  }
+  return files.length ? content : String(prompt || "");
+}
+
+function getAiFilePlugins(files = []) {
+  if (!files.some((file) => file.mimeType === "application/pdf")) return undefined;
+  return [{
+    id: "file-parser",
+    pdf: {
+      engine: process.env.OPENROUTER_PDF_ENGINE || "mistral-ocr"
+    }
+  }];
 }
 // نماذج OpenRouter المستخدمة بالترتيب:
 // Gemini ثم GPT للمراجعة، وبعدها Claude وDeepSeek وQwen وLlama كبدائل.
@@ -2074,28 +2395,11 @@ function isAssignmentTask(text) {
 }
 
 function isFormAssignmentTask(text) {
-  const value = String(text || "");
-  if (/nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|shift\s*[ab]|ورقة\s+واجب\s+تمريض|نموذج\s+واجب\s+تمريض|شفت\s*[أب]/i.test(value)) {
-    return true;
-  }
-  const signals = [
-    /assigned\s+patients/i, /responsible\s+nurse/i, /delegated\s+nurse/i,
-    /break\s+time/i, /narcotic\s+check/i, /emergency\s*(?:&|and)\s*defibrillator/i,
-    /high\s*alert/i, /controlled\s+drug/i, /sterile\s+supply/i,
-    /hazardous\s+materials/i, /o2\s+and\s+suction/i, /fire\s+plan/i,
-    /red\s+code/i, /rescue\s+person/i, /extinguisher/i,
-    /مرضى\s+مكلفون/i, /خطة\s+الحريق/i, /الأدوية\s+الخاضعة/i,
-    /عربة\s+الطوارئ/i, /المواد\s+المعقمة/i
-  ];
-  return signals.filter((pattern) => pattern.test(value)).length >= 2;
-}
-
-function isObstetricReportTask(text) {
-  return /comparative\s+analysis.*(?:vaginal|cesarean|caesarean)|(?:vaginal\s+delivery|normal\s+vaginal\s+delivery).*(?:cesarean|caesarean|c-section)|(?:cesarean|caesarean|c-section).*(?:vaginal\s+delivery|normal\s+vaginal\s+delivery)|تحليل\s+مقارن.*(?:ولادة|قيصرية)|ولادة\s+طبيعي.*قيصرية|قيصرية.*ولادة\s+طبيعي/i.test(String(text || ""));
+  return /nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|s?heet|worksheet|form|shift\s*[ab]|assigned\s+patients|responsible\s+nurse|delegated\s+nurse|break\s+time|narcotic\s+check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s+drug|sterile\s+supply|hazardous\s+materials|o2\s+and\s+suction|fire\s+plan|red\s+code|rescue\s+person|extinguisher|ورقة\s+واجب\s+تمريض|نموذج|شفت\s*[أب]|مرضى\s+مكلفون|خطة\s+الحريق|الأدوية\s+الخاضعة|عربة\s+الطوارئ|المواد\s+المعقمة/i.test(String(text || ""));
 }
 
 function requiresComparisonTable(text) {
-  return /comparison\s+table|comparative\s+table|(?:include|add|provide|use|required|must|complete|fill)\s+(?:one\s+)?(?:clear\s+)?table|table\s+(?:is\s+)?(?:required|needed|requested)|جدول\s+مقارنة|جدول\s+مقارن|(?:أضف|أدرج|استخدم|املأ|مطلوب|يتطلب)\s*.{0,35}جدول/i.test(String(text || ""));
+  return /comparison\s+table|comparative\s+table|include\s+(?:one\s+)?(?:clear\s+)?comparison|جدول\s+مقارنة|جدول\s+مقارن|مقارنة\s+واضحة/i.test(String(text || ""));
 }
 
 function containsMarkdownTable(text) {
@@ -2113,7 +2417,7 @@ const FORM_ASSIGNMENT_RULES = `
   وضع في أعلى الناتج: "نموذج تدريبي — البيانات افتراضية".
 - لا تنسب البيانات الافتراضية إلى مستشفى أو أشخاص حقيقيين، ولا تستخدم معلومات شخصية حقيقية.
 - لا تترك خانات أساسية فارغة أو تكتب [يُستكمل] عندما يمكن إكمالها ببيانات تدريبية افتراضية.
-- لا تختلق توقيعاً؛ اترك خانة توقيع يدوية فارغة أسفل كل شفت.
+- لا تختلق توقيعاً؛ اكتب "[توقيع الطالب مطلوب]" في نهاية كل شفت.
 - حافظ على جميع الحقول: Floor/Unit، Head Nurse، Total Patients، CPR Team، Date،
   Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time،
   Narcotic Check، Emergency & Defibrillator، High Alert Cabinet & Refrigerator،
@@ -2123,61 +2427,20 @@ const FORM_ASSIGNMENT_RULES = `
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
 `;
 
-const NURSING_SHEET_FINAL_RULES = `
-إخراج Nursing Assignment Sheet النهائي — صارم:
-- أخرج نموذجاً واحداً فقط، وليس نسخاً أو بدائل أو نماذج مكررة.
-- يجب أن يظهر Shift A مرة واحدة وShift B مرة واحدة فقط.
-- لكل شفت قسم واحد للمعلومات الأساسية، وقسم Staffing، وقسم Safety Checks،
-  وقسم Fire Plan، ثم خانة توقيع يدوية واحدة أسفل ذلك الشفت.
-- لا تضع N/A في Assigned Patients أو Responsible Nurse أو Delegated Nurse أو Break Time.
-  استخدم بيانات تدريبية رمزية متسقة عند غياب بيانات المستخدم.
-- يجب أن يتطابق Patient Count مع توزيع المرضى في ذلك الشفت.
-- لا تكرر النموذج في نهاية المستند ولا تضف جدول مقارنة أو ملخصاً بديلاً.
-- اترك التوقيع كخانة فارغة قابلة للتوقيع اليدوي:
-  Student Signature: ____________________   Date: __________
-  لا تنشئ توقيعاً أو اسماً مزيفاً.
-`;
-
-const OBSTETRIC_REPORT_RULES = `
-قواعد تقرير Comparative Analysis: Vaginal Delivery vs. Cesarean Section:
-- أخرج تقريراً واحداً كاملاً، وليس أجزاءً أو نسخاً بديلة.
-- استخدم هذه الأقسام مرة واحدة فقط وبالترتيب: Introduction، Preoperative Preparation،
-  Intraoperative Nursing Roles، Immediate Postoperative Care، Pain Management،
-  Complication Prevention Strategies، Conclusion.
-- غطِّ NVD وelective C-Section وemergency C-Section عند ارتباطها بالمحور.
-- لا تكتب End of Part 1 أو Part 1/Part 2 أو عبارة تفيد أن التقرير مقطوع.
-- لا تضف جدولاً لمجرد أن الموضوع مقارن؛ الجدول مسموح فقط إذا طلبه الدكتور صراحةً.
-- لا تكرر العناوين أو الفقرات، ولا تضع ملخصاً بديلاً بعد التقرير.
-- لا تخترع اسم طالب أو ID أو مشرفاً أو مراجع أو DOI. استخدم البيانات التي قدمها المستخدم فقط.
-- لا تختصر التقرير بسبب حد كلمات داخلي؛ أخرج النسخة النهائية كاملة.
-`;
-
-const ACADEMIC_COMPLETENESS_RULES = `
-قواعد التسليم النهائي الإلزامية:
-- أخرج ملفاً نهائياً واحداً فقط، بلا نسخ أو تصاميم أو صفحات مكررة.
-- لا تضع [Student] أو [ID] أو [Student Signature Required] أو أقواساً فارغة
-  أو End of Part 1/Part 2.
-- اسم الطالب والرقم الجامعي واسم المشرف والتوقيع تُستخدم فقط إذا قدمها المستخدم
-  صراحةً في الطلب. لا تخترع أي قيمة ولا تضع قيمة وهمية.
-- إذا كانت بيانات الغلاف أو التوقيع مطلوبة ولم يقدمها المستخدم، أوقف التسليم النهائي
-  واكتب بوضوح: "يلزم إدخال بيانات الطالب والتوقيع قبل التصدير النهائي".
-- لا تعتبر خط التوقيع الفارغ توقيعاً رقمياً، ولا تنشئ توقيعاً مزيفاً.
-`;
-
-const ASSIGNMENT_FORMAT_RULES = `
-قاعدة تنسيق إلزامية:
-- التزم حرفياً بتعليمات الدكتور وبنوع الإخراج المطلوب.
-- لا تنشئ أي جدول من تلقاء نفسك. المقارنة أو عنوان Comparative Analysis لا يعنيان
-  أن الجدول مطلوب.
-- استخدم نصاً متصلاً بعناوين واضحة إذا كان المطلوب تقريراً أو مقالاً أو نصاً.
-- استخدم جدولاً فقط إذا طلب الدكتور جدولاً صراحةً أو كان المطلوب نموذجاً جدولياً.
-- عند عدم وضوح التنسيق، اتبع صيغة التعليمات الأصلية ولا تضف عناصر شكلية من عندك.
-`;
-
-async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
+async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1, files = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
   try {
+    const requestBody = {
+      model,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+      stream: false
+    };
+    const plugins = getAiFilePlugins(files);
+    if (plugins) requestBody.plugins = plugins;
+
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -2186,13 +2449,7 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
         "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
         "X-Title": "A+ Medical"
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        max_tokens: maxTokens,
-        temperature,
-        stream: false
-      }),
+      body: JSON.stringify(requestBody),
       signal: controller.signal
     });
     const data = await response.json().catch(() => ({}));
@@ -2218,25 +2475,18 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
   }
 }
 
-async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
+async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest, files = []) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
-  const assignmentText = `${systemPrompt || ""}\n${prompt || ""}`;
-  const formTask = isFormAssignmentTask(assignmentText);
-  const obstetricTask = isObstetricReportTask(assignmentText);
-  const tableRequired = formTask || requiresComparisonTable(assignmentText);
+  const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
     systemPrompt,
-    ASSIGNMENT_FORMAT_RULES,
-    ACADEMIC_COMPLETENESS_RULES,
-    formTask ? FORM_ASSIGNMENT_RULES : "",
-    formTask ? NURSING_SHEET_FINAL_RULES : "",
-    obstetricTask ? OBSTETRIC_REPORT_RULES : ""
+    formTask ? FORM_ASSIGNMENT_RULES : ""
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
-    { role: "user", content: String(prompt) }
+    { role: "user", content: buildAiUserContent(prompt, files) }
   ];
-  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
+  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1, files);
   if (!draft.ok) return draft;
 
   // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
@@ -2247,17 +2497,12 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
 صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
 لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
-طبّق قواعد التسليم الأكاديمية ولا تُخرج ملفاً نهائياً ببيانات أو توقيع ناقصين.
-احذف أي جدول أُضيف من تلقاء نفسه إذا لم تطلبه تعليمات الدكتور، وحافظ على النص
-المتصل والعناوين فقط في التقارير والمقالات.
 لا تخترع مراجع أو DOI أو أرقاماً علمية. في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
 وبيانات طاقم افتراضية متسقة إذا لم يقدم المستخدم بيانات فعلية، مع إبقاء وسم "البيانات افتراضية".
 أخرج نص الواجب النهائي فقط.
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
-${obstetricTask ? `\nهذا تقرير مقارن، وليس نموذجاً:
-${OBSTETRIC_REPORT_RULES}` : ""}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
@@ -2269,96 +2514,16 @@ ${String(draft.content).slice(0, 50000)}
     reviewModel,
     [
       { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
-      { role: "user", content: reviewPrompt }
+        { role: "user", content: buildAiUserContent(reviewPrompt, files) }
     ],
     maxTokens,
-    0.1
+    0.1,
+    files
   );
   if (!reviewed.ok) return draft;
 
-  if (formTask) {
-    const normalized = await openRouterCompletion(
-      reviewModel,
-      [
-        {
-          role: "system",
-          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt, FORM_ASSIGNMENT_RULES, NURSING_SHEET_FINAL_RULES]
-            .filter(Boolean).join("\n\n")
-        },
-        {
-          role: "user",
-          content: `أعد بناء الواجب التالي كنسخة نهائية واحدة فقط.
-احذف كل النسخ المكررة والبدائل وأي نموذج إضافي، ثم أخرج Nursing Assignment Sheet واحداً
-يحتوي Shift A وShift B مرة واحدة فقط، مع جميع المتطلبات كاملة.
-لا تكتب شرحاً عن التنقيح ولا قائمة تحقق.
-
-${NURSING_SHEET_FINAL_RULES}
-
-المحتوى الحالي:
-${String(reviewed.content).slice(0, 60000)}`
-        }
-      ],
-      maxTokens,
-      0.05
-    );
-    if (normalized.ok) return normalized;
-  }
-
-  if (obstetricTask) {
-    const normalized = await openRouterCompletion(
-      reviewModel,
-      [
-        {
-          role: "system",
-          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt, OBSTETRIC_REPORT_RULES]
-            .filter(Boolean).join("\n\n")
-        },
-        {
-          role: "user",
-          content: `أعد بناء التقرير التالي كنسخة نهائية واحدة كاملة.
-احذف التكرار، وأي جدول غير مطلوب، وأي عبارة End of Part أو Part 1/Part 2.
-لا تختصر المحتوى ولا تضف مراجع أو بيانات غير موجودة.
-يجب أن تظهر المحاور المطلوبة مرة واحدة فقط وبالترتيب.
-
-${OBSTETRIC_REPORT_RULES}
-
-التقرير الحالي:
-${String(reviewed.content).slice(0, 60000)}`
-        }
-      ],
-      maxTokens,
-      0.05
-    );
-    if (normalized.ok) return normalized;
-  }
-
-  if (!tableRequired && containsMarkdownTable(reviewed.content)) {
-    const repaired = await openRouterCompletion(
-      reviewModel,
-      [
-        {
-          role: "system",
-          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n")
-        },
-        {
-          role: "user",
-          content: `أعد كتابة النص التالي دون أي جداول.
-تعليمات الدكتور لا تطلب جدولاً؛ احذف الجداول فقط وحوّل محتواها إلى فقرات أو نقاط
-عند الحاجة، مع الحفاظ على كل المعلومات والعناوين وعدم إضافة أي محتوى جديد.
-أخرج الواجب النهائي فقط.
-
-النص:
-${String(reviewed.content).slice(0, 60000)}`
-        }
-      ],
-      maxTokens,
-      0.05
-    );
-    if (repaired.ok) return repaired;
-  }
-
   // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
-  if (tableRequired && !containsMarkdownTable(reviewed.content)) {
+  if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
     const repaired = await openRouterCompletion(
       reviewModel,
       [
@@ -2381,7 +2546,8 @@ ${String(reviewed.content).slice(0, 60000)}`
         }
       ],
       maxTokens,
-      0.05
+      0.05,
+      files
     );
     return repaired.ok ? repaired : reviewed;
   }
@@ -2394,6 +2560,7 @@ ${String(reviewed.content).slice(0, 60000)}`
 // ══════════════════════════════════════════════
 app.post("/api/ai/call", async (req, res) => {
   const { provider = "gemini", prompt, systemPrompt = "", maxTokens } = req.body || {};
+  const normalizedFiles = normalizeAiFiles(req.body || {});
   if (provider !== "gemini") {
     res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
     return;
@@ -2405,6 +2572,10 @@ app.post("/api/ai/call", async (req, res) => {
   }
   if (!prompt) {
     res.status(400).json({ ok: false, error: "prompt_required" });
+    return;
+  }
+  if (normalizedFiles.error) {
+    res.status(400).json({ ok: false, error: normalizedFiles.error });
     return;
   }
   if (String(prompt).length > AI_MAX_PROMPT_CHARS) {
@@ -2432,7 +2603,8 @@ app.post("/api/ai/call", async (req, res) => {
         prompt,
         systemPrompt,
         safeMaxTokens,
-        isArabicRequest
+        isArabicRequest,
+        normalizedFiles.files
       );
       if (qualityResult.ok) {
         res.json({
@@ -2448,13 +2620,23 @@ app.post("/api/ai/call", async (req, res) => {
 
     const messages = [
       { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
-      { role: "user", content: String(prompt) }
+      { role: "user", content: buildAiUserContent(prompt, normalizedFiles.files) }
     ];
 
     for (const model of requestModels) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 120000);
       try {
+        const requestBody = {
+          model,
+          messages,
+          max_tokens: safeMaxTokens,
+          temperature: isHighAccuracyTask(requestText) ? 0.1 : 0.2,
+          stream: false
+        };
+        const plugins = getAiFilePlugins(normalizedFiles.files);
+        if (plugins) requestBody.plugins = plugins;
+
         const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -2463,13 +2645,7 @@ app.post("/api/ai/call", async (req, res) => {
             "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
             "X-Title": "A+ Medical"
           },
-          body: JSON.stringify({
-            model,
-            messages,
-            max_tokens: safeMaxTokens,
-            temperature: isHighAccuracyTask(requestText) ? 0.1 : 0.2,
-            stream: false
-          }),
+          body: JSON.stringify(requestBody),
           signal: controller.signal
         });
         const data = await response.json().catch(() => ({}));
@@ -2532,8 +2708,13 @@ app.post("/api/openrouter/stream", async (req, res) => {
     return;
   }
   const { prompt, systemPrompt, maxTokens } = req.body || {};
+  const normalizedFiles = normalizeAiFiles(req.body || {});
   if (!prompt) {
     res.status(400).json({ ok: false, error: "prompt_required" });
+    return;
+  }
+  if (normalizedFiles.error) {
+    res.status(400).json({ ok: false, error: normalizedFiles.error });
     return;
   }
   if (String(prompt).length > AI_MAX_PROMPT_CHARS) {
@@ -2556,7 +2737,8 @@ app.post("/api/openrouter/stream", async (req, res) => {
   const messages = [];
   const combinedSystem = [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n");
   messages.push({ role: "system", content: combinedSystem });
-  messages.push({ role: "user", content: prompt });
+  messages.push({ role: "user", content: buildAiUserContent(prompt, normalizedFiles.files) });
+  const aiFilePlugins = getAiFilePlugins(normalizedFiles.files);
 
   let lastErr = null;
   let sentAny = false;
@@ -2586,6 +2768,15 @@ app.post("/api/openrouter/stream", async (req, res) => {
         const ctrl = new AbortController();
         if (clientGone) return;
         const tm = setTimeout(() => ctrl.abort(), 90000);
+        const requestBody = {
+          model,
+          messages,
+          max_tokens: safeMaxTokens,
+          temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.1 : 0.2,
+          stream: true
+        };
+        if (aiFilePlugins) requestBody.plugins = aiFilePlugins;
+
         const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -2595,13 +2786,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
             "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
             "X-Title": "A+ Medical"
           },
-          body: JSON.stringify({
-            model,
-            messages,
-            max_tokens: safeMaxTokens,
-            temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.1 : 0.2,
-            stream: true
-          }),
+          body: JSON.stringify(requestBody),
           signal: ctrl.signal
         });
         clearTimeout(tm);
@@ -2707,9 +2892,21 @@ app.post("/api/openrouter/vision", async (req, res) => {
     res.status(400).json({ ok: false, error: "missing_params" });
     return;
   }
+  const normalizedImage = normalizeAiFiles({
+    files: [{
+      filename: req.body?.fileName || "image",
+      mimeType: req.body?.mimeType || req.body?.fileType || "image/jpeg",
+      fileData: imageBase64
+    }]
+  });
+  if (normalizedImage.error || !normalizedImage.files[0]?.mimeType.startsWith("image/")) {
+    res.status(400).json({ ok: false, error: normalizedImage.error || "image_required" });
+    return;
+  }
+  const safeImageData = normalizedImage.files[0].fileData;
   if (
     String(prompt).length > AI_MAX_PROMPT_CHARS ||
-    String(imageBase64).length > AI_MAX_IMAGE_CHARS
+    String(safeImageData).length > AI_MAX_IMAGE_CHARS
   ) {
     res.status(413).json({ ok: false, error: "payload_too_large" });
     return;
@@ -2723,7 +2920,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
   console.log("[AI] vision request", {
     user: aiUser.email,
     promptChars: String(prompt).length,
-    imageChars: String(imageBase64).length,
+    imageChars: String(safeImageData).length,
     maxTokens: safeMaxTokens
   });
   const VISION_MODELS = [
@@ -2756,7 +2953,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
             {
               role: "user",
               content: [
-                { type: "image_url", image_url: { url: imageBase64 } },
+                { type: "image_url", image_url: { url: safeImageData } },
                 { type: "text", text: prompt }
               ]
             }
@@ -2845,9 +3042,14 @@ async function paylinkFetch(endpoint, options = {}) {
 
 app.post("/api/payment/paylink/create", async (req, res) => {
   try {
+    const sessionUser = await getSessionUser(req.headers["x-session-token"]);
+    if (!sessionUser) return res.status(401).json({ success: false, error: "login_required" });
     const { email, name, mobile } = req.body || {};
     const amount = Number(req.body?.amount);
     if (!email || !email.includes("@")) return res.status(400).json({ success: false, error: "email_required" });
+    if (String(email).toLowerCase().trim() !== String(sessionUser.email).toLowerCase().trim()) {
+      return res.status(403).json({ success: false, error: "payment_owner_mismatch" });
+    }
     if (!Number.isFinite(amount) || amount < 5) return res.status(400).json({ success: false, error: "minimum_amount_is_5_sar" });
     const orderNumber = `APLUS-${Date.now()}-${randomBytes(3).toString("hex")}`;
     const invoice = await paylinkFetch("/api/addInvoice", {
@@ -2870,6 +3072,17 @@ app.post("/api/payment/paylink/create", async (req, res) => {
       })
     });
     if (!invoice.url || !invoice.transactionNo) throw new Error("Paylink returned an invalid invoice");
+    await db.query(
+      `INSERT INTO paylink_orders
+        (transaction_no, order_number, user_email, amount, order_status, created_at)
+       VALUES ($1,$2,$3,$4,'pending',$5)
+       ON CONFLICT (transaction_no) DO UPDATE SET
+         order_number=EXCLUDED.order_number,
+         user_email=EXCLUDED.user_email,
+         amount=EXCLUDED.amount,
+         order_status='pending'`,
+      [String(invoice.transactionNo), orderNumber, email.toLowerCase().trim(), Number(amount.toFixed(2)), Date.now()]
+    );
     res.json({ success: true, url: invoice.url, transactionNo: invoice.transactionNo, orderNumber });
   } catch (e) {
     console.error("PAYLINK_CREATE:", e.message);
@@ -2881,6 +3094,10 @@ app.get("/api/payment/paylink/status/:transactionNo", async (req, res) => {
   try {
     const d = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(req.params.transactionNo)}`);
     const paid = String(d.orderStatus || "").toLowerCase() === "paid";
+    await db.query(
+      "UPDATE paylink_orders SET order_status=$1 WHERE transaction_no=$2",
+      [String(d.orderStatus || "unknown"), String(req.params.transactionNo)]
+    );
     res.json({ success: true, paid, orderStatus: d.orderStatus, amount: d.amount, transactionNo: d.transactionNo });
   } catch (e) {
     console.error("PAYLINK_STATUS:", e.message);
@@ -2894,17 +3111,88 @@ app.post("/api/payment/paylink/confirm", async (req, res) => {
     if (!user) return res.status(401).json({ success: false, error: "login_required" });
     const transactionNo = String(req.body?.transactionNo || "").trim();
     if (!transactionNo) return res.status(400).json({ success: false, error: "transaction_required" });
+
+    const orderRow = await db.query(
+      "SELECT transaction_no, order_number, user_email, confirmed_at FROM paylink_orders WHERE transaction_no=$1",
+      [transactionNo]
+    );
+    if (!orderRow.rows.length) {
+      return res.status(404).json({ success: false, error: "payment_order_not_found" });
+    }
+    const order = orderRow.rows[0];
+    if (String(order.user_email).toLowerCase() !== String(user.email).toLowerCase()) {
+      return res.status(403).json({ success: false, error: "payment_owner_mismatch" });
+    }
+
     const invoice = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(transactionNo)}`);
     const paid = String(invoice.orderStatus || "").toLowerCase() === "paid";
     if (!paid) return res.status(400).json({ success: false, error: "payment_not_paid" });
-    const expiry = Math.max(Date.now(), Number(user.premium_expiry) || 0) + 30 * 24 * 60 * 60 * 1000;
-    await db.query("UPDATE users SET premium_expiry=$1 WHERE email=$2", [expiry, user.email]);
+
+    const invoiceEmail = String(
+      invoice.clientEmail || invoice.client_email || invoice.customerEmail || ""
+    ).toLowerCase().trim();
+    if (invoiceEmail && invoiceEmail !== String(user.email).toLowerCase()) {
+      return res.status(403).json({ success: false, error: "payment_owner_mismatch" });
+    }
+    if (invoice.orderNumber && String(invoice.orderNumber) !== String(order.order_number)) {
+      return res.status(403).json({ success: false, error: "payment_order_mismatch" });
+    }
+
+    const result = await withTransaction(async (client) => {
+      const lockedOrder = await client.query(
+        "SELECT * FROM paylink_orders WHERE transaction_no=$1 AND user_email=$2 FOR UPDATE",
+        [transactionNo, user.email.toLowerCase()]
+      );
+      if (!lockedOrder.rows.length) {
+        const error = new Error("payment_owner_mismatch");
+        error.statusCode = 403;
+        throw error;
+      }
+
+      const locked = lockedOrder.rows[0];
+      const currentUser = await client.query(
+        "SELECT premium_expiry FROM users WHERE email=$1 FOR UPDATE",
+        [user.email]
+      );
+      if (!currentUser.rows.length) {
+        const error = new Error("user_not_found");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      if (locked.confirmed_at) {
+        return {
+          premiumExpiry: Number(currentUser.rows[0].premium_expiry) || 0,
+          alreadyConfirmed: true
+        };
+      }
+
+      const expiry = Math.max(Date.now(), Number(currentUser.rows[0].premium_expiry) || 0)
+        + 30 * 24 * 60 * 60 * 1000;
+      await client.query(
+        "UPDATE users SET premium_expiry=$1 WHERE email=$2",
+        [expiry, user.email]
+      );
+      await client.query(
+        "UPDATE paylink_orders SET order_status='paid', confirmed_at=$1 WHERE transaction_no=$2",
+        [Date.now(), transactionNo]
+      );
+      return { premiumExpiry: expiry, alreadyConfirmed: false };
+    });
+
     invalidateSessionCache(user.email);
-    broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: expiry });
-    res.json({ success: true, premiumExpiry: expiry });
+    broadcastEvent({
+      type: "subscription_updated",
+      email: user.email,
+      premiumExpiry: result.premiumExpiry
+    });
+    res.json({ success: true, premiumExpiry: result.premiumExpiry, alreadyConfirmed: result.alreadyConfirmed });
   } catch (e) {
     console.error("PAYLINK_CONFIRM:", e.message);
-    res.status(502).json({ success: false, error: "payment_confirmation_failed" });
+    res.status(Number(e.statusCode) || 502).json({
+      success: false,
+      error: e.statusCode ? e.message : "payment_confirmation_failed"
+    });
   }
 });
 
@@ -2917,6 +3205,13 @@ app.use("/api", (_req, res) => {
 app.use((err, _req, res, next) => {
   console.error("❌ خطأ غير متوقع:", err?.message || err);
   if (res.headersSent || res.writableEnded) return next(err);
+  const status = Number(err?.status || err?.statusCode);
+  if (status >= 400 && status < 600) {
+    return res.status(status).json({
+      ok: false,
+      error: status === 413 ? "request_too_large" : "request_failed"
+    });
+  }
   res.status(500).json({ ok: false, error: "server error" });
 });
 
