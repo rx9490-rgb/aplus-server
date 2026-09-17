@@ -2109,7 +2109,7 @@ const FORM_ASSIGNMENT_RULES = `
   وضع في أعلى الناتج: "نموذج تدريبي — البيانات افتراضية".
 - لا تنسب البيانات الافتراضية إلى مستشفى أو أشخاص حقيقيين، ولا تستخدم معلومات شخصية حقيقية.
 - لا تترك خانات أساسية فارغة أو تكتب [يُستكمل] عندما يمكن إكمالها ببيانات تدريبية افتراضية.
-- لا تختلق توقيعاً؛ اكتب "[توقيع الطالب مطلوب]" في نهاية كل شفت.
+- لا تختلق توقيعاً؛ اترك خانة توقيع يدوية فارغة أسفل كل شفت.
 - حافظ على جميع الحقول: Floor/Unit، Head Nurse، Total Patients، CPR Team، Date،
   Assigned Patients، Responsible Nurse، Delegated Nurse، Break Time،
   Narcotic Check، Emergency & Defibrillator، High Alert Cabinet & Refrigerator،
@@ -2117,6 +2117,21 @@ const FORM_ASSIGNMENT_RULES = `
   Rescue Person، Red Code، Activate Alarm، Extinguisher Use، Signature.
 - لا تكتب مقدمة أو خاتمة أو مراجع أو شرحاً خارج النموذج.
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
+`;
+
+const NURSING_SHEET_FINAL_RULES = `
+إخراج Nursing Assignment Sheet النهائي — صارم:
+- أخرج نموذجاً واحداً فقط، وليس نسخاً أو بدائل أو نماذج مكررة.
+- يجب أن يظهر Shift A مرة واحدة وShift B مرة واحدة فقط.
+- لكل شفت قسم واحد للمعلومات الأساسية، وقسم Staffing، وقسم Safety Checks،
+  وقسم Fire Plan، ثم خانة توقيع يدوية واحدة أسفل ذلك الشفت.
+- لا تضع N/A في Assigned Patients أو Responsible Nurse أو Delegated Nurse أو Break Time.
+  استخدم بيانات تدريبية رمزية متسقة عند غياب بيانات المستخدم.
+- يجب أن يتطابق Patient Count مع توزيع المرضى في ذلك الشفت.
+- لا تكرر النموذج في نهاية المستند ولا تضف جدول مقارنة أو ملخصاً بديلاً.
+- اترك التوقيع كخانة فارغة قابلة للتوقيع اليدوي:
+  Student Signature: ____________________   Date: __________
+  لا تنشئ توقيعاً أو اسماً مزيفاً.
 `;
 
 const ASSIGNMENT_FORMAT_RULES = `
@@ -2221,6 +2236,34 @@ ${String(draft.content).slice(0, 50000)}
     0.1
   );
   if (!reviewed.ok) return draft;
+
+  if (formTask) {
+    const normalized = await openRouterCompletion(
+      reviewModel,
+      [
+        {
+          role: "system",
+          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt, FORM_ASSIGNMENT_RULES, NURSING_SHEET_FINAL_RULES]
+            .filter(Boolean).join("\n\n")
+        },
+        {
+          role: "user",
+          content: `أعد بناء الواجب التالي كنسخة نهائية واحدة فقط.
+احذف كل النسخ المكررة والبدائل وأي نموذج إضافي، ثم أخرج Nursing Assignment Sheet واحداً
+يحتوي Shift A وShift B مرة واحدة فقط، مع جميع المتطلبات كاملة.
+لا تكتب شرحاً عن التنقيح ولا قائمة تحقق.
+
+${NURSING_SHEET_FINAL_RULES}
+
+المحتوى الحالي:
+${String(reviewed.content).slice(0, 60000)}`
+        }
+      ],
+      maxTokens,
+      0.05
+    );
+    if (normalized.ok) return normalized;
+  }
 
   const tableRequired = formTask || requiresComparisonTable(`${systemPrompt || ""}\n${prompt || ""}`);
   if (!tableRequired && containsMarkdownTable(reviewed.content)) {
