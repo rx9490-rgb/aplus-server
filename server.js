@@ -62,21 +62,6 @@ const db = {
   }
 };
 
-async function withTransaction(work) {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const result = await work(client);
-    await client.query("COMMIT");
-    return result;
-  } catch (error) {
-    try { await client.query("ROLLBACK"); } catch {}
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 // يبدأ HTTP فوراً، وتنتظر طلبات الدخول جاهزية قاعدة البيانات
 let dbReady = false;
 let dbInitError = null;
@@ -183,15 +168,6 @@ async function initDB() {
       expires_at BIGINT NOT NULL,
       used       BOOLEAN DEFAULT FALSE,
       created_at BIGINT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS paylink_orders (
-      transaction_no TEXT PRIMARY KEY,
-      order_number   TEXT UNIQUE NOT NULL,
-      user_email     TEXT NOT NULL,
-      amount         NUMERIC(12,2) NOT NULL,
-      order_status   TEXT DEFAULT 'pending',
-      created_at     BIGINT NOT NULL,
-      confirmed_at   BIGINT
     );
   `);
 
@@ -302,14 +278,6 @@ const AI_MAX_IMAGE_CHARS = Math.max(
   1_000_000,
   Number(process.env.AI_MAX_IMAGE_CHARS || 12_000_000)
 );
-const AI_MAX_FILE_CHARS = Math.max(
-  1_000_000,
-  Number(process.env.AI_MAX_FILE_CHARS || 24_000_000)
-);
-const AI_MAX_FILES = Math.max(
-  1,
-  Math.min(5, Number(process.env.AI_MAX_FILES || 3))
-);
 
 async function requireAiUser(req, res, requestedTokens = 0) {
   const auth = String(req.headers.authorization || "");
@@ -387,15 +355,6 @@ const RESEND_KEY   = process.env.RESEND_API_KEY || "";
 // FRONTEND_URL: رابط صفحة reset-password.html
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://aplus-server-w6wb.onrender.com";
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
 async function _sendViaResend(toEmail, subject, htmlBody) {
   const fromAddr = process.env.RESEND_FROM || "A+ الطبي <onboarding@resend.dev>";
   const body = JSON.stringify({ from: fromAddr, to: [toEmail], subject, html: htmlBody });
@@ -425,8 +384,7 @@ async function _sendViaResend(toEmail, subject, htmlBody) {
 
 async function sendResetEmail(toEmail, token, fullName) {
   const resetLink = `${FRONTEND_URL}/reset-password.html?token=${token}`;
-  const displayName = escapeHtml(fullName || "المستخدم");
-  const safeResetLink = escapeHtml(resetLink);
+  const displayName = fullName || "المستخدم";
 
   const htmlBody = `
 <!DOCTYPE html>
@@ -462,7 +420,7 @@ async function sendResetEmail(toEmail, token, fullName) {
 
           <!-- CTA Button -->
           <div style="text-align:center;margin:28px 0;">
-             <a href="${safeResetLink}" style="display:inline-block;padding:15px 40px;background:linear-gradient(135deg,#d4af37,#b8960c,#d4af37);color:#0a0a0f;font-size:1rem;font-weight:900;text-decoration:none;border-radius:12px;letter-spacing:0.3px;box-shadow:0 6px 24px rgba(212,175,55,0.4);">
+            <a href="${resetLink}" style="display:inline-block;padding:15px 40px;background:linear-gradient(135deg,#d4af37,#b8960c,#d4af37);color:#0a0a0f;font-size:1rem;font-weight:900;text-decoration:none;border-radius:12px;letter-spacing:0.3px;box-shadow:0 6px 24px rgba(212,175,55,0.4);">
               🔑 إعادة تعيين كلمة المرور
             </a>
           </div>
@@ -470,7 +428,7 @@ async function sendResetEmail(toEmail, token, fullName) {
           <!-- Link fallback -->
           <div style="background:#0d0819;border:1px solid #2a1f48;border-radius:10px;padding:14px 16px;margin-top:16px;">
             <p style="color:#7a6d9a;font-size:0.75rem;margin:0 0 6px;">أو انسخ هذا الرابط في متصفحك:</p>
-             <p style="color:#8b7bd4;font-size:0.72rem;word-break:break-all;margin:0;direction:ltr;text-align:left;">${safeResetLink}</p>
+            <p style="color:#8b7bd4;font-size:0.72rem;word-break:break-all;margin:0;direction:ltr;text-align:left;">${resetLink}</p>
           </div>
         </td></tr>
 
@@ -543,7 +501,7 @@ setInterval(() => {
 // إرسال إيميل تأكيد البريد الإلكتروني
 // ══════════════════════════════════════════════
 async function sendVerificationEmail(toEmail, code, fullName) {
-  const displayName = escapeHtml(fullName || "المستخدم");
+  const displayName = fullName || "المستخدم";
   const htmlBody = `<!DOCTYPE html>
 <html dir="rtl" lang="ar">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -805,11 +763,10 @@ function broadcastEvent(data, targetEmail = null) {
   const eventType = data.type || "message";
   const payload   = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
   const dead = [];
-  const recipientEmail = targetEmail || data.email || null;
 
   for (const [id, client] of sseClients) {
-    // الأحداث التي تحتوي بريداً إلكترونياً مخصصة لذلك المستخدم فقط.
-    if (recipientEmail && client._email !== recipientEmail) continue;
+    // إذا كان الحدث مخصصاً لمستخدم معين → أرسل فقط لذلك المستخدم (تجاهل المجهولين)
+    if (targetEmail && client._email !== targetEmail) continue;
     try {
       client.write(payload);
     } catch {
@@ -841,18 +798,8 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: false,
 }));
-const configuredOrigins = new Set([
-  FRONTEND_URL,
-  "https://aplus.blog",
-  "https://www.aplus.blog",
-  ...(process.env.ALLOWED_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean)
-]);
-
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || configuredOrigins.has(origin)) return callback(null, true);
-    return callback(new Error("origin_not_allowed"));
-  },
+  origin: "*",
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type","Authorization","x-session-token",
@@ -883,96 +830,8 @@ app.use("/api/openrouter", rateLimit({
   legacyHeaders: false
 }));
 
-app.use(express.json({ limit: "32mb" }));
-app.use(express.urlencoded({ extended: true, limit: "32mb" }));
-
-// دعم FormData للملفات بدون حفظها على القرص؛ تُمرّر لاحقاً إلى OpenRouter كـ data URL.
-app.use((req, res, next) => {
-  const contentType = String(req.headers["content-type"] || "");
-  if (!contentType.toLowerCase().startsWith("multipart/form-data")) return next();
-
-  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
-  const boundary = boundaryMatch?.[1] || boundaryMatch?.[2];
-  const contentLength = Number(req.headers["content-length"] || 0);
-  const maxBodyBytes = 32 * 1024 * 1024;
-  if (!boundary) return res.status(400).json({ ok: false, error: "multipart_boundary_required" });
-  if (contentLength > maxBodyBytes) {
-    return res.status(413).json({ ok: false, error: "request_too_large" });
-  }
-
-  const chunks = [];
-  let received = 0;
-  let stopped = false;
-  req.on("data", (chunk) => {
-    if (stopped) return;
-    received += chunk.length;
-    if (received > maxBodyBytes) {
-      stopped = true;
-      req.destroy();
-      return res.status(413).json({ ok: false, error: "request_too_large" });
-    }
-    chunks.push(chunk);
-  });
-  req.on("error", (error) => {
-    if (!res.headersSent) next(error);
-  });
-  req.on("end", () => {
-    if (stopped || res.headersSent) return;
-    try {
-      const raw = Buffer.concat(chunks);
-      const marker = Buffer.from(`--${boundary}`);
-      const parsed = {};
-      const files = [];
-      let cursor = raw.indexOf(marker);
-
-      while (cursor !== -1) {
-        const partStart = cursor + marker.length;
-        if (raw.subarray(partStart, partStart + 2).toString() === "--") break;
-        const nextMarker = raw.indexOf(marker, partStart);
-        if (nextMarker === -1) break;
-
-        let part = raw.subarray(partStart, nextMarker);
-        if (part.subarray(0, 2).toString() === "\r\n") part = part.subarray(2);
-        if (part.subarray(-2).toString() === "\r\n") part = part.subarray(0, -2);
-        const separator = Buffer.from("\r\n\r\n");
-        const headerEnd = part.indexOf(separator);
-        if (headerEnd === -1) {
-          cursor = nextMarker;
-          continue;
-        }
-
-        const headers = part.subarray(0, headerEnd).toString("utf8");
-        const payload = part.subarray(headerEnd + separator.length);
-        const disposition = headers.match(/content-disposition:[^\r\n]*/i)?.[0] || "";
-        const name = disposition.match(/(?:^|;)\s*name="([^"]*)"/i)?.[1];
-        const filename = disposition.match(/(?:^|;)\s*filename="([^"]*)"/i)?.[1];
-        if (!name) {
-          cursor = nextMarker;
-          continue;
-        }
-
-        if (filename) {
-          const partType = headers.match(/content-type:\s*([^\r\n;]+)/i)?.[1]?.trim() || "";
-          const inferredType = getFileMimeType(filename, partType) || partType;
-          files.push({
-            filename,
-            mimeType: inferredType,
-            fileData: `data:${inferredType || "application/octet-stream"};base64,${payload.toString("base64")}`
-          });
-        } else {
-          parsed[name] = payload.toString("utf8");
-        }
-        cursor = nextMarker;
-      }
-
-      if (files.length) parsed.files = files;
-      req.body = parsed;
-      next();
-    } catch (error) {
-      next(error);
-    }
-  });
-});
+app.use(express.json({ limit: "100mb" }));
+app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
 // ══════════════════════════════════════════════
 // 6. Health & Ping
@@ -2137,8 +1996,7 @@ app.get("/download-reset-page", (_req, res) => {
   });
 });
 
-app.get("/download-server", async (req, res) => {
-  if (!(await isAdminRequest(req))) return res.status(404).send("Not found");
+app.get("/download-server", (_req, res) => {
   res.setHeader("Content-Disposition", 'attachment; filename="server.js"');
   res.setHeader("Content-Type", "application/javascript");
   res.sendFile(path.join(__dirname, "server.js"));
@@ -2165,185 +2023,6 @@ function safeOpenRouterModel(value, fallback) {
     return fallback;
   }
   return model;
-}
-
-const AI_FILE_MIME_TYPES = new Set([
-  "application/pdf",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.ms-excel",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.ms-powerpoint",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  "text/plain",
-  "text/markdown",
-  "text/csv",
-  "application/json",
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/gif"
-]);
-
-const AI_FILE_EXTENSIONS = {
-  pdf: "application/pdf",
-  doc: "application/msword",
-  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  xls: "application/vnd.ms-excel",
-  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ppt: "application/vnd.ms-powerpoint",
-  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  txt: "text/plain",
-  md: "text/markdown",
-  csv: "text/csv",
-  json: "application/json",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  png: "image/png",
-  webp: "image/webp",
-  gif: "image/gif"
-};
-
-function getFileMimeType(filename, value) {
-  const explicit = String(value || "").toLowerCase().split(";")[0].trim();
-  if (AI_FILE_MIME_TYPES.has(explicit)) return explicit;
-  const extension = String(filename || "").toLowerCase().split(".").pop();
-  return AI_FILE_EXTENSIONS[extension] || "";
-}
-
-function normalizeFileName(filename, index) {
-  const original = path.basename(String(filename || `document-${index + 1}`));
-  const cleaned = original.replace(/[^\w.\-()\u0600-\u06ff ]/g, "_").trim();
-  return (cleaned || `document-${index + 1}`).slice(0, 120);
-}
-
-function normalizeAiFiles(body) {
-  const input = body && typeof body === "object" ? body : {};
-  let entries = [];
-
-  if (Array.isArray(input.files)) {
-    entries.push(...input.files.map((file, index) => (
-      typeof file === "string"
-        ? {
-            filename: input.fileNames?.[index] || `document-${index + 1}`,
-            mimeType: input.fileTypes?.[index],
-            fileData: file
-          }
-        : file
-    )));
-  }
-  if (input.file && (typeof input.file === "object" || typeof input.file === "string")) {
-    entries.push(
-      typeof input.file === "string"
-        ? {
-            filename: input.fileName || input.filename || "document",
-            mimeType: input.fileType || input.mimeType || input.contentType,
-            fileData: input.file
-          }
-        : input.file
-    );
-  }
-
-  const legacyData = input.fileData
-    ?? input.file_data
-    ?? input.fileBase64
-    ?? input.file_base64
-    ?? input.fileContent
-    ?? input.file_content;
-  if (legacyData) {
-    entries.push({
-      filename: input.fileName || input.filename || "document",
-      mimeType: input.fileType || input.mimeType || input.contentType,
-      fileData: legacyData
-    });
-  }
-
-  if (!entries.length) return { files: [], error: null };
-  if (entries.length > AI_MAX_FILES) {
-    return { files: [], error: "too_many_files" };
-  }
-
-  const files = [];
-  let totalChars = 0;
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = entries[index];
-    if (!entry || typeof entry !== "object") {
-      return { files: [], error: "invalid_file" };
-    }
-
-    const filename = normalizeFileName(entry.filename || entry.name, index);
-    const mimeType = getFileMimeType(
-      filename,
-      entry.mimeType || entry.mime_type || entry.type || entry.contentType
-    );
-    if (!mimeType) return { files: [], error: "unsupported_file_type" };
-
-    let fileData = entry.fileData ?? entry.file_data ?? entry.data ?? entry.url ?? entry.fileUrl;
-    if (!fileData && entry.text !== undefined && mimeType.startsWith("text/")) {
-      fileData = Buffer.from(String(entry.text), "utf8").toString("base64");
-    }
-    if (typeof fileData !== "string" || !fileData.trim()) {
-      return { files: [], error: "file_data_required" };
-    }
-
-    fileData = fileData.trim();
-    if (/^https?:\/\//i.test(fileData)) {
-      if (!/^https:\/\//i.test(fileData)) {
-        return { files: [], error: "only_https_file_urls_allowed" };
-      }
-    } else if (/^data:/i.test(fileData)) {
-      const dataUrlPattern = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i;
-      const match = fileData.match(dataUrlPattern);
-      if (!match || match[1].toLowerCase() !== mimeType) {
-        return { files: [], error: "invalid_file_data_url" };
-      }
-      fileData = `data:${mimeType};base64,${match[2].replace(/\s/g, "")}`;
-    } else {
-      if (!/^[a-z0-9+/=\s]+$/i.test(fileData)) {
-        return { files: [], error: "invalid_base64_file" };
-      }
-      fileData = `data:${mimeType};base64,${fileData.replace(/\s/g, "")}`;
-    }
-
-    totalChars += fileData.length;
-    if (fileData.length > AI_MAX_FILE_CHARS || totalChars > AI_MAX_FILE_CHARS) {
-      return { files: [], error: "file_too_large" };
-    }
-    files.push({ filename, mimeType, fileData });
-  }
-
-  return { files, error: null };
-}
-
-function buildAiUserContent(prompt, files = []) {
-  const content = [{ type: "text", text: String(prompt || "") }];
-  for (const file of files) {
-    if (file.mimeType.startsWith("image/")) {
-      content.push({
-        type: "image_url",
-        image_url: { url: file.fileData }
-      });
-    } else {
-      content.push({
-        type: "file",
-        file: {
-          filename: file.filename,
-          file_data: file.fileData
-        }
-      });
-    }
-  }
-  return files.length ? content : String(prompt || "");
-}
-
-function getAiFilePlugins(files = []) {
-  if (!files.some((file) => file.mimeType === "application/pdf")) return undefined;
-  return [{
-    id: "file-parser",
-    pdf: {
-      engine: process.env.OPENROUTER_PDF_ENGINE || "mistral-ocr"
-    }
-  }];
 }
 // نماذج OpenRouter المستخدمة بالترتيب:
 // Gemini ثم GPT للمراجعة، وبعدها Claude وDeepSeek وQwen وLlama كبدائل.
@@ -2394,97 +2073,6 @@ function isAssignmentTask(text) {
   return /assignment|academic\s+assignment|academic\s+paper|coursework|s?heet|worksheet|form|واجب|واجب\s+أكاديمي|نموذج|ورقة|بحث\s+جامعي|مشروع\s+تخرج|تعليمات\s+الدكتور|متطلبات\s+الواجب/i.test(String(text || ""));
 }
 
-function isAssignmentGradingTask(text) {
-  return /grade|grading|score|scoring|mark|marks|evaluate|evaluation|rubric|assessment|feedback|تقييم|قيّم|قيم|درجة|درجات|تصحيح|تصحيح\s+الواجب|ملاحظات\s+على\s+الواجب/i.test(String(text || ""));
-}
-
-const ASSIGNMENT_GRADING_RULES = `
-أنت مقيّم أكاديمي دقيق. قيّم الواجب الموجود في طلب المستخدم، ولا تنشئ واجباً جديداً.
-الدرجة النهائية يجب أن تكون رقماً واحداً من 0 إلى 10 فقط، ويمكن أن تكون عشرية حتى منزلة واحدة.
-اعتمد على نص الواجب وتعليمات المستخدم أو rubric إن وُجدت.
-إذا كانت معلومات التقييم غير كافية، قيّم الموجود فقط واذكر ما ينقص بدلاً من اختلاقه.
-أعد النتيجة بصيغة JSON صحيحة فقط، دون Markdown أو أي نص خارج JSON:
-{
-  "score": 0,
-  "summary": "ملخص قصير للتقييم",
-  "strengths": ["نقطة قوة"],
-  "weaknesses": ["نقطة تحتاج تحسيناً"],
-  "improvements": ["اقتراح عملي"]
-}
-`;
-
-function clampAssignmentScore(value) {
-  const score = Number(value);
-  if (!Number.isFinite(score)) return null;
-  return Math.round(Math.min(10, Math.max(0, score)) * 10) / 10;
-}
-
-function parseAssignmentGrade(content) {
-  const raw = String(content || "").trim();
-  let parsed = null;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    const jsonBlock = raw.match(/\{[\s\S]*\}/);
-    if (jsonBlock) {
-      try { parsed = JSON.parse(jsonBlock[0]); } catch {}
-    }
-  }
-
-  let score = clampAssignmentScore(parsed?.score);
-  if (score === null) {
-    const scoreMatch = raw.match(/(?:score|grade|mark|الدرجة|العلامة|التقييم)\s*[:：=\-]?\s*(10(?:\.0)?|[0-9](?:\.[0-9])?)\s*(?:\/\s*10|من\s*10|out\s+of\s+10)?/i);
-    score = clampAssignmentScore(scoreMatch?.[1]);
-  }
-  if (score === null) return null;
-
-  const list = (value) => Array.isArray(value)
-    ? value.map((item) => String(item).trim()).filter(Boolean).slice(0, 8)
-    : [];
-  return {
-    score,
-    summary: String(parsed?.summary || parsed?.feedback || raw).trim().slice(0, 2000),
-    strengths: list(parsed?.strengths),
-    weaknesses: list(parsed?.weaknesses),
-    improvements: list(parsed?.improvements)
-  };
-}
-
-function formatAssignmentGrade(grade) {
-  const lines = [
-    `الدرجة: ${grade.score}/10`,
-    "",
-    `التقييم: ${grade.summary || "تم تقييم الواجب وفق المحتوى والتعليمات المتاحة."}`
-  ];
-  if (grade.strengths.length) lines.push("", "نقاط القوة:", ...grade.strengths.map((item) => `- ${item}`));
-  if (grade.weaknesses.length) lines.push("", "نقاط تحتاج تحسيناً:", ...grade.weaknesses.map((item) => `- ${item}`));
-  if (grade.improvements.length) lines.push("", "اقتراحات التحسين:", ...grade.improvements.map((item) => `- ${item}`));
-  return lines.join("\n");
-}
-
-async function gradeAssignment(prompt, systemPrompt, maxTokens, isArabicRequest, files = []) {
-  const model = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
-  const messages = [
-    {
-      role: "system",
-      content: [AI_QUALITY_SYSTEM, ASSIGNMENT_GRADING_RULES, systemPrompt].filter(Boolean).join("\n\n")
-    },
-    { role: "user", content: buildAiUserContent(prompt, files) }
-  ];
-  const result = await openRouterCompletion(model, messages, Math.min(maxTokens, 3000), 0.1, files);
-  if (!result.ok) return result;
-  const grade = parseAssignmentGrade(result.content);
-  if (!grade) {
-    return { ok: false, status: 502, message: "invalid_grade_response" };
-  }
-  return {
-    ...result,
-    content: formatAssignmentGrade(grade),
-    score: grade.score,
-    grade
-  };
-}
-
 function isFormAssignmentTask(text) {
   return /nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|s?heet|worksheet|form|shift\s*[ab]|assigned\s+patients|responsible\s+nurse|delegated\s+nurse|break\s+time|narcotic\s+check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s+drug|sterile\s+supply|hazardous\s+materials|o2\s+and\s+suction|fire\s+plan|red\s+code|rescue\s+person|extinguisher|ورقة\s+واجب\s+تمريض|نموذج|شفت\s*[أب]|مرضى\s+مكلفون|خطة\s+الحريق|الأدوية\s+الخاضعة|عربة\s+الطوارئ|المواد\s+المعقمة/i.test(String(text || ""));
 }
@@ -2518,20 +2106,10 @@ const FORM_ASSIGNMENT_RULES = `
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
 `;
 
-async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1, files = []) {
+async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
   try {
-    const requestBody = {
-      model,
-      messages,
-      max_tokens: maxTokens,
-      temperature,
-      stream: false
-    };
-    const plugins = getAiFilePlugins(files);
-    if (plugins) requestBody.plugins = plugins;
-
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -2540,7 +2118,13 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
         "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
         "X-Title": "A+ Medical"
       },
-      body: JSON.stringify(requestBody),
+      body: JSON.stringify({
+        model,
+        messages,
+        max_tokens: maxTokens,
+        temperature,
+        stream: false
+      }),
       signal: controller.signal
     });
     const data = await response.json().catch(() => ({}));
@@ -2566,7 +2150,7 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
   }
 }
 
-async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest, files = []) {
+async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
   const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
@@ -2575,9 +2159,9 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
-    { role: "user", content: buildAiUserContent(prompt, files) }
+    { role: "user", content: String(prompt) }
   ];
-  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1, files);
+  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
   if (!draft.ok) return draft;
 
   // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
@@ -2605,11 +2189,10 @@ ${String(draft.content).slice(0, 50000)}
     reviewModel,
     [
       { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
-        { role: "user", content: buildAiUserContent(reviewPrompt, files) }
+      { role: "user", content: reviewPrompt }
     ],
     maxTokens,
-    0.1,
-    files
+    0.1
   );
   if (!reviewed.ok) return draft;
 
@@ -2637,8 +2220,7 @@ ${String(reviewed.content).slice(0, 60000)}`
         }
       ],
       maxTokens,
-      0.05,
-      files
+      0.05
     );
     return repaired.ok ? repaired : reviewed;
   }
@@ -2651,7 +2233,6 @@ ${String(reviewed.content).slice(0, 60000)}`
 // ══════════════════════════════════════════════
 app.post("/api/ai/call", async (req, res) => {
   const { provider = "gemini", prompt, systemPrompt = "", maxTokens } = req.body || {};
-  const normalizedFiles = normalizeAiFiles(req.body || {});
   if (provider !== "gemini") {
     res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
     return;
@@ -2663,10 +2244,6 @@ app.post("/api/ai/call", async (req, res) => {
   }
   if (!prompt) {
     res.status(400).json({ ok: false, error: "prompt_required" });
-    return;
-  }
-  if (normalizedFiles.error) {
-    res.status(400).json({ ok: false, error: normalizedFiles.error });
     return;
   }
   if (String(prompt).length > AI_MAX_PROMPT_CHARS) {
@@ -2690,38 +2267,11 @@ app.post("/api/ai/call", async (req, res) => {
 
   try {
     if (isAssignmentTask(requestText)) {
-      if (isAssignmentGradingTask(requestText)) {
-        const gradeResult = await gradeAssignment(
-          prompt,
-          systemPrompt,
-          safeMaxTokens,
-          isArabicRequest,
-          normalizedFiles.files
-        );
-        if (gradeResult.ok) {
-          res.json({
-            ok: true,
-            content: gradeResult.content,
-            score: gradeResult.score,
-            grade: gradeResult.grade,
-            provider: "openrouter-assignment-grader",
-            model: gradeResult.model
-          });
-          return;
-        }
-        res.status(gradeResult.status >= 500 ? 503 : 502).json({
-          ok: false,
-          error: "assignment_grading_failed"
-        });
-        return;
-      }
-
       const qualityResult = await generateAssignmentWithReview(
         prompt,
         systemPrompt,
         safeMaxTokens,
-        isArabicRequest,
-        normalizedFiles.files
+        isArabicRequest
       );
       if (qualityResult.ok) {
         res.json({
@@ -2737,23 +2287,13 @@ app.post("/api/ai/call", async (req, res) => {
 
     const messages = [
       { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
-      { role: "user", content: buildAiUserContent(prompt, normalizedFiles.files) }
+      { role: "user", content: String(prompt) }
     ];
 
     for (const model of requestModels) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 120000);
       try {
-        const requestBody = {
-          model,
-          messages,
-          max_tokens: safeMaxTokens,
-          temperature: isHighAccuracyTask(requestText) ? 0.1 : 0.2,
-          stream: false
-        };
-        const plugins = getAiFilePlugins(normalizedFiles.files);
-        if (plugins) requestBody.plugins = plugins;
-
         const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -2762,7 +2302,13 @@ app.post("/api/ai/call", async (req, res) => {
             "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
             "X-Title": "A+ Medical"
           },
-          body: JSON.stringify(requestBody),
+          body: JSON.stringify({
+            model,
+            messages,
+            max_tokens: safeMaxTokens,
+            temperature: isHighAccuracyTask(requestText) ? 0.1 : 0.2,
+            stream: false
+          }),
           signal: controller.signal
         });
         const data = await response.json().catch(() => ({}));
@@ -2825,13 +2371,8 @@ app.post("/api/openrouter/stream", async (req, res) => {
     return;
   }
   const { prompt, systemPrompt, maxTokens } = req.body || {};
-  const normalizedFiles = normalizeAiFiles(req.body || {});
   if (!prompt) {
     res.status(400).json({ ok: false, error: "prompt_required" });
-    return;
-  }
-  if (normalizedFiles.error) {
-    res.status(400).json({ ok: false, error: normalizedFiles.error });
     return;
   }
   if (String(prompt).length > AI_MAX_PROMPT_CHARS) {
@@ -2854,8 +2395,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
   const messages = [];
   const combinedSystem = [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n");
   messages.push({ role: "system", content: combinedSystem });
-  messages.push({ role: "user", content: buildAiUserContent(prompt, normalizedFiles.files) });
-  const aiFilePlugins = getAiFilePlugins(normalizedFiles.files);
+  messages.push({ role: "user", content: prompt });
 
   let lastErr = null;
   let sentAny = false;
@@ -2885,15 +2425,6 @@ app.post("/api/openrouter/stream", async (req, res) => {
         const ctrl = new AbortController();
         if (clientGone) return;
         const tm = setTimeout(() => ctrl.abort(), 90000);
-        const requestBody = {
-          model,
-          messages,
-          max_tokens: safeMaxTokens,
-          temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.1 : 0.2,
-          stream: true
-        };
-        if (aiFilePlugins) requestBody.plugins = aiFilePlugins;
-
         const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -2903,7 +2434,13 @@ app.post("/api/openrouter/stream", async (req, res) => {
             "HTTP-Referer": process.env.FRONTEND_URL || "https://aplus.blog",
             "X-Title": "A+ Medical"
           },
-          body: JSON.stringify(requestBody),
+          body: JSON.stringify({
+            model,
+            messages,
+            max_tokens: safeMaxTokens,
+            temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.1 : 0.2,
+            stream: true
+          }),
           signal: ctrl.signal
         });
         clearTimeout(tm);
@@ -3009,21 +2546,9 @@ app.post("/api/openrouter/vision", async (req, res) => {
     res.status(400).json({ ok: false, error: "missing_params" });
     return;
   }
-  const normalizedImage = normalizeAiFiles({
-    files: [{
-      filename: req.body?.fileName || "image",
-      mimeType: req.body?.mimeType || req.body?.fileType || "image/jpeg",
-      fileData: imageBase64
-    }]
-  });
-  if (normalizedImage.error || !normalizedImage.files[0]?.mimeType.startsWith("image/")) {
-    res.status(400).json({ ok: false, error: normalizedImage.error || "image_required" });
-    return;
-  }
-  const safeImageData = normalizedImage.files[0].fileData;
   if (
     String(prompt).length > AI_MAX_PROMPT_CHARS ||
-    String(safeImageData).length > AI_MAX_IMAGE_CHARS
+    String(imageBase64).length > AI_MAX_IMAGE_CHARS
   ) {
     res.status(413).json({ ok: false, error: "payload_too_large" });
     return;
@@ -3037,7 +2562,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
   console.log("[AI] vision request", {
     user: aiUser.email,
     promptChars: String(prompt).length,
-    imageChars: String(safeImageData).length,
+    imageChars: String(imageBase64).length,
     maxTokens: safeMaxTokens
   });
   const VISION_MODELS = [
@@ -3070,7 +2595,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
             {
               role: "user",
               content: [
-                { type: "image_url", image_url: { url: safeImageData } },
+                { type: "image_url", image_url: { url: imageBase64 } },
                 { type: "text", text: prompt }
               ]
             }
@@ -3159,14 +2684,9 @@ async function paylinkFetch(endpoint, options = {}) {
 
 app.post("/api/payment/paylink/create", async (req, res) => {
   try {
-    const sessionUser = await getSessionUser(req.headers["x-session-token"]);
-    if (!sessionUser) return res.status(401).json({ success: false, error: "login_required" });
     const { email, name, mobile } = req.body || {};
     const amount = Number(req.body?.amount);
     if (!email || !email.includes("@")) return res.status(400).json({ success: false, error: "email_required" });
-    if (String(email).toLowerCase().trim() !== String(sessionUser.email).toLowerCase().trim()) {
-      return res.status(403).json({ success: false, error: "payment_owner_mismatch" });
-    }
     if (!Number.isFinite(amount) || amount < 5) return res.status(400).json({ success: false, error: "minimum_amount_is_5_sar" });
     const orderNumber = `APLUS-${Date.now()}-${randomBytes(3).toString("hex")}`;
     const invoice = await paylinkFetch("/api/addInvoice", {
@@ -3189,17 +2709,6 @@ app.post("/api/payment/paylink/create", async (req, res) => {
       })
     });
     if (!invoice.url || !invoice.transactionNo) throw new Error("Paylink returned an invalid invoice");
-    await db.query(
-      `INSERT INTO paylink_orders
-        (transaction_no, order_number, user_email, amount, order_status, created_at)
-       VALUES ($1,$2,$3,$4,'pending',$5)
-       ON CONFLICT (transaction_no) DO UPDATE SET
-         order_number=EXCLUDED.order_number,
-         user_email=EXCLUDED.user_email,
-         amount=EXCLUDED.amount,
-         order_status='pending'`,
-      [String(invoice.transactionNo), orderNumber, email.toLowerCase().trim(), Number(amount.toFixed(2)), Date.now()]
-    );
     res.json({ success: true, url: invoice.url, transactionNo: invoice.transactionNo, orderNumber });
   } catch (e) {
     console.error("PAYLINK_CREATE:", e.message);
@@ -3211,10 +2720,6 @@ app.get("/api/payment/paylink/status/:transactionNo", async (req, res) => {
   try {
     const d = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(req.params.transactionNo)}`);
     const paid = String(d.orderStatus || "").toLowerCase() === "paid";
-    await db.query(
-      "UPDATE paylink_orders SET order_status=$1 WHERE transaction_no=$2",
-      [String(d.orderStatus || "unknown"), String(req.params.transactionNo)]
-    );
     res.json({ success: true, paid, orderStatus: d.orderStatus, amount: d.amount, transactionNo: d.transactionNo });
   } catch (e) {
     console.error("PAYLINK_STATUS:", e.message);
@@ -3228,88 +2733,17 @@ app.post("/api/payment/paylink/confirm", async (req, res) => {
     if (!user) return res.status(401).json({ success: false, error: "login_required" });
     const transactionNo = String(req.body?.transactionNo || "").trim();
     if (!transactionNo) return res.status(400).json({ success: false, error: "transaction_required" });
-
-    const orderRow = await db.query(
-      "SELECT transaction_no, order_number, user_email, confirmed_at FROM paylink_orders WHERE transaction_no=$1",
-      [transactionNo]
-    );
-    if (!orderRow.rows.length) {
-      return res.status(404).json({ success: false, error: "payment_order_not_found" });
-    }
-    const order = orderRow.rows[0];
-    if (String(order.user_email).toLowerCase() !== String(user.email).toLowerCase()) {
-      return res.status(403).json({ success: false, error: "payment_owner_mismatch" });
-    }
-
     const invoice = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(transactionNo)}`);
     const paid = String(invoice.orderStatus || "").toLowerCase() === "paid";
     if (!paid) return res.status(400).json({ success: false, error: "payment_not_paid" });
-
-    const invoiceEmail = String(
-      invoice.clientEmail || invoice.client_email || invoice.customerEmail || ""
-    ).toLowerCase().trim();
-    if (invoiceEmail && invoiceEmail !== String(user.email).toLowerCase()) {
-      return res.status(403).json({ success: false, error: "payment_owner_mismatch" });
-    }
-    if (invoice.orderNumber && String(invoice.orderNumber) !== String(order.order_number)) {
-      return res.status(403).json({ success: false, error: "payment_order_mismatch" });
-    }
-
-    const result = await withTransaction(async (client) => {
-      const lockedOrder = await client.query(
-        "SELECT * FROM paylink_orders WHERE transaction_no=$1 AND user_email=$2 FOR UPDATE",
-        [transactionNo, user.email.toLowerCase()]
-      );
-      if (!lockedOrder.rows.length) {
-        const error = new Error("payment_owner_mismatch");
-        error.statusCode = 403;
-        throw error;
-      }
-
-      const locked = lockedOrder.rows[0];
-      const currentUser = await client.query(
-        "SELECT premium_expiry FROM users WHERE email=$1 FOR UPDATE",
-        [user.email]
-      );
-      if (!currentUser.rows.length) {
-        const error = new Error("user_not_found");
-        error.statusCode = 404;
-        throw error;
-      }
-
-      if (locked.confirmed_at) {
-        return {
-          premiumExpiry: Number(currentUser.rows[0].premium_expiry) || 0,
-          alreadyConfirmed: true
-        };
-      }
-
-      const expiry = Math.max(Date.now(), Number(currentUser.rows[0].premium_expiry) || 0)
-        + 30 * 24 * 60 * 60 * 1000;
-      await client.query(
-        "UPDATE users SET premium_expiry=$1 WHERE email=$2",
-        [expiry, user.email]
-      );
-      await client.query(
-        "UPDATE paylink_orders SET order_status='paid', confirmed_at=$1 WHERE transaction_no=$2",
-        [Date.now(), transactionNo]
-      );
-      return { premiumExpiry: expiry, alreadyConfirmed: false };
-    });
-
+    const expiry = Math.max(Date.now(), Number(user.premium_expiry) || 0) + 30 * 24 * 60 * 60 * 1000;
+    await db.query("UPDATE users SET premium_expiry=$1 WHERE email=$2", [expiry, user.email]);
     invalidateSessionCache(user.email);
-    broadcastEvent({
-      type: "subscription_updated",
-      email: user.email,
-      premiumExpiry: result.premiumExpiry
-    });
-    res.json({ success: true, premiumExpiry: result.premiumExpiry, alreadyConfirmed: result.alreadyConfirmed });
+    broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: expiry });
+    res.json({ success: true, premiumExpiry: expiry });
   } catch (e) {
     console.error("PAYLINK_CONFIRM:", e.message);
-    res.status(Number(e.statusCode) || 502).json({
-      success: false,
-      error: e.statusCode ? e.message : "payment_confirmation_failed"
-    });
+    res.status(502).json({ success: false, error: "payment_confirmation_failed" });
   }
 });
 
@@ -3322,13 +2756,6 @@ app.use("/api", (_req, res) => {
 app.use((err, _req, res, next) => {
   console.error("❌ خطأ غير متوقع:", err?.message || err);
   if (res.headersSent || res.writableEnded) return next(err);
-  const status = Number(err?.status || err?.statusCode);
-  if (status >= 400 && status < 600) {
-    return res.status(status).json({
-      ok: false,
-      error: status === 413 ? "request_too_large" : "request_failed"
-    });
-  }
   res.status(500).json({ ok: false, error: "server error" });
 });
 
