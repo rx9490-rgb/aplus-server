@@ -2090,6 +2090,10 @@ function isFormAssignmentTask(text) {
   return signals.filter((pattern) => pattern.test(value)).length >= 2;
 }
 
+function isObstetricReportTask(text) {
+  return /comparative\s+analysis.*(?:vaginal|cesarean|caesarean)|(?:vaginal\s+delivery|normal\s+vaginal\s+delivery).*(?:cesarean|caesarean|c-section)|(?:cesarean|caesarean|c-section).*(?:vaginal\s+delivery|normal\s+vaginal\s+delivery)|تحليل\s+مقارن.*(?:ولادة|قيصرية)|ولادة\s+طبيعي.*قيصرية|قيصرية.*ولادة\s+طبيعي/i.test(String(text || ""));
+}
+
 function requiresComparisonTable(text) {
   return /comparison\s+table|comparative\s+table|(?:include|add|provide|use|required|must|complete|fill)\s+(?:one\s+)?(?:clear\s+)?table|table\s+(?:is\s+)?(?:required|needed|requested)|جدول\s+مقارنة|جدول\s+مقارن|(?:أضف|أدرج|استخدم|املأ|مطلوب|يتطلب)\s*.{0,35}جدول/i.test(String(text || ""));
 }
@@ -2132,6 +2136,20 @@ const NURSING_SHEET_FINAL_RULES = `
 - اترك التوقيع كخانة فارغة قابلة للتوقيع اليدوي:
   Student Signature: ____________________   Date: __________
   لا تنشئ توقيعاً أو اسماً مزيفاً.
+`;
+
+const OBSTETRIC_REPORT_RULES = `
+قواعد تقرير Comparative Analysis: Vaginal Delivery vs. Cesarean Section:
+- أخرج تقريراً واحداً كاملاً، وليس أجزاءً أو نسخاً بديلة.
+- استخدم هذه الأقسام مرة واحدة فقط وبالترتيب: Introduction، Preoperative Preparation،
+  Intraoperative Nursing Roles، Immediate Postoperative Care، Pain Management،
+  Complication Prevention Strategies، Conclusion.
+- غطِّ NVD وelective C-Section وemergency C-Section عند ارتباطها بالمحور.
+- لا تكتب End of Part 1 أو Part 1/Part 2 أو عبارة تفيد أن التقرير مقطوع.
+- لا تضف جدولاً لمجرد أن الموضوع مقارن؛ الجدول مسموح فقط إذا طلبه الدكتور صراحةً.
+- لا تكرر العناوين أو الفقرات، ولا تضع ملخصاً بديلاً بعد التقرير.
+- لا تخترع اسم طالب أو ID أو مشرفاً أو مراجع أو DOI. استخدم البيانات التي قدمها المستخدم فقط.
+- لا تختصر التقرير بسبب حد كلمات داخلي؛ أخرج النسخة النهائية كاملة.
 `;
 
 const ASSIGNMENT_FORMAT_RULES = `
@@ -2190,11 +2208,16 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
-  const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
+  const assignmentText = `${systemPrompt || ""}\n${prompt || ""}`;
+  const formTask = isFormAssignmentTask(assignmentText);
+  const obstetricTask = isObstetricReportTask(assignmentText);
+  const tableRequired = formTask || requiresComparisonTable(assignmentText);
   const effectiveSystemPrompt = [
     systemPrompt,
     ASSIGNMENT_FORMAT_RULES,
-    formTask ? FORM_ASSIGNMENT_RULES : ""
+    formTask ? FORM_ASSIGNMENT_RULES : "",
+    formTask ? NURSING_SHEET_FINAL_RULES : "",
+    obstetricTask ? OBSTETRIC_REPORT_RULES : ""
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
@@ -2219,6 +2242,8 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
+${obstetricTask ? `\nهذا تقرير مقارن، وليس نموذجاً:
+${OBSTETRIC_REPORT_RULES}` : ""}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
@@ -2265,7 +2290,34 @@ ${String(reviewed.content).slice(0, 60000)}`
     if (normalized.ok) return normalized;
   }
 
-  const tableRequired = formTask || requiresComparisonTable(`${systemPrompt || ""}\n${prompt || ""}`);
+  if (obstetricTask) {
+    const normalized = await openRouterCompletion(
+      reviewModel,
+      [
+        {
+          role: "system",
+          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt, OBSTETRIC_REPORT_RULES]
+            .filter(Boolean).join("\n\n")
+        },
+        {
+          role: "user",
+          content: `أعد بناء التقرير التالي كنسخة نهائية واحدة كاملة.
+احذف التكرار، وأي جدول غير مطلوب، وأي عبارة End of Part أو Part 1/Part 2.
+لا تختصر المحتوى ولا تضف مراجع أو بيانات غير موجودة.
+يجب أن تظهر المحاور المطلوبة مرة واحدة فقط وبالترتيب.
+
+${OBSTETRIC_REPORT_RULES}
+
+التقرير الحالي:
+${String(reviewed.content).slice(0, 60000)}`
+        }
+      ],
+      maxTokens,
+      0.05
+    );
+    if (normalized.ok) return normalized;
+  }
+
   if (!tableRequired && containsMarkdownTable(reviewed.content)) {
     const repaired = await openRouterCompletion(
       reviewModel,
