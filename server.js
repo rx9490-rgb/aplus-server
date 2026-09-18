@@ -2106,6 +2106,58 @@ const FORM_ASSIGNMENT_RULES = `
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
 `;
 
+const NVD_CSECTION_COMPARATIVE_RULES = `
+ACADEMIC TEMPLATE — COMPARATIVE ANALYSIS: VAGINAL DELIVERY VS. CESAREAN SECTION
+This is a comparative nursing report, not a generic maternity essay.
+Compare Normal Vaginal Delivery (NVD) with elective/emergency Cesarean Section under every required domain:
+1. Preoperative / pre-delivery preparation: maternal assessment, consent and education, laboratory checks,
+   fetal assessment, IV access, fasting/medication preparation, and operating-room readiness when applicable.
+2. Intraoperative nursing roles: circulating/scrub responsibilities, aseptic technique, counts, maternal and fetal
+   monitoring, documentation, communication, newborn safety, and emergency escalation.
+3. Immediate postoperative / post-delivery care: airway and vital signs, uterine tone and bleeding, incision or
+   perineal assessment, bladder/urine output, mobility, breastfeeding/skin-to-skin, and handover.
+4. Pain management: assessment tools, pharmacological and non-pharmacological measures, opioid safety,
+   neuraxial/regional considerations, and patient education for both pathways.
+5. Complication prevention: postpartum hemorrhage, infection, thromboembolism, urinary problems, wound or
+   perineal complications, anesthesia-related problems, and escalation/red-flag criteria.
+The report must include a clear introduction, conclusion, nursing priorities, clinically specific actions,
+and a comparison table with a row for each required domain and separate NVD/C-Section columns.
+Include a short section explaining how emergency C-Section changes priorities and requires rapid escalation.
+Use only verifiable references. Never invent a DOI, author, journal, statistic, or page number.
+If a source cannot be verified, write [SOURCE NEEDS VERIFICATION].
+`;
+
+const NURSING_ASSIGNMENT_SHEET_RULES = `
+ACADEMIC TEMPLATE — NURSING ASSIGNMENT SHEET
+This is a completed operational nursing assignment sheet, not a theoretical essay.
+Create two clearly separated and independently complete sections: SHIFT A and SHIFT B.
+For EACH shift, preserve and complete all visible fields:
+Basic Info: Unit/Floor, Head Nurse, Patient Count, Date, CPR Team.
+Staffing: patient assignments, responsible nurse, delegated nurse, and break time.
+Safety Checks: narcotics/controlled-drug check, emergency cart and defibrillator,
+high-alert medication cabinet and refrigerator, sterile supplies, hazardous materials,
+O2 and suction.
+Fire Plan: rescue person, Red Code caller, alarm activation, and extinguisher user.
+Signature: a final signature line for the responsible person. Never forge a signature; use
+[Student signature required] if no signature is supplied.
+Use practical tables that can be printed and signed. Do not add an unrelated introduction,
+conclusion, references, or theoretical essay.
+If real staffing or patient data are not supplied, use clearly labelled fictional training data
+and place "TRAINING SAMPLE — DATA ARE FICTIONAL" at the top of each shift. Do not use real
+patient names or identifying information.
+`;
+
+function assignmentProfile(text) {
+  const value = String(text || "");
+  if (/vaginal\s+delivery|normal\s+vaginal\s+delivery|\bNVD\b|cesarean|c-section|comparative\s+analysis/i.test(value)) {
+    return NVD_CSECTION_COMPARATIVE_RULES;
+  }
+  if (isFormAssignmentTask(value) || /nursing\s+assignment\s+sheet|نموذج\s+تكليف\s+تمريضي/i.test(value)) {
+    return NURSING_ASSIGNMENT_SHEET_RULES;
+  }
+  return "";
+}
+
 async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
@@ -2153,9 +2205,11 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
   const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
+  const profileRules = assignmentProfile(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
     systemPrompt,
-    formTask ? FORM_ASSIGNMENT_RULES : ""
+    formTask ? FORM_ASSIGNMENT_RULES : "",
+    profileRules
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
@@ -2172,12 +2226,14 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
 صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
 لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
-لا تخترع مراجع أو DOI أو أرقاماً علمية. في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
+لا تخترع مراجع أو DOI أو أرقاماً علمية. إذا لم يمكن التحقق من المصدر فاكتب [SOURCE NEEDS VERIFICATION].
+في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
 وبيانات طاقم افتراضية متسقة إذا لم يقدم المستخدم بيانات فعلية، مع إبقاء وسم "البيانات افتراضية".
 أخرج نص الواجب النهائي فقط.
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
+${profileRules ? `\nطبّق قالب المهمة المتخصص التالي حرفياً:\n${profileRules}` : ""}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
