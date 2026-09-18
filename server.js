@@ -2024,6 +2024,10 @@ function safeOpenRouterModel(value, fallback) {
   }
   return model;
 }
+const EXTRA_OPENROUTER_MODELS = String(process.env.AI_EXTRA_MODELS || "")
+  .split(",")
+  .map((model) => safeOpenRouterModel(model, ""))
+  .filter(Boolean);
 // نماذج OpenRouter المستخدمة بالترتيب:
 // Gemini ثم GPT للمراجعة، وبعدها Claude وDeepSeek وQwen وLlama كبدائل.
 // كل الطلبات تمر من OPENROUTER_API_KEY، ولا نحتاج مفاتيح منفصلة.
@@ -2040,7 +2044,8 @@ const OPENROUTER_MODELS = [
   safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "deepseek/deepseek-chat-v3.1"),
   ...(process.env.AI_BLACKBOX_MODEL
     ? [safeOpenRouterModel(process.env.AI_BLACKBOX_MODEL, "")]
-    : [])
+    : []),
+  ...EXTRA_OPENROUTER_MODELS
 ].filter((model, index, all) => model && all.indexOf(model) === index);
 const ARABIC_MODEL = safeOpenRouterModel(
   process.env.AI_ARABIC_MODEL,
@@ -2051,8 +2056,37 @@ const REVIEW_MODELS = [
   safeOpenRouterModel(process.env.AI_CLAUDE_MODEL, "anthropic/claude-sonnet-4"),
   safeOpenRouterModel(process.env.AI_DEEPSEEK_MODEL, "deepseek/deepseek-chat-v3.1"),
   safeOpenRouterModel(process.env.AI_QWEN_MODEL, "qwen/qwen-2.5-72b-instruct"),
-  safeOpenRouterModel(process.env.AI_LLAMA_MODEL, "meta-llama/llama-3.3-70b-instruct")
+  safeOpenRouterModel(process.env.AI_LLAMA_MODEL, "meta-llama/llama-3.3-70b-instruct"),
+  ...EXTRA_OPENROUTER_MODELS
 ].filter((model, index, all) => model && all.indexOf(model) === index);
+const SUPPORTED_AI_PROVIDERS = new Set([
+  "gemini", "openrouter", "openai", "gpt", "chatgpt", "claude",
+  "deepseek", "qwen", "llama", "mistral", "grok", "perplexity", "blackbox"
+]);
+const PROVIDER_PREFIXES = {
+  gemini: ["google/"],
+  openai: ["openai/"],
+  gpt: ["openai/"],
+  chatgpt: ["openai/"],
+  claude: ["anthropic/"],
+  deepseek: ["deepseek/"],
+  qwen: ["qwen/"],
+  llama: ["meta-llama/"],
+  mistral: ["mistralai/"],
+  grok: ["x-ai/"],
+  perplexity: ["perplexity/"],
+  blackbox: ["blackbox/"]
+};
+
+function modelsForProvider(provider, isArabicRequest) {
+  const all = isArabicRequest
+    ? [ARABIC_MODEL, ...OPENROUTER_MODELS]
+    : OPENROUTER_MODELS;
+  const prefixes = PROVIDER_PREFIXES[provider];
+  if (!prefixes || provider === "openrouter") return [...new Set(all)];
+  const preferred = all.filter((model) => prefixes.some((prefix) => model.startsWith(prefix)));
+  return [...new Set([...preferred, ...all])];
+}
 
 const AI_QUALITY_SYSTEM = `
 أنت المساعد الرئيسي لموقع طبي تعليمي، وتنفذ كل أنواع المهام: الواجبات،
@@ -2270,9 +2304,27 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
   const draft = await openRouterCompletionWithFallback(pipelineModels, draftMessages, maxTokens, 0.1);
   if (!draft.ok) return draft;
 
-  // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
   const reviewModel = REVIEW_MODELS.find((model) => OPENROUTER_MODELS.includes(model))
-    || primaryModel;
+    || (isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0]);
+  const audit = await openRouterCompletionWithFallback(
+    [reviewModel, ...REVIEW_MODELS, ...pipelineModels],
+    [
+      {
+        role: "system",
+        content: `أنت مدقق جودة صارم للواجبات الأكاديمية والملفات التمريضية.
+راجع المسودة مقابل الطلب الأصلي فقط. اكتب قائمة أخطاء عملية مختصرة تشمل: الحقول الناقصة،
+التكرار، النماذج الأولية، زيادة الصفحات، خلط اللغة، المعلومات غير الموثوقة، والمراجع المختلقة.
+لا تعِد كتابة الواجب ولا تضف محتوى جديداً.`
+      },
+      {
+        role: "user",
+        content: `الطلب الأصلي:\n${String(prompt).slice(0, 60000)}\n\nالمسودة:\n${String(draft.content).slice(0, 50000)}`
+      }
+    ],
+    Math.min(3000, Math.max(1800, Math.floor(maxTokens * 0.35))),
+    0.05
+  );
+  const auditText = audit.ok ? audit.content : "نفّذ تدقيقاً مستقلاً بنفسك قبل إخراج النسخة النهائية.";
   const reviewPrompt = `
 أنت محرر أكاديمي ومراجع جودة نهائي.
 أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
@@ -2286,6 +2338,9 @@ ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
 ${profileRules ? `\nطبّق قالب المهمة المتخصص التالي حرفياً:\n${profileRules}` : ""}
+
+تقرير المدقق المستقل (صحح ما يلزم ولا تنقله إلى الناتج):
+${String(auditText).slice(0, 12000)}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
@@ -2344,13 +2399,77 @@ ${String(reviewed.content).slice(0, 60000)}`
     : reviewed;
 }
 
+async function generateHighAccuracyWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
+  const pipelineModels = isArabicRequest
+    ? [ARABIC_MODEL, ...OPENROUTER_MODELS]
+    : OPENROUTER_MODELS;
+  const baseSystem = [
+    AI_QUALITY_SYSTEM,
+    `طبّق تدقيقاً متعدد المراحل. لا تخترع حقائق أو مراجع أو DOI أو أرقاماً.
+إذا تعذر التحقق فاكتب [SOURCE NEEDS VERIFICATION]. أخرج النتيجة المطلوبة فقط.`
+  ];
+  const draft = await openRouterCompletionWithFallback(
+    pipelineModels,
+    [
+      { role: "system", content: [...baseSystem, systemPrompt].filter(Boolean).join("\n\n") },
+      { role: "user", content: String(prompt) }
+    ],
+    maxTokens,
+    0.1
+  );
+  if (!draft.ok) return draft;
+
+  const audit = await openRouterCompletionWithFallback(
+    [REVIEW_MODELS[0], ...REVIEW_MODELS, ...pipelineModels],
+    [
+      {
+        role: "system",
+        content: `أنت مدقق مستقل. افحص المسودة مقابل الطلب الأصلي من ناحية الدقة،
+الاكتمال، البنية، اللغة، التكرار، السلامة الطبية، والمراجع. أخرج ملاحظات تصحيحية فقط،
+ولا تعِد كتابة المسودة ولا تخترع بديلاً.`
+      },
+      {
+        role: "user",
+        content: `الطلب:\n${String(prompt).slice(0, 60000)}\n\nالمسودة:\n${String(draft.content).slice(0, 60000)}`
+      }
+    ],
+    Math.min(3000, Math.max(1800, Math.floor(maxTokens * 0.35))),
+    0.05
+  );
+
+  const final = await openRouterCompletionWithFallback(
+    [REVIEW_MODELS[0], ...REVIEW_MODELS, ...pipelineModels],
+    [
+      { role: "system", content: [...baseSystem, systemPrompt].filter(Boolean).join("\n\n") },
+      {
+        role: "user",
+        content: `أخرج نسخة نهائية جاهزة للتسليم من المسودة.
+التزم بالطلب الأصلي حرفياً، أصلح كل ملاحظات التدقيق، احذف التكرار والحشو،
+ولا تذكر التدقيق أو الذكاء الاصطناعي.
+
+الطلب الأصلي:
+${String(prompt).slice(0, 60000)}
+
+تقرير التدقيق:
+${audit.ok ? String(audit.content).slice(0, 12000) : "دقّق بنفسك قبل الإخراج."}
+
+المسودة:
+${String(draft.content).slice(0, 60000)}`
+      }
+    ],
+    maxTokens,
+    0.05
+  );
+  return final.ok ? final : draft;
+}
+
 // ══════════════════════════════════════════════
 // OpenRouter — المسار الموحد باستخدام مفتاح المشروع
 // لا يعتمد هذا المسار على GEMINI_API_KEY المباشر.
 // ══════════════════════════════════════════════
 app.post("/api/ai/call", async (req, res) => {
   const { provider = "gemini", prompt, systemPrompt = "", maxTokens } = req.body || {};
-  if (provider !== "gemini") {
+  if (!SUPPORTED_AI_PROVIDERS.has(String(provider).toLowerCase())) {
     res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
     return;
   }
@@ -2377,9 +2496,8 @@ app.post("/api/ai/call", async (req, res) => {
 
   const requestText = `${systemPrompt || ""}\n${prompt}`;
   const isArabicRequest = /[\u0600-\u06ff]/.test(requestText);
-  const requestModels = isArabicRequest
-    ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
-    : OPENROUTER_MODELS;
+  const normalizedProvider = String(provider).toLowerCase();
+  const requestModels = modelsForProvider(normalizedProvider, isArabicRequest);
   let lastError = null;
 
   try {
@@ -2395,6 +2513,25 @@ app.post("/api/ai/call", async (req, res) => {
           ok: true,
           content: qualityResult.content,
           provider: "openrouter-quality-pipeline",
+          models: [isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0], qualityResult.model]
+        });
+        return;
+      }
+      lastError = qualityResult;
+    }
+
+    if (isHighAccuracyTask(requestText) && !isAssignmentTask(requestText)) {
+      const qualityResult = await generateHighAccuracyWithReview(
+        prompt,
+        systemPrompt,
+        safeMaxTokens,
+        isArabicRequest
+      );
+      if (qualityResult.ok) {
+        res.json({
+          ok: true,
+          content: qualityResult.content,
+          provider: "openrouter-multi-agent",
           models: [isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0], qualityResult.model]
         });
         return;
