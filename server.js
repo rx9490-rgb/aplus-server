@@ -2090,10 +2090,12 @@ function containsMarkdownTable(text) {
 const FORM_ASSIGNMENT_RULES = `
 هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
 إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
-- أخرج نموذجاً منظماً بعناوين واضحة للشفت A ثم الشفت B.
+- أخرج نسختين فقط: SHIFT A ثم SHIFT B، وكل شفت مكتمل ومستقل.
+- ممنوع إخراج مسودة أولية، نموذج فارغ، نسخة مكررة، صفحات شرح، أو إعادة تعبئة النموذج مرة ثانية.
+- ابدأ مباشرة بعنوان SHIFT A، ثم SHIFT B، ولا تكتب أي شيء خارج الشفتين.
 - إذا لم يزوّد المستخدم بيانات فعلية وكان المطلوب نموذجاً مكتملاً، أنشئ بيانات تدريبية افتراضية متسقة
   (أسماء غير حقيقية، مرضى بأرقام رمزية، أوقات منطقية، وعدد مرضى متوافق مع الجدول)،
-  وضع في أعلى الناتج: "نموذج تدريبي — البيانات افتراضية".
+  من دون كتابة أي عبارة مثل TRAINING SAMPLE أو DATA ARE FICTIONAL أو نموذج تدريبي.
 - لا تنسب البيانات الافتراضية إلى مستشفى أو أشخاص حقيقيين، ولا تستخدم معلومات شخصية حقيقية.
 - لا تترك خانات أساسية فارغة أو تكتب [يُستكمل] عندما يمكن إكمالها ببيانات تدريبية افتراضية.
 - لا تختلق توقيعاً؛ اكتب "[توقيع الطالب مطلوب]" في نهاية كل شفت.
@@ -2131,6 +2133,9 @@ const NURSING_ASSIGNMENT_SHEET_RULES = `
 ACADEMIC TEMPLATE — NURSING ASSIGNMENT SHEET
 This is a completed operational nursing assignment sheet, not a theoretical essay.
 Create two clearly separated and independently complete sections: SHIFT A and SHIFT B.
+Output exactly one SHIFT A and one SHIFT B. Never output a draft, blank prototype, duplicate
+copy, page-by-page explanation, or a second completed version. Start directly with SHIFT A and
+end after the SHIFT B signature line.
 For EACH shift, preserve and complete all visible fields:
 Basic Info: Unit/Floor, Head Nurse, Patient Count, Date, CPR Team.
 Staffing: patient assignments, responsible nurse, delegated nurse, and break time.
@@ -2142,9 +2147,9 @@ Signature: a final signature line for the responsible person. Never forge a sign
 [Student signature required] if no signature is supplied.
 Use practical tables that can be printed and signed. Do not add an unrelated introduction,
 conclusion, references, or theoretical essay.
-If real staffing or patient data are not supplied, use clearly labelled fictional training data
-and place "TRAINING SAMPLE — DATA ARE FICTIONAL" at the top of each shift. Do not use real
-patient names or identifying information.
+If real staffing or patient data are not supplied, use consistent fictional data without real
+identifiers. Do not write "TRAINING SAMPLE", "DATA ARE FICTIONAL", "نموذج تدريبي", or any
+other training-label text anywhere in the final output.
 `;
 
 function assignmentProfile(text) {
@@ -2156,6 +2161,51 @@ function assignmentProfile(text) {
     return NURSING_ASSIGNMENT_SHEET_RULES;
   }
   return "";
+}
+
+function cleanNursingAssignmentOutput(text) {
+  let value = String(text || "")
+    .replace(/^\s*(?:TRAINING\s*SAMPLE|DATA\s*ARE\s*FICTIONAL)\s*[-—:]*.*$/gim, "")
+    .replace(/^\s*(?:نموذج\s+تدريبي|البيانات\s+افتراضية|بيانات\s+افتراضية)\s*[-—:：]*.*$/gim, "")
+    .replace(/^\s*(?:page|صفحة)\s+\d+\s*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const shiftA = /^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?\s*(?:SHIFT\s*A\b|SHIFT\s*1\b|الشفت\s*(?:A|أ|الأول|الاول)\b|شفت\s*(?:A|أ|الأول|الاول)\b|الوردية\s*(?:A|أ|الأولى|الاولى)\b).*$/gim;
+  const shiftB = /^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?\s*(?:SHIFT\s*B\b|SHIFT\s*2\b|الشفت\s*(?:B|ب|الثاني|الثانى)\b|شفت\s*(?:B|ب|الثاني|الثانى)\b|الوردية\s*(?:B|ب|الثانية|الثانيه)\b).*$/gim;
+  const aMatches = [...value.matchAll(shiftA)];
+  const bMatches = [...value.matchAll(shiftB)];
+
+  // Keep the first complete A and B only; this removes draft pages and repeated forms.
+  if (aMatches.length && bMatches.length) {
+    const firstA = aMatches[0];
+    const nextB = bMatches.find((match) => match.index > firstA.index);
+    if (nextB) {
+      const nextAAfterB = aMatches.find((match) => match.index > nextB.index);
+      const endOfB = nextAAfterB ? nextAAfterB.index : value.length;
+      value = `${value.slice(firstA.index, nextB.index).trim()}\n\n${value.slice(nextB.index, endOfB).trim()}`;
+    }
+  }
+
+  return value
+    .replace(/TRAINING\s*SAMPLE\s*[-—:]\s*DATA\s*ARE\s*FICTIONAL/gi, "")
+    .replace(/(?:TRAINING\s*SAMPLE|DATA\s*ARE\s*FICTIONAL)\s*[-—:：]*/gi, "")
+    .replace(/(?:نموذج\s+تدريبي|البيانات\s+افتراضية|بيانات\s+افتراضية)\s*[-—:：]*/gi, "")
+    .replace(/^\s*(?:TRAINING\s*SAMPLE|DATA\s*ARE\s*FICTIONAL)\s*[-—:]*.*$/gim, "")
+    .replace(/^\s*(?:نموذج\s+تدريبي|البيانات\s+افتراضية|بيانات\s+افتراضية)\s*[-—:：]*.*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function openRouterCompletionWithFallback(models, messages, maxTokens, temperature = 0.1) {
+  const candidates = [...new Set(models.filter(Boolean))];
+  let lastResult = { ok: false, status: 502, message: "no_model_available" };
+  for (const model of candidates) {
+    const result = await openRouterCompletion(model, messages, maxTokens, temperature);
+    if (result.ok) return result;
+    lastResult = result;
+  }
+  return lastResult;
 }
 
 async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
@@ -2203,9 +2253,11 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 }
 
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
-  const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
   const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const profileRules = assignmentProfile(`${systemPrompt || ""}\n${prompt || ""}`);
+  const pipelineModels = isArabicRequest
+    ? [ARABIC_MODEL, ...OPENROUTER_MODELS]
+    : OPENROUTER_MODELS;
   const effectiveSystemPrompt = [
     systemPrompt,
     formTask ? FORM_ASSIGNMENT_RULES : "",
@@ -2215,7 +2267,7 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
     { role: "user", content: String(prompt) }
   ];
-  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
+  const draft = await openRouterCompletionWithFallback(pipelineModels, draftMessages, maxTokens, 0.1);
   if (!draft.ok) return draft;
 
   // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
@@ -2227,8 +2279,8 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
 لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
 لا تخترع مراجع أو DOI أو أرقاماً علمية. إذا لم يمكن التحقق من المصدر فاكتب [SOURCE NEEDS VERIFICATION].
-في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
-وبيانات طاقم افتراضية متسقة إذا لم يقدم المستخدم بيانات فعلية، مع إبقاء وسم "البيانات افتراضية".
+  في نموذج الشفتين فقط، استخدم أرقام مرضى وأوقاتاً وبيانات طاقم افتراضية متسقة إذا لم يقدم
+  المستخدم بيانات فعلية، لكن لا تضف أي وسم أو عبارة تدريبية إلى الناتج النهائي.
 أخرج نص الواجب النهائي فقط.
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
@@ -2241,8 +2293,8 @@ ${String(prompt).slice(0, 60000)}
 المسودة:
 ${String(draft.content).slice(0, 50000)}
 `;
-  const reviewed = await openRouterCompletion(
-    reviewModel,
+  const reviewed = await openRouterCompletionWithFallback(
+    [reviewModel, ...REVIEW_MODELS, ...pipelineModels],
     [
       { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
       { role: "user", content: reviewPrompt }
@@ -2250,12 +2302,16 @@ ${String(draft.content).slice(0, 50000)}
     maxTokens,
     0.1
   );
-  if (!reviewed.ok) return draft;
+  if (!reviewed.ok) {
+    return formTask
+      ? { ...draft, content: cleanNursingAssignmentOutput(draft.content) }
+      : draft;
+  }
 
   // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
   if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
-    const repaired = await openRouterCompletion(
-      reviewModel,
+    const repaired = await openRouterCompletionWithFallback(
+      [reviewModel, ...REVIEW_MODELS, ...pipelineModels],
       [
         {
           role: "system",
@@ -2278,9 +2334,14 @@ ${String(reviewed.content).slice(0, 60000)}`
       maxTokens,
       0.05
     );
-    return repaired.ok ? repaired : reviewed;
+    const finalResult = repaired.ok ? repaired : reviewed;
+    return formTask
+      ? { ...finalResult, content: cleanNursingAssignmentOutput(finalResult.content) }
+      : finalResult;
   }
-  return reviewed;
+  return formTask
+    ? { ...reviewed, content: cleanNursingAssignmentOutput(reviewed.content) }
+    : reviewed;
 }
 
 // ══════════════════════════════════════════════
