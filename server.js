@@ -2083,8 +2083,12 @@ function isFormAssignmentTask(text) {
   return /nursing\s+assignment\s+sheet|fill\s+out\s+and\s+sign|s?heet|worksheet|form|shift\s*[ab]|assigned\s+patients|responsible\s+nurse|delegated\s+nurse|break\s+time|narcotic\s+check|emergency\s*(?:&|and)\s*defibrillator|high\s*alert|controlled\s+drug|sterile\s+supply|hazardous\s+materials|o2\s+and\s+suction|fire\s+plan|red\s+code|rescue\s+person|extinguisher|ورقة\s+واجب\s+تمريض|نموذج|شفت\s*[أب]|مرضى\s+مكلفون|خطة\s+الحريق|الأدوية\s+الخاضعة|عربة\s+الطوارئ|المواد\s+المعقمة/i.test(String(text || ""));
 }
 
+function isDeliveryComparisonTask(text) {
+  return /comparative\s+(?:analysis|report)|vaginal\s+delivery|normal\s+vaginal\s+delivery|\bnvd\b|cesarean\s+section|c[\s-]?section|preoperative\s+preparation|intraoperative\s+roles|immediate\s+postoperative\s+care|pain\s+management|complication\s+prevention/i.test(String(text || ""));
+}
+
 function requiresComparisonTable(text) {
-  return /comparison\s+table|comparative\s+table|include\s+(?:one\s+)?(?:clear\s+)?comparison|جدول\s+مقارنة|جدول\s+مقارن|مقارنة\s+واضحة/i.test(String(text || ""));
+  return /comparison\s+table|comparative\s+table|comparative\s+(?:analysis|report)|vaginal\s+delivery.*(?:cesarean|c[\s-]?section)|cesarean.*vaginal\s+delivery|include\s+(?:one\s+)?(?:clear\s+)?comparison|جدول\s+مقارنة|جدول\s+مقارن|مقارنة\s+واضحة/i.test(String(text || ""));
 }
 
 function containsMarkdownTable(text) {
@@ -2113,6 +2117,18 @@ const FORM_ASSIGNMENT_RULES = `
   Rescue Person، Red Code، Activate Alarm، Extinguisher Use، Signature.
 - لا تكتب مقدمة أو خاتمة أو مراجع أو شرحاً خارج النموذج.
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
+`;
+
+const DELIVERY_COMPARISON_RULES = `
+هذا تقرير مقارن عن الولادة المهبلية الطبيعية (NVD) والقيصرية الاختيارية/الطارئة، وليس شرحاً عاماً عن الولادة.
+- اكتب مقارنة مباشرة ومتوازنة بين NVD وC-Section، مع توضيح الفروق في كل محور مطلوب:
+  التحضير قبل العملية، أدوار الفريق أثناء الإجراء، الرعاية الفورية بعد الولادة/العملية،
+  تدبير الألم، واستراتيجيات منع المضاعفات.
+- أضف جدول مقارنة واضحاً يضع NVD وC-Section في عمودين متقابلين، ثم ناقش كل محور في قسم مستقل.
+- ميّز صراحة بين القيصرية الاختيارية والقيصرية الطارئة، ولا تخلط بين المخاطر أو الأولويات التمريضية.
+- ركّز على مسؤوليات التمريض، المراقبة، السلامة، تثقيف المريضة، ومؤشرات التصعيد؛ لا تكتب وصفاً جراحياً غير مطلوب.
+- لا تكرر الفكرة نفسها في أكثر من قسم، ولا تضف غلافاً أو فهرساً أو خاتمة أو مراجع إلا إذا طلبتها التعليمات الأصلية.
+- لا تخترع إحصاءات أو مراجع أو أرقام صفحات. استخدم مصادر قابلة للتحقق فقط، واذكر بوضوح ما يحتاج تحققاً.
 `;
 
 async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
@@ -2163,9 +2179,11 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
   const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
   const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
+  const deliveryComparisonTask = isDeliveryComparisonTask(`${systemPrompt || ""}\n${prompt || ""}`);
   const effectiveSystemPrompt = [
     systemPrompt,
-    formTask ? FORM_ASSIGNMENT_RULES : ""
+    formTask ? FORM_ASSIGNMENT_RULES : "",
+    deliveryComparisonTask && !formTask ? DELIVERY_COMPARISON_RULES : ""
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
@@ -2188,6 +2206,9 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
+${deliveryComparisonTask && !formTask ? `\nهذا تقرير مقارن عن NVD وC-Section:
+${DELIVERY_COMPARISON_RULES}
+تحقق أن المحاور الخمسة كلها موجودة وأن الجدول يقارن العمودين مباشرة.` : ""}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
