@@ -2097,6 +2097,101 @@ function containsMarkdownTable(text) {
     && lines.some((line) => /^\|?\s*:?-{3,}/.test(line));
 }
 
+function assignmentWordCount(text) {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function extractAssignmentRequirementLabels(prompt) {
+  const source = String(prompt || "");
+  const blocks = [
+    source.match(/Required visible labels, fields, headings, and rubric items:\s*([\s\S]*?)\nTreat the supplied text/i),
+    source.match(/قائمة البنود\/العناوين\/الحقول التي يجب أن تظهر في الناتج:\s*([\s\S]*?)\nتعامل مع النص/i)
+  ].filter(Boolean);
+  if (!blocks.length) return [];
+  return String(blocks[0][1] || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*\d+[.)]\s*/, "").trim())
+    .filter((line) => line && !/^\[.*\]$/.test(line))
+    .map((line) => line.replace(/[*_`|]/g, "").trim())
+    .filter((line) => line.length >= 3 && line.length <= 100)
+    .slice(0, 80);
+}
+
+function auditAssignmentQuality(text, prompt) {
+  const output = String(text || "").trim();
+  const source = String(prompt || "");
+  const issues = [];
+  const words = assignmentWordCount(output);
+  const targetMatch = source.match(/(?:Word count|عدد الكلمات المطلوبة)\s*[:：]\s*~?\s*(\d{3,6})/i);
+  const target = targetMatch ? Number(targetMatch[1]) : 0;
+
+  if (!output || words < 200) issues.push("الناتج قصير أو فارغ");
+  if (target && words < Math.floor(target * 0.88)) {
+    issues.push(`عدد الكلمات أقل من المطلوب (${words}/${target})`);
+  }
+  if (/```|<script\b|<style\b|APPLUS_ACADEMIC_CONTRACT|A\+_ASSIGNMENT_FORMAT/i.test(output)) {
+    issues.push("تسريب تعليمات أو كود داخل الواجب");
+  }
+  if (requiresComparisonTable(source) && !containsMarkdownTable(output)) {
+    issues.push("جدول المقارنة المطلوب غير موجود");
+  }
+
+  const compact = output.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const missingLabels = extractAssignmentRequirementLabels(source).filter((label) => {
+    const low = label.toLowerCase();
+    const normalized = low.replace(/[^\p{L}\p{N}]+/gu, "");
+    return !output.toLowerCase().includes(low) && !compact.includes(normalized);
+  });
+  if (missingLabels.length) issues.push(`بنود ناقصة: ${missingLabels.slice(0, 8).join("، ")}`);
+
+  return {
+    ok: issues.length === 0,
+    score: issues.length === 0 ? 10 : Math.max(0, 10 - Math.min(issues.length, 10)),
+    issues,
+    words,
+    target,
+    missingLabels
+  };
+}
+
+async function enforceAssignmentQualityGate(content, prompt, systemPrompt, model, maxTokens) {
+  let current = String(content || "").trim();
+  let audit = auditAssignmentQuality(current, prompt);
+  for (let attempt = 0; !audit.ok && attempt < 4; attempt++) {
+    const repairPrompt = `
+هذه بوابة جودة إلزامية لواجب أكاديمي.
+لا تُخرج النسخة الحالية كما هي. أصلح كل الملاحظات ثم أخرج الواجب كاملاً فقط.
+يجب أن تصبح نتيجة الفحص الداخلي 10/10:
+${audit.issues.map((issue) => `- ${issue}`).join("\n")}
+
+تعليمات الدكتور والطلب الأصلي:
+${String(prompt).slice(0, 60000)}
+
+النسخة الحالية:
+${current.slice(0, 60000)}
+
+قواعد الإصلاح:
+- لا تحذف أي قسم أو جدول أو حقل موجود.
+- لا تضف مراجع أو DOI أو أرقاماً غير قابلة للتحقق.
+- حافظ على لغة الواجب وتنسيقه المطلوبين.
+- أخرج النص النهائي فقط، بلا شرح للفحص أو الإصلاح.
+`;
+    const repaired = await openRouterCompletion(
+      model,
+      [
+        { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+        { role: "user", content: repairPrompt }
+      ],
+      maxTokens,
+      0.05
+    );
+    if (!repaired.ok || !String(repaired.content || "").trim()) break;
+    current = repaired.content.trim();
+    audit = auditAssignmentQuality(current, prompt);
+  }
+  return { content: current, audit };
+}
+
 const FORM_ASSIGNMENT_RULES = `
 هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
 إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
@@ -2199,6 +2294,7 @@ async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isA
 أنت محرر أكاديمي ومراجع جودة نهائي.
 أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
 صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
+ حافظ على كل قسم مطلوب وكل جدول وكل حقل موجود في المسودة؛ لا تختصر المحتوى ولا تحذف مطلباً لتقليل الطول.
 لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
 لا تخترع مراجع أو DOI أو أرقاماً علمية. في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
 وبيانات طاقم افتراضية متسقة إذا لم يقدم المستخدم بيانات فعلية، مع إبقاء وسم "البيانات افتراضية".
@@ -2226,6 +2322,28 @@ ${String(draft.content).slice(0, 50000)}
     0.1
   );
   if (!reviewed.ok) return draft;
+  const draftWordCount = String(draft.content || "").trim().split(/\s+/).filter(Boolean).length;
+  const reviewedWordCount = String(reviewed.content || "").trim().split(/\s+/).filter(Boolean).length;
+  /* لا نستبدل مسودة كاملة بمراجعة قصّرت المحتوى بشكل واضح. */
+  if (draftWordCount >= 500 && reviewedWordCount < Math.floor(draftWordCount * 0.72)) {
+    return draft;
+  }
+  const gated = await enforceAssignmentQualityGate(
+    reviewed.content,
+    prompt,
+    effectiveSystemPrompt,
+    reviewModel,
+    maxTokens
+  );
+  if (!gated.audit.ok) {
+    return {
+      ok: false,
+      qualityGateFailed: true,
+      status: 422,
+      message: `assignment_quality_gate_failed:${gated.audit.issues.slice(0, 3).join("|")}`
+    };
+  }
+  reviewed.content = gated.content;
 
   // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
   if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
@@ -2310,6 +2428,14 @@ app.post("/api/ai/call", async (req, res) => {
           content: qualityResult.content,
           provider: "openrouter-quality-pipeline",
           models: [isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0], qualityResult.model]
+        });
+        return;
+      }
+      if (qualityResult.qualityGateFailed) {
+        res.status(422).json({
+          ok: false,
+          error: "assignment_quality_gate_failed",
+          detail: qualityResult.message
         });
         return;
       }
