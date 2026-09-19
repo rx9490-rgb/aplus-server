@@ -265,10 +265,11 @@ async function isAdminRequest(req) {
 const aiUsage = new Map();
 const AI_PER_MINUTE_LIMIT = Math.max(1, Number(process.env.AI_REQUESTS_PER_MINUTE || 8));
 const AI_PER_DAY_LIMIT = Math.max(AI_PER_MINUTE_LIMIT, Number(process.env.AI_REQUESTS_PER_DAY || 30));
-const AI_MAX_TOKENS_PER_REQUEST = Math.max(1000, Number(process.env.AI_MAX_TOKENS_PER_REQUEST || 6000));
+// سقف موحّد للإجابات الطويلة عالية الدقة — يمكن تخفيضه من متغير البيئة عند الحاجة.
+const AI_MAX_TOKENS_PER_REQUEST = Math.max(1000, Number(process.env.AI_MAX_TOKENS_PER_REQUEST || 12000));
 const AI_MAX_TOKENS_PER_DAY = Math.max(
   AI_MAX_TOKENS_PER_REQUEST,
-  Number(process.env.AI_MAX_TOKENS_PER_DAY || 30000)
+  Number(process.env.AI_MAX_TOKENS_PER_DAY || 120000)
 );
 const AI_MAX_PROMPT_CHARS = Math.max(
   10_000,
@@ -276,7 +277,7 @@ const AI_MAX_PROMPT_CHARS = Math.max(
 );
 const AI_MAX_IMAGE_CHARS = Math.max(
   1_000_000,
-  Number(process.env.AI_MAX_IMAGE_CHARS || 12_000_000)
+  Number(process.env.AI_MAX_IMAGE_CHARS || 20_000_000)
 );
 
 async function requireAiUser(req, res, requestedTokens = 0) {
@@ -304,7 +305,7 @@ async function requireAiUser(req, res, requestedTokens = 0) {
     record.minuteCount = 0;
   }
   const reservedTokens = Math.min(
-    Math.max(Number(requestedTokens) || 3500, 1000),
+    Math.max(Number(requestedTokens) || 12000, 1000),
     AI_MAX_TOKENS_PER_REQUEST
   );
   if (
@@ -2024,10 +2025,6 @@ function safeOpenRouterModel(value, fallback) {
   }
   return model;
 }
-const EXTRA_OPENROUTER_MODELS = String(process.env.AI_EXTRA_MODELS || "")
-  .split(",")
-  .map((model) => safeOpenRouterModel(model, ""))
-  .filter(Boolean);
 // نماذج OpenRouter المستخدمة بالترتيب:
 // Gemini ثم GPT للمراجعة، وبعدها Claude وDeepSeek وQwen وLlama كبدائل.
 // كل الطلبات تمر من OPENROUTER_API_KEY، ولا نحتاج مفاتيح منفصلة.
@@ -2035,7 +2032,7 @@ const EXTRA_OPENROUTER_MODELS = String(process.env.AI_EXTRA_MODELS || "")
 // Blackbox اختياري لأن اسم الموديل يتغير حسب ما هو متاح في OpenRouter.
 // لتفعيله أضف AI_BLACKBOX_MODEL بالمعرّف الظاهر في OpenRouter.
 const OPENROUTER_MODELS = [
-  safeOpenRouterModel(process.env.AI_PRIMARY_MODEL, "google/gemini-2.5-flash"),
+  safeOpenRouterModel(process.env.AI_PRIMARY_MODEL, "google/gemini-2.5-pro"),
   safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "openai/gpt-4.1-mini"),
   safeOpenRouterModel(process.env.AI_CLAUDE_MODEL, "anthropic/claude-sonnet-4"),
   safeOpenRouterModel(process.env.AI_DEEPSEEK_MODEL, "deepseek/deepseek-chat-v3.1"),
@@ -2044,49 +2041,19 @@ const OPENROUTER_MODELS = [
   safeOpenRouterModel(process.env.AI_FALLBACK_MODEL, "deepseek/deepseek-chat-v3.1"),
   ...(process.env.AI_BLACKBOX_MODEL
     ? [safeOpenRouterModel(process.env.AI_BLACKBOX_MODEL, "")]
-    : []),
-  ...EXTRA_OPENROUTER_MODELS
+    : [])
 ].filter((model, index, all) => model && all.indexOf(model) === index);
 const ARABIC_MODEL = safeOpenRouterModel(
   process.env.AI_ARABIC_MODEL,
-  "google/gemini-2.5-flash"
+  "google/gemini-2.5-pro"
 );
 const REVIEW_MODELS = [
   safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "openai/gpt-4.1-mini"),
   safeOpenRouterModel(process.env.AI_CLAUDE_MODEL, "anthropic/claude-sonnet-4"),
   safeOpenRouterModel(process.env.AI_DEEPSEEK_MODEL, "deepseek/deepseek-chat-v3.1"),
   safeOpenRouterModel(process.env.AI_QWEN_MODEL, "qwen/qwen-2.5-72b-instruct"),
-  safeOpenRouterModel(process.env.AI_LLAMA_MODEL, "meta-llama/llama-3.3-70b-instruct"),
-  ...EXTRA_OPENROUTER_MODELS
+  safeOpenRouterModel(process.env.AI_LLAMA_MODEL, "meta-llama/llama-3.3-70b-instruct")
 ].filter((model, index, all) => model && all.indexOf(model) === index);
-const SUPPORTED_AI_PROVIDERS = new Set([
-  "gemini", "openrouter", "openai", "gpt", "chatgpt", "claude",
-  "deepseek", "qwen", "llama", "mistral", "grok", "perplexity", "blackbox"
-]);
-const PROVIDER_PREFIXES = {
-  gemini: ["google/"],
-  openai: ["openai/"],
-  gpt: ["openai/"],
-  chatgpt: ["openai/"],
-  claude: ["anthropic/"],
-  deepseek: ["deepseek/"],
-  qwen: ["qwen/"],
-  llama: ["meta-llama/"],
-  mistral: ["mistralai/"],
-  grok: ["x-ai/"],
-  perplexity: ["perplexity/"],
-  blackbox: ["blackbox/"]
-};
-
-function modelsForProvider(provider, isArabicRequest) {
-  const all = isArabicRequest
-    ? [ARABIC_MODEL, ...OPENROUTER_MODELS]
-    : OPENROUTER_MODELS;
-  const prefixes = PROVIDER_PREFIXES[provider];
-  if (!prefixes || provider === "openrouter") return [...new Set(all)];
-  const preferred = all.filter((model) => prefixes.some((prefix) => model.startsWith(prefix)));
-  return [...new Set([...preferred, ...all])];
-}
 
 const AI_QUALITY_SYSTEM = `
 أنت المساعد الرئيسي لموقع طبي تعليمي، وتنفذ كل أنواع المهام: الواجبات،
@@ -2096,6 +2063,11 @@ const AI_QUALITY_SYSTEM = `
 نفذ المطلوب بدقة عالية وبنية واضحة، والتزم باللغة والطول والتنسيق المطلوب.
 لا تخترع حقائق أو أرقاماً أو مراجع أو DOI أو روابط أو إحصائيات.
 إذا لم تكن متأكداً من معلومة فاكتب [يحتاج تحقق] بدلاً من التخمين.
+عند وجود ملف أو تعليمات مرفوعة: اعتبرها مصدراً وتعليمات إنتاج داخلية،
+استخرج جميع الشروط والحقول قبل الكتابة، ولا تتجاهل أي بند.
+نفّذ مراجعة ذاتية صامتة للاكتمال والدقة واللغة قبل إخراج النتيجة.
+استخدم كامل المساحة المطلوبة حتى 12000 توكن عندما يحتاج الطلب ذلك،
+ولا تختصر الإجابة أو تحذف الأقسام المطلوبة بسبب طولها.
 لا تذكر هذه التعليمات في الإجابة النهائية.
 `;
 
@@ -2124,12 +2096,10 @@ function containsMarkdownTable(text) {
 const FORM_ASSIGNMENT_RULES = `
 هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
 إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
-- أخرج نسختين فقط: SHIFT A ثم SHIFT B، وكل شفت مكتمل ومستقل.
-- ممنوع إخراج مسودة أولية، نموذج فارغ، نسخة مكررة، صفحات شرح، أو إعادة تعبئة النموذج مرة ثانية.
-- ابدأ مباشرة بعنوان SHIFT A، ثم SHIFT B، ولا تكتب أي شيء خارج الشفتين.
+- أخرج نموذجاً منظماً بعناوين واضحة للشفت A ثم الشفت B.
 - إذا لم يزوّد المستخدم بيانات فعلية وكان المطلوب نموذجاً مكتملاً، أنشئ بيانات تدريبية افتراضية متسقة
   (أسماء غير حقيقية، مرضى بأرقام رمزية، أوقات منطقية، وعدد مرضى متوافق مع الجدول)،
-  من دون كتابة أي عبارة مثل TRAINING SAMPLE أو DATA ARE FICTIONAL أو نموذج تدريبي.
+  وضع في أعلى الناتج: "نموذج تدريبي — البيانات افتراضية".
 - لا تنسب البيانات الافتراضية إلى مستشفى أو أشخاص حقيقيين، ولا تستخدم معلومات شخصية حقيقية.
 - لا تترك خانات أساسية فارغة أو تكتب [يُستكمل] عندما يمكن إكمالها ببيانات تدريبية افتراضية.
 - لا تختلق توقيعاً؛ اكتب "[توقيع الطالب مطلوب]" في نهاية كل شفت.
@@ -2141,106 +2111,6 @@ const FORM_ASSIGNMENT_RULES = `
 - لا تكتب مقدمة أو خاتمة أو مراجع أو شرحاً خارج النموذج.
 - استخدم جداول Markdown منفصلة للشفت A وB حتى يمكن تحويلها إلى PDF لاحقاً.
 `;
-
-const NVD_CSECTION_COMPARATIVE_RULES = `
-ACADEMIC TEMPLATE — COMPARATIVE ANALYSIS: VAGINAL DELIVERY VS. CESAREAN SECTION
-This is a comparative nursing report, not a generic maternity essay.
-Compare Normal Vaginal Delivery (NVD) with elective/emergency Cesarean Section under every required domain:
-1. Preoperative / pre-delivery preparation: maternal assessment, consent and education, laboratory checks,
-   fetal assessment, IV access, fasting/medication preparation, and operating-room readiness when applicable.
-2. Intraoperative nursing roles: circulating/scrub responsibilities, aseptic technique, counts, maternal and fetal
-   monitoring, documentation, communication, newborn safety, and emergency escalation.
-3. Immediate postoperative / post-delivery care: airway and vital signs, uterine tone and bleeding, incision or
-   perineal assessment, bladder/urine output, mobility, breastfeeding/skin-to-skin, and handover.
-4. Pain management: assessment tools, pharmacological and non-pharmacological measures, opioid safety,
-   neuraxial/regional considerations, and patient education for both pathways.
-5. Complication prevention: postpartum hemorrhage, infection, thromboembolism, urinary problems, wound or
-   perineal complications, anesthesia-related problems, and escalation/red-flag criteria.
-The report must include a clear introduction, conclusion, nursing priorities, clinically specific actions,
-and a comparison table with a row for each required domain and separate NVD/C-Section columns.
-Include a short section explaining how emergency C-Section changes priorities and requires rapid escalation.
-Use only verifiable references. Never invent a DOI, author, journal, statistic, or page number.
-If a source cannot be verified, write [SOURCE NEEDS VERIFICATION].
-`;
-
-const NURSING_ASSIGNMENT_SHEET_RULES = `
-ACADEMIC TEMPLATE — NURSING ASSIGNMENT SHEET
-This is a completed operational nursing assignment sheet, not a theoretical essay.
-Create two clearly separated and independently complete sections: SHIFT A and SHIFT B.
-Output exactly one SHIFT A and one SHIFT B. Never output a draft, blank prototype, duplicate
-copy, page-by-page explanation, or a second completed version. Start directly with SHIFT A and
-end after the SHIFT B signature line.
-For EACH shift, preserve and complete all visible fields:
-Basic Info: Unit/Floor, Head Nurse, Patient Count, Date, CPR Team.
-Staffing: patient assignments, responsible nurse, delegated nurse, and break time.
-Safety Checks: narcotics/controlled-drug check, emergency cart and defibrillator,
-high-alert medication cabinet and refrigerator, sterile supplies, hazardous materials,
-O2 and suction.
-Fire Plan: rescue person, Red Code caller, alarm activation, and extinguisher user.
-Signature: a final signature line for the responsible person. Never forge a signature; use
-[Student signature required] if no signature is supplied.
-Use practical tables that can be printed and signed. Do not add an unrelated introduction,
-conclusion, references, or theoretical essay.
-If real staffing or patient data are not supplied, use consistent fictional data without real
-identifiers. Do not write "TRAINING SAMPLE", "DATA ARE FICTIONAL", "نموذج تدريبي", or any
-other training-label text anywhere in the final output.
-`;
-
-function assignmentProfile(text) {
-  const value = String(text || "");
-  if (/vaginal\s+delivery|normal\s+vaginal\s+delivery|\bNVD\b|cesarean|c-section|comparative\s+analysis/i.test(value)) {
-    return NVD_CSECTION_COMPARATIVE_RULES;
-  }
-  if (isFormAssignmentTask(value) || /nursing\s+assignment\s+sheet|نموذج\s+تكليف\s+تمريضي/i.test(value)) {
-    return NURSING_ASSIGNMENT_SHEET_RULES;
-  }
-  return "";
-}
-
-function cleanNursingAssignmentOutput(text) {
-  let value = String(text || "")
-    .replace(/^\s*(?:TRAINING\s*SAMPLE|DATA\s*ARE\s*FICTIONAL)\s*[-—:]*.*$/gim, "")
-    .replace(/^\s*(?:نموذج\s+تدريبي|البيانات\s+افتراضية|بيانات\s+افتراضية)\s*[-—:：]*.*$/gim, "")
-    .replace(/^\s*(?:page|صفحة)\s+\d+\s*$/gim, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
-  const shiftA = /^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?\s*(?:SHIFT\s*A\b|SHIFT\s*1\b|الشفت\s*(?:A|أ|الأول|الاول)\b|شفت\s*(?:A|أ|الأول|الاول)\b|الوردية\s*(?:A|أ|الأولى|الاولى)\b).*$/gim;
-  const shiftB = /^\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?\s*(?:SHIFT\s*B\b|SHIFT\s*2\b|الشفت\s*(?:B|ب|الثاني|الثانى)\b|شفت\s*(?:B|ب|الثاني|الثانى)\b|الوردية\s*(?:B|ب|الثانية|الثانيه)\b).*$/gim;
-  const aMatches = [...value.matchAll(shiftA)];
-  const bMatches = [...value.matchAll(shiftB)];
-
-  // Keep the first complete A and B only; this removes draft pages and repeated forms.
-  if (aMatches.length && bMatches.length) {
-    const firstA = aMatches[0];
-    const nextB = bMatches.find((match) => match.index > firstA.index);
-    if (nextB) {
-      const nextAAfterB = aMatches.find((match) => match.index > nextB.index);
-      const endOfB = nextAAfterB ? nextAAfterB.index : value.length;
-      value = `${value.slice(firstA.index, nextB.index).trim()}\n\n${value.slice(nextB.index, endOfB).trim()}`;
-    }
-  }
-
-  return value
-    .replace(/TRAINING\s*SAMPLE\s*[-—:]\s*DATA\s*ARE\s*FICTIONAL/gi, "")
-    .replace(/(?:TRAINING\s*SAMPLE|DATA\s*ARE\s*FICTIONAL)\s*[-—:：]*/gi, "")
-    .replace(/(?:نموذج\s+تدريبي|البيانات\s+افتراضية|بيانات\s+افتراضية)\s*[-—:：]*/gi, "")
-    .replace(/^\s*(?:TRAINING\s*SAMPLE|DATA\s*ARE\s*FICTIONAL)\s*[-—:]*.*$/gim, "")
-    .replace(/^\s*(?:نموذج\s+تدريبي|البيانات\s+افتراضية|بيانات\s+افتراضية)\s*[-—:：]*.*$/gim, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-async function openRouterCompletionWithFallback(models, messages, maxTokens, temperature = 0.1) {
-  const candidates = [...new Set(models.filter(Boolean))];
-  let lastResult = { ok: false, status: 502, message: "no_model_available" };
-  for (const model of candidates) {
-    const result = await openRouterCompletion(model, messages, maxTokens, temperature);
-    if (result.ok) return result;
-    lastResult = result;
-  }
-  return lastResult;
-}
 
 async function openRouterCompletion(model, messages, maxTokens, temperature = 0.1) {
   const controller = new AbortController();
@@ -2259,6 +2129,7 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
         messages,
         max_tokens: maxTokens,
         temperature,
+        top_p: 0.9,
         stream: false
       }),
       signal: controller.signal
@@ -2287,60 +2158,33 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
 }
 
 async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
+  const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
   const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
-  const profileRules = assignmentProfile(`${systemPrompt || ""}\n${prompt || ""}`);
-  const pipelineModels = isArabicRequest
-    ? [ARABIC_MODEL, ...OPENROUTER_MODELS]
-    : OPENROUTER_MODELS;
   const effectiveSystemPrompt = [
     systemPrompt,
-    formTask ? FORM_ASSIGNMENT_RULES : "",
-    profileRules
+    formTask ? FORM_ASSIGNMENT_RULES : ""
   ].filter(Boolean).join("\n\n");
   const draftMessages = [
     { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
     { role: "user", content: String(prompt) }
   ];
-  const draft = await openRouterCompletionWithFallback(pipelineModels, draftMessages, maxTokens, 0.1);
+  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
   if (!draft.ok) return draft;
 
+  // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
   const reviewModel = REVIEW_MODELS.find((model) => OPENROUTER_MODELS.includes(model))
-    || (isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0]);
-  const audit = await openRouterCompletionWithFallback(
-    [reviewModel, ...REVIEW_MODELS, ...pipelineModels],
-    [
-      {
-        role: "system",
-        content: `أنت مدقق جودة صارم للواجبات الأكاديمية والملفات التمريضية.
-راجع المسودة مقابل الطلب الأصلي فقط. اكتب قائمة أخطاء عملية مختصرة تشمل: الحقول الناقصة،
-التكرار، النماذج الأولية، زيادة الصفحات، خلط اللغة، المعلومات غير الموثوقة، والمراجع المختلقة.
-لا تعِد كتابة الواجب ولا تضف محتوى جديداً.`
-      },
-      {
-        role: "user",
-        content: `الطلب الأصلي:\n${String(prompt).slice(0, 60000)}\n\nالمسودة:\n${String(draft.content).slice(0, 50000)}`
-      }
-    ],
-    Math.min(3000, Math.max(1800, Math.floor(maxTokens * 0.35))),
-    0.05
-  );
-  const auditText = audit.ok ? audit.content : "نفّذ تدقيقاً مستقلاً بنفسك قبل إخراج النسخة النهائية.";
+    || primaryModel;
   const reviewPrompt = `
 أنت محرر أكاديمي ومراجع جودة نهائي.
 أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
 صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
 لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
-لا تخترع مراجع أو DOI أو أرقاماً علمية. إذا لم يمكن التحقق من المصدر فاكتب [SOURCE NEEDS VERIFICATION].
-  في نموذج الشفتين فقط، استخدم أرقام مرضى وأوقاتاً وبيانات طاقم افتراضية متسقة إذا لم يقدم
-  المستخدم بيانات فعلية، لكن لا تضف أي وسم أو عبارة تدريبية إلى الناتج النهائي.
+لا تخترع مراجع أو DOI أو أرقاماً علمية. في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
+وبيانات طاقم افتراضية متسقة إذا لم يقدم المستخدم بيانات فعلية، مع إبقاء وسم "البيانات افتراضية".
 أخرج نص الواجب النهائي فقط.
 ${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
 ${FORM_ASSIGNMENT_RULES}
 تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
-${profileRules ? `\nطبّق قالب المهمة المتخصص التالي حرفياً:\n${profileRules}` : ""}
-
-تقرير المدقق المستقل (صحح ما يلزم ولا تنقله إلى الناتج):
-${String(auditText).slice(0, 12000)}
 
 الطلب الأصلي وتعليمات الدكتور:
 ${String(prompt).slice(0, 60000)}
@@ -2348,8 +2192,8 @@ ${String(prompt).slice(0, 60000)}
 المسودة:
 ${String(draft.content).slice(0, 50000)}
 `;
-  const reviewed = await openRouterCompletionWithFallback(
-    [reviewModel, ...REVIEW_MODELS, ...pipelineModels],
+  const reviewed = await openRouterCompletion(
+    reviewModel,
     [
       { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
       { role: "user", content: reviewPrompt }
@@ -2357,16 +2201,12 @@ ${String(draft.content).slice(0, 50000)}
     maxTokens,
     0.1
   );
-  if (!reviewed.ok) {
-    return formTask
-      ? { ...draft, content: cleanNursingAssignmentOutput(draft.content) }
-      : draft;
-  }
+  if (!reviewed.ok) return draft;
 
   // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
   if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
-    const repaired = await openRouterCompletionWithFallback(
-      [reviewModel, ...REVIEW_MODELS, ...pipelineModels],
+    const repaired = await openRouterCompletion(
+      reviewModel,
       [
         {
           role: "system",
@@ -2389,78 +2229,9 @@ ${String(reviewed.content).slice(0, 60000)}`
       maxTokens,
       0.05
     );
-    const finalResult = repaired.ok ? repaired : reviewed;
-    return formTask
-      ? { ...finalResult, content: cleanNursingAssignmentOutput(finalResult.content) }
-      : finalResult;
+    return repaired.ok ? repaired : reviewed;
   }
-  return formTask
-    ? { ...reviewed, content: cleanNursingAssignmentOutput(reviewed.content) }
-    : reviewed;
-}
-
-async function generateHighAccuracyWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
-  const pipelineModels = isArabicRequest
-    ? [ARABIC_MODEL, ...OPENROUTER_MODELS]
-    : OPENROUTER_MODELS;
-  const baseSystem = [
-    AI_QUALITY_SYSTEM,
-    `طبّق تدقيقاً متعدد المراحل. لا تخترع حقائق أو مراجع أو DOI أو أرقاماً.
-إذا تعذر التحقق فاكتب [SOURCE NEEDS VERIFICATION]. أخرج النتيجة المطلوبة فقط.`
-  ];
-  const draft = await openRouterCompletionWithFallback(
-    pipelineModels,
-    [
-      { role: "system", content: [...baseSystem, systemPrompt].filter(Boolean).join("\n\n") },
-      { role: "user", content: String(prompt) }
-    ],
-    maxTokens,
-    0.1
-  );
-  if (!draft.ok) return draft;
-
-  const audit = await openRouterCompletionWithFallback(
-    [REVIEW_MODELS[0], ...REVIEW_MODELS, ...pipelineModels],
-    [
-      {
-        role: "system",
-        content: `أنت مدقق مستقل. افحص المسودة مقابل الطلب الأصلي من ناحية الدقة،
-الاكتمال، البنية، اللغة، التكرار، السلامة الطبية، والمراجع. أخرج ملاحظات تصحيحية فقط،
-ولا تعِد كتابة المسودة ولا تخترع بديلاً.`
-      },
-      {
-        role: "user",
-        content: `الطلب:\n${String(prompt).slice(0, 60000)}\n\nالمسودة:\n${String(draft.content).slice(0, 60000)}`
-      }
-    ],
-    Math.min(3000, Math.max(1800, Math.floor(maxTokens * 0.35))),
-    0.05
-  );
-
-  const final = await openRouterCompletionWithFallback(
-    [REVIEW_MODELS[0], ...REVIEW_MODELS, ...pipelineModels],
-    [
-      { role: "system", content: [...baseSystem, systemPrompt].filter(Boolean).join("\n\n") },
-      {
-        role: "user",
-        content: `أخرج نسخة نهائية جاهزة للتسليم من المسودة.
-التزم بالطلب الأصلي حرفياً، أصلح كل ملاحظات التدقيق، احذف التكرار والحشو،
-ولا تذكر التدقيق أو الذكاء الاصطناعي.
-
-الطلب الأصلي:
-${String(prompt).slice(0, 60000)}
-
-تقرير التدقيق:
-${audit.ok ? String(audit.content).slice(0, 12000) : "دقّق بنفسك قبل الإخراج."}
-
-المسودة:
-${String(draft.content).slice(0, 60000)}`
-      }
-    ],
-    maxTokens,
-    0.05
-  );
-  return final.ok ? final : draft;
+  return reviewed;
 }
 
 // ══════════════════════════════════════════════
@@ -2469,7 +2240,7 @@ ${String(draft.content).slice(0, 60000)}`
 // ══════════════════════════════════════════════
 app.post("/api/ai/call", async (req, res) => {
   const { provider = "gemini", prompt, systemPrompt = "", maxTokens } = req.body || {};
-  if (!SUPPORTED_AI_PROVIDERS.has(String(provider).toLowerCase())) {
+  if (provider !== "gemini") {
     res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
     return;
   }
@@ -2490,14 +2261,15 @@ app.post("/api/ai/call", async (req, res) => {
   if (!aiUser) return;
 
   const safeMaxTokens = Math.min(
-    Math.max(Number(maxTokens) || 7000, 1000),
+    Math.max(Number(maxTokens) || 12000, 1000),
     AI_MAX_TOKENS_PER_REQUEST
   );
 
   const requestText = `${systemPrompt || ""}\n${prompt}`;
   const isArabicRequest = /[\u0600-\u06ff]/.test(requestText);
-  const normalizedProvider = String(provider).toLowerCase();
-  const requestModels = modelsForProvider(normalizedProvider, isArabicRequest);
+  const requestModels = isArabicRequest
+    ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
+    : OPENROUTER_MODELS;
   let lastError = null;
 
   try {
@@ -2513,25 +2285,6 @@ app.post("/api/ai/call", async (req, res) => {
           ok: true,
           content: qualityResult.content,
           provider: "openrouter-quality-pipeline",
-          models: [isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0], qualityResult.model]
-        });
-        return;
-      }
-      lastError = qualityResult;
-    }
-
-    if (isHighAccuracyTask(requestText) && !isAssignmentTask(requestText)) {
-      const qualityResult = await generateHighAccuracyWithReview(
-        prompt,
-        systemPrompt,
-        safeMaxTokens,
-        isArabicRequest
-      );
-      if (qualityResult.ok) {
-        res.json({
-          ok: true,
-          content: qualityResult.content,
-          provider: "openrouter-multi-agent",
           models: [isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0], qualityResult.model]
         });
         return;
@@ -2561,6 +2314,7 @@ app.post("/api/ai/call", async (req, res) => {
             messages,
             max_tokens: safeMaxTokens,
             temperature: isHighAccuracyTask(requestText) ? 0.1 : 0.2,
+            top_p: 0.9,
             stream: false
           }),
           signal: controller.signal
@@ -2636,7 +2390,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
   const aiUser = await requireAiUser(req, res, maxTokens);
   if (!aiUser) return;
   const safeMaxTokens = Math.min(
-    Math.max(Number(maxTokens) || 3500, 1000),
+    Math.max(Number(maxTokens) || 12000, 1000),
     AI_MAX_TOKENS_PER_REQUEST
   );
 
@@ -2693,6 +2447,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
             messages,
             max_tokens: safeMaxTokens,
             temperature: isHighAccuracyTask(`${systemPrompt}\n${prompt}`) ? 0.1 : 0.2,
+            top_p: 0.9,
             stream: true
           }),
           signal: ctrl.signal
@@ -2810,8 +2565,8 @@ app.post("/api/openrouter/vision", async (req, res) => {
   const aiUser = await requireAiUser(req, res, maxTokens);
   if (!aiUser) return;
   const safeMaxTokens = Math.min(
-    Math.max(Number(maxTokens) || 2000, 1000),
-    Math.min(AI_MAX_TOKENS_PER_REQUEST, 3500)
+    Math.max(Number(maxTokens) || 12000, 1000),
+    AI_MAX_TOKENS_PER_REQUEST
   );
   console.log("[AI] vision request", {
     user: aiUser.email,
@@ -2820,7 +2575,8 @@ app.post("/api/openrouter/vision", async (req, res) => {
     maxTokens: safeMaxTokens
   });
   const VISION_MODELS = [
-    safeOpenRouterModel(process.env.AI_VISION_MODEL, "google/gemini-2.5-flash"),
+    safeOpenRouterModel(process.env.AI_VISION_MODEL, "google/gemini-2.5-pro"),
+    "google/gemini-2.5-flash",
     "openai/gpt-4.1-mini",
     "qwen/qwen2.5-vl-72b-instruct"
   ].filter((model, index, all) => model && all.indexOf(model) === index);
@@ -2855,7 +2611,8 @@ app.post("/api/openrouter/vision", async (req, res) => {
             }
           ],
           max_tokens: safeMaxTokens,
-          temperature: 0.1
+          temperature: 0.1,
+          top_p: 0.9
         }),
         signal: ctrl.signal
       });
