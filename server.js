@@ -199,7 +199,7 @@ async function initDB() {
       notes          TEXT DEFAULT '',
       status         TEXT DEFAULT 'pending',
       created_at     BIGINT NOT NULL
-    )
+    );
     CREATE TABLE IF NOT EXISTS private_tutor_rooms (
       id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
       booking_id TEXT REFERENCES private_tutor_bookings(id) ON DELETE SET NULL,
