@@ -62,6 +62,21 @@ const db = {
   }
 };
 
+async function withDbTransaction(work) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // يبدأ HTTP فوراً، وتنتظر طلبات الدخول جاهزية قاعدة البيانات
 let dbReady = false;
 let dbInitError = null;
@@ -175,8 +190,14 @@ async function initDB() {
       bio            TEXT DEFAULT '',
       subject        TEXT DEFAULT '',
       image_url      TEXT DEFAULT '',
+      video_url      TEXT DEFAULT '',
+      lesson_price   NUMERIC(10,2) DEFAULT 0,
       monthly_price  NUMERIC(10,2) DEFAULT 0,
-      salla_url      TEXT NOT NULL,
+      daily_salla_url TEXT DEFAULT '',
+      monthly_salla_url TEXT DEFAULT '',
+      package_salla_url TEXT DEFAULT '',
+      package_lessons INTEGER DEFAULT 10,
+      salla_url      TEXT DEFAULT '',
       active         BOOLEAN DEFAULT TRUE,
       created_at     BIGINT NOT NULL
     );
@@ -185,6 +206,8 @@ async function initDB() {
       tutor_id       TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
       code           TEXT UNIQUE NOT NULL,
       student_email  TEXT,
+      plan           TEXT DEFAULT 'month',
+      lessons_remaining INTEGER DEFAULT 0,
       status         TEXT DEFAULT 'available',
       expires_at     BIGINT,
       activated_at   BIGINT,
@@ -199,6 +222,20 @@ async function initDB() {
       notes          TEXT DEFAULT '',
       status         TEXT DEFAULT 'pending',
       created_at     BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS private_tutor_payments (
+      id                TEXT PRIMARY KEY,
+      transaction_no    TEXT UNIQUE NOT NULL,
+      order_number      TEXT UNIQUE NOT NULL,
+      tutor_id          TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
+      student_email     TEXT NOT NULL,
+      plan              TEXT NOT NULL CHECK (plan IN ('lesson','month')),
+      amount            NUMERIC(10,2) NOT NULL,
+      status            TEXT DEFAULT 'pending',
+      lessons_remaining INTEGER DEFAULT 0,
+      expires_at        BIGINT DEFAULT 0,
+      paid_at           BIGINT DEFAULT 0,
+      created_at        BIGINT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS private_tutor_rooms (
       id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
@@ -228,6 +265,16 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS tutor_email TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS video_url TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS lesson_price NUMERIC(10,2) DEFAULT 0`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS monthly_price NUMERIC(10,2) DEFAULT 0`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS daily_salla_url TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS monthly_salla_url TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS package_salla_url TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS package_lessons INTEGER DEFAULT 10`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS salla_url TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutor_codes ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'month'`,
+    `ALTER TABLE private_tutor_codes ADD COLUMN IF NOT EXISTS lessons_remaining INTEGER DEFAULT 0`,
   ];
   for (const sql of safeCols) {
     try { await db.query(sql); } catch {}
@@ -2979,10 +3026,52 @@ function formatPrivateTutor(row) {
     bio: row.bio || "",
     subject: row.subject || "",
     imageUrl: row.image_url || "",
+    videoUrl: row.video_url || "",
+    lessonPrice: Number(row.lesson_price) || 0,
     monthlyPrice: Number(row.monthly_price) || 0,
-    sallaUrl: row.salla_url,
+    dailySallaUrl: row.daily_salla_url || row.salla_url || "",
+    monthlySallaUrl: row.monthly_salla_url || row.salla_url || "",
+    packageSallaUrl: row.package_salla_url || "",
+    packageLessons: Math.max(1, Number(row.package_lessons) || 10),
+    sallaUrl: row.salla_url || "",
     active: !!row.active,
     createdAt: Number(row.created_at) || 0
+  };
+}
+
+async function tutorEntitlement(tutorId, email) {
+  const normalizedEmail = String(email || "").toLowerCase();
+  const now = Date.now();
+  const paid = await db.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN plan='lesson' AND lessons_remaining>0 THEN lessons_remaining ELSE 0 END),0) AS lessons_remaining,
+       COALESCE(MAX(CASE WHEN plan='month' AND expires_at>$3 THEN expires_at ELSE 0 END),0) AS month_expires_at
+     FROM private_tutor_payments
+     WHERE tutor_id=$1 AND student_email=$2 AND status='paid'`,
+    [tutorId, normalizedEmail, now]
+  );
+  const legacy = await db.query(
+    `SELECT 1 FROM private_tutor_codes
+     WHERE tutor_id=$1 AND student_email=$2 AND status='active'
+     AND (plan='month' OR lessons_remaining>0 OR plan IS NULL)
+     AND (expires_at IS NULL OR expires_at>$3) LIMIT 1`,
+    [tutorId, normalizedEmail, now]
+  );
+  const lessonsRemaining = Number(paid.rows[0]?.lessons_remaining) || 0;
+  const monthExpiresAt = Number(paid.rows[0]?.month_expires_at) || 0;
+  return {
+    lessonsRemaining,
+    monthExpiresAt,
+    legacyActive: legacy.rows.length > 0,
+    active: legacy.rows.length > 0 || lessonsRemaining > 0 || monthExpiresAt > now
+  };
+}
+
+async function tutorPaymentPlan(tutorId, email) {
+  const ent = await tutorEntitlement(tutorId, email);
+  return {
+    ...ent,
+    canBook: ent.active
   };
 }
 
@@ -2995,6 +3084,166 @@ app.get("/api/private-tutors", async (_req, res) => {
   } catch (e) {
     console.error("private tutors list:", e.message);
     res.status(500).json({ ok: false, tutors: [] });
+  }
+});
+
+app.get("/api/private-tutors/:id/payment-options", async (req, res) => {
+  try {
+    const result = await db.query(
+      "SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE LIMIT 1",
+      [String(req.params.id || "")]
+    );
+    if (!result.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
+    const tutor = result.rows[0];
+    res.json({
+      ok: true,
+      tutor: formatPrivateTutor(tutor),
+      options: {
+        lesson: Number(tutor.lesson_price) || 0,
+        month: Number(tutor.monthly_price) || 0
+      }
+    });
+  } catch (e) {
+    console.error("private tutor payment options:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر تحميل خيارات الدفع" });
+  }
+});
+
+app.post("/api/private-tutors/:id/payment/create", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const tutorResult = await db.query(
+      "SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE LIMIT 1",
+      [String(req.params.id || "")]
+    );
+    if (!tutorResult.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
+    const tutor = tutorResult.rows[0];
+    const plan = req.body?.plan === "month" ? "month" : req.body?.plan === "lesson" ? "lesson" : "";
+    const amount = plan === "lesson" ? Number(tutor.lesson_price) : Number(tutor.monthly_price);
+    if (!plan || !Number.isFinite(amount) || amount < 5) {
+      return res.status(400).json({ ok: false, msg: "خيار الدفع غير متاح لهذا المعلم" });
+    }
+    const orderNumber = `TUTOR-${Date.now()}-${randomBytes(3).toString("hex")}`;
+    const invoice = await paylinkFetch("/api/addInvoice", {
+      method: "POST",
+      body: JSON.stringify({
+        amount: Number(amount.toFixed(2)),
+        currency: "SAR",
+        orderNumber,
+        clientName: String(user.full_name || user.email || "A+ Student").slice(0, 100),
+        clientEmail: user.email,
+        clientMobile: String(req.body?.mobile || "0500000000"),
+        callBackUrl: `${(process.env.FRONTEND_URL || "https://aplus.blog").replace(/\/$/, "")}/?payment=tutor`,
+        note: `A+ Medical - ${tutor.name} - ${plan === "month" ? "اشتراك شهر" : "شرح واحد"}`,
+        products: [{
+          title: `${tutor.name} - ${plan === "month" ? "اشتراك شهر" : "شرح واحد"}`,
+          price: Number(amount.toFixed(2)),
+          qty: 1,
+          isDigital: true
+        }]
+      })
+    });
+    if (!invoice.url || !invoice.transactionNo) throw new Error("Paylink returned an invalid invoice");
+    await db.query(
+      `INSERT INTO private_tutor_payments
+       (id,transaction_no,order_number,tutor_id,student_email,plan,amount,status,lessons_remaining,expires_at,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0,0,$8)`,
+      [privateTutorId(), String(invoice.transactionNo), orderNumber, tutor.id,
+        String(user.email).toLowerCase(), plan, Number(amount.toFixed(2)), Date.now()]
+    );
+    res.json({
+      ok: true,
+      url: invoice.url,
+      transactionNo: String(invoice.transactionNo),
+      plan,
+      amount: Number(amount.toFixed(2)),
+      tutorName: tutor.name
+    });
+  } catch (e) {
+    console.error("private tutor payment create:", e.message);
+    res.status(502).json({ ok: false, msg: "تعذر إنشاء فاتورة الدفع" });
+  }
+});
+
+app.post("/api/private-tutors/:id/payment/confirm", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const transactionNo = String(req.body?.transactionNo || "").trim();
+    if (!transactionNo) return res.status(400).json({ ok: false, msg: "رقم العملية مطلوب" });
+    const paymentResult = await db.query(
+      `SELECT p.*, t.name AS tutor_name
+       FROM private_tutor_payments p JOIN private_tutors t ON t.id=p.tutor_id
+       WHERE p.transaction_no=$1 AND p.tutor_id=$2 AND p.student_email=$3 LIMIT 1`,
+      [transactionNo, String(req.params.id || ""), String(user.email).toLowerCase()]
+    );
+    if (!paymentResult.rows.length) return res.status(404).json({ ok: false, msg: "عملية الدفع غير موجودة" });
+    const payment = paymentResult.rows[0];
+    if (payment.status === "paid") {
+      const access = await tutorPaymentPlan(payment.tutor_id, user.email);
+      return res.json({ ok: true, paid: true, access });
+    }
+    const invoice = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(transactionNo)}`);
+    const paid = String(invoice.orderStatus || "").toLowerCase() === "paid";
+    if (!paid) return res.status(400).json({ ok: false, msg: "لم يتم تأكيد الدفع بعد" });
+    const invoiceAmount = Number(invoice.amount);
+    if (Number.isFinite(invoiceAmount) && Math.abs(invoiceAmount - Number(payment.amount)) > 0.01) {
+      return res.status(400).json({ ok: false, msg: "قيمة الفاتورة لا تطابق سعر الخدمة" });
+    }
+    const now = Date.now();
+    await withDbTransaction(async (client) => {
+      const locked = await client.query(
+        "SELECT * FROM private_tutor_payments WHERE id=$1 FOR UPDATE",
+        [payment.id]
+      );
+      if (!locked.rows.length || locked.rows[0].status === "paid") return;
+      if (payment.plan === "month") {
+        const current = await client.query(
+          `SELECT COALESCE(MAX(expires_at),0) AS expires_at
+           FROM private_tutor_payments
+           WHERE tutor_id=$1 AND student_email=$2 AND plan='month' AND status='paid'`,
+          [payment.tutor_id, String(user.email).toLowerCase()]
+        );
+        const expiresAt = Math.max(now, Number(current.rows[0]?.expires_at) || 0) + 30 * 86_400_000;
+        await client.query(
+          `UPDATE private_tutor_payments
+           SET status='paid',lessons_remaining=0,expires_at=$1,paid_at=$2
+           WHERE id=$3`,
+          [expiresAt, now, payment.id]
+        );
+      } else {
+        await client.query(
+          `UPDATE private_tutor_payments
+           SET status='paid',lessons_remaining=1,expires_at=$1,paid_at=$2
+           WHERE id=$3`,
+          [now + 90 * 86_400_000, now, payment.id]
+        );
+      }
+    });
+    const access = await tutorPaymentPlan(payment.tutor_id, user.email);
+    broadcastEvent({ type: "private_tutor_payment", tutorId: payment.tutor_id, email: user.email });
+    res.json({ ok: true, paid: true, access });
+  } catch (e) {
+    console.error("private tutor payment confirm:", e.message);
+    res.status(502).json({ ok: false, msg: "تعذر تأكيد الدفع" });
+  }
+});
+
+app.get("/api/private-tutors/:id/subscription", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.json({ ok: true, active: false, canBook: false, lessonsRemaining: 0, expiresAt: 0 });
+    const access = await tutorPaymentPlan(String(req.params.id || ""), user.email);
+    res.json({
+      ok: true,
+      active: access.active,
+      canBook: access.canBook,
+      lessonsRemaining: access.lessonsRemaining,
+      expiresAt: access.monthExpiresAt
+    });
+  } catch {
+    res.status(500).json({ ok: false, active: false, canBook: false, lessonsRemaining: 0, expiresAt: 0 });
   }
 });
 
@@ -3017,7 +3266,8 @@ app.get("/api/admin/private-tutors", async (req, res) => {
       tutors: tutors.rows.map(formatPrivateTutor),
       codes: codes.rows.map((c) => ({
         id: c.id, tutorId: c.tutor_id, code: c.code,
-        studentEmail: c.student_email || "", status: c.status,
+        studentEmail: c.student_email || "", plan: c.plan || "month",
+        lessonsRemaining: Number(c.lessons_remaining) || 0, status: c.status,
         expiresAt: Number(c.expires_at) || 0
       })),
       bookings: bookings.rows.map((b) => ({
@@ -3042,19 +3292,27 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     const bio = String(body.bio || "").trim().slice(0, 2000);
     const subject = String(body.subject || "").trim().slice(0, 120);
     const imageUrl = String(body.imageUrl || "").trim().slice(0, 1000);
+    const videoUrl = String(body.videoUrl || "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl || "").trim().slice(0, 1500);
+    const lessonPrice = Math.max(0, Number(body.lessonPrice) || 0);
     const monthlyPrice = Math.max(0, Number(body.monthlyPrice) || 0);
-    if (!name || !sallaUrl) {
-      return res.status(400).json({ ok: false, msg: "اسم المعلم ورابط سلة مطلوبان" });
+    const dailySallaUrl = String(body.dailySallaUrl || "").trim().slice(0, 1500);
+    const monthlySallaUrl = String(body.monthlySallaUrl || "").trim().slice(0, 1500);
+    const packageSallaUrl = String(body.packageSallaUrl || "").trim().slice(0, 1500);
+    const packageLessons = Math.min(100, Math.max(1, Number(body.packageLessons) || 10));
+    if (!name || !subject || (lessonPrice < 5 && monthlyPrice < 5)) {
+      return res.status(400).json({ ok: false, msg: "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
     }
-    if (!/^https?:\/\//i.test(sallaUrl)) {
+    if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
     }
     const result = await db.query(
       `INSERT INTO private_tutors
-       (id,name,bio,subject,image_url,monthly_price,salla_url,active,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,$8) RETURNING *`,
-      [privateTutorId(), name, bio, subject, imageUrl, monthlyPrice, sallaUrl, Date.now()]
+       (id,name,bio,subject,image_url,video_url,lesson_price,monthly_price,
+        daily_salla_url,monthly_salla_url,package_salla_url,package_lessons,salla_url,active,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,$14) RETURNING *`,
+      [privateTutorId(), name, bio, subject, imageUrl, videoUrl, lessonPrice, monthlyPrice,
+        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, Date.now()]
     );
     broadcastEvent({ type: "private_tutors_updated" });
     res.status(201).json({ ok: true, tutor: formatPrivateTutor(result.rows[0]) });
@@ -3079,13 +3337,28 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
     const bio = String(body.bio ?? old.bio ?? "").trim().slice(0, 2000);
     const subject = String(body.subject ?? old.subject ?? "").trim().slice(0, 120);
     const imageUrl = String(body.imageUrl ?? old.image_url ?? "").trim().slice(0, 1000);
+    const videoUrl = String(body.videoUrl ?? old.video_url ?? "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl ?? old.salla_url).trim().slice(0, 1500);
+    const lessonPrice = Math.max(0, Number(body.lessonPrice ?? old.lesson_price) || 0);
     const monthlyPrice = Math.max(0, Number(body.monthlyPrice ?? old.monthly_price) || 0);
+    const dailySallaUrl = String(body.dailySallaUrl ?? old.daily_salla_url ?? old.salla_url ?? "").trim().slice(0, 1500);
+    const monthlySallaUrl = String(body.monthlySallaUrl ?? old.monthly_salla_url ?? old.salla_url ?? "").trim().slice(0, 1500);
+    const packageSallaUrl = String(body.packageSallaUrl ?? old.package_salla_url ?? "").trim().slice(0, 1500);
+    const packageLessons = Math.min(100, Math.max(1, Number(body.packageLessons ?? old.package_lessons) || 10));
     const active = body.active === undefined ? !!old.active : !!body.active;
+    if (!name || !subject || (lessonPrice < 5 && monthlyPrice < 5)) {
+      return res.status(400).json({ ok: false, msg: "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
+    }
+    if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
+      return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
+    }
     const result = await db.query(
       `UPDATE private_tutors SET name=$1,bio=$2,subject=$3,image_url=$4,
-       monthly_price=$5,salla_url=$6,active=$7 WHERE id=$8 RETURNING *`,
-      [name, bio, subject, imageUrl, monthlyPrice, sallaUrl, active, id]
+       video_url=$5,lesson_price=$6,monthly_price=$7,daily_salla_url=$8,
+       monthly_salla_url=$9,package_salla_url=$10,package_lessons=$11,
+       salla_url=$12,active=$13 WHERE id=$14 RETURNING *`,
+      [name, bio, subject, imageUrl, videoUrl, lessonPrice, monthlyPrice,
+        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, active, id]
     );
     broadcastEvent({ type: "private_tutors_updated" });
     res.json({ ok: true, tutor: formatPrivateTutor(result.rows[0]) });
@@ -3102,11 +3375,16 @@ app.post("/api/admin/private-tutor-codes", async (req, res) => {
     }
     const tutorId = String(req.body?.tutorId || "");
     const studentEmail = String(req.body?.studentEmail || "").trim().toLowerCase();
-    const days = Math.min(366, Math.max(1, Number(req.body?.days) || 30));
-    const tutor = await db.query("SELECT id FROM private_tutors WHERE id=$1", [tutorId]);
+    const plan = ["daily", "month", "package"].includes(String(req.body?.plan || ""))
+      ? String(req.body.plan) : "month";
+    const tutor = await db.query("SELECT * FROM private_tutors WHERE id=$1", [tutorId]);
     if (!tutor.rows.length) {
       return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
     }
+    const defaultDays = plan === "daily" ? 1 : plan === "package" ? 90 : 30;
+    const days = Math.min(366, Math.max(1, Number(req.body?.days) || defaultDays));
+    const lessons = plan === "daily" ? 1 :
+      plan === "package" ? Math.min(100, Math.max(1, Number(req.body?.lessons) || Number(tutor.rows[0].package_lessons) || 10)) : 0;
     let code = privateTutorCode();
     for (let i = 0; i < 5; i++) {
       const exists = await db.query("SELECT 1 FROM private_tutor_codes WHERE code=$1", [code]);
@@ -3115,16 +3393,16 @@ app.post("/api/admin/private-tutor-codes", async (req, res) => {
     }
     const result = await db.query(
       `INSERT INTO private_tutor_codes
-       (id,tutor_id,code,student_email,status,expires_at,created_at)
-       VALUES ($1,$2,$3,$4,'available',$5,$6) RETURNING *`,
+       (id,tutor_id,code,student_email,plan,lessons_remaining,status,expires_at,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'available',$7,$8) RETURNING *`,
       [privateTutorId(), tutorId, code, studentEmail || null,
-        Date.now() + days * 86_400_000, Date.now()]
+        plan, lessons, Date.now() + days * 86_400_000, Date.now()]
     );
     res.status(201).json({
       ok: true,
       code: {
         id: result.rows[0].id, tutorId, code, studentEmail,
-        expiresAt: Number(result.rows[0].expires_at)
+        plan, lessonsRemaining: lessons, expiresAt: Number(result.rows[0].expires_at)
       }
     });
   } catch (e) {
@@ -3160,30 +3438,14 @@ app.post("/api/private-tutors/:id/activate", async (req, res) => {
       ok: true,
       subscription: {
         tutorId, code: result.rows[0].code,
+        plan: result.rows[0].plan || "month",
+        lessonsRemaining: Number(result.rows[0].lessons_remaining) || 0,
         expiresAt: Number(result.rows[0].expires_at) || 0
       }
     });
   } catch (e) {
     console.error("private tutor activate:", e.message);
     res.status(500).json({ ok: false, msg: "تعذر تفعيل الاشتراك" });
-  }
-});
-
-app.get("/api/private-tutors/:id/subscription", async (req, res) => {
-  try {
-    const user = await privateTutorUser(req);
-    if (!user) return res.json({ ok: true, active: false });
-    const result = await db.query(
-      `SELECT * FROM private_tutor_codes
-       WHERE tutor_id=$1 AND student_email=$2 AND status='active'
-       AND (expires_at IS NULL OR expires_at>$3)
-       ORDER BY activated_at DESC LIMIT 1`,
-      [String(req.params.id || ""), user.email.toLowerCase(), Date.now()]
-    );
-    const row = result.rows[0];
-    res.json({ ok: true, active: !!row, expiresAt: row ? Number(row.expires_at) || 0 : 0 });
-  } catch {
-    res.status(500).json({ ok: false, active: false });
   }
 });
 
@@ -3198,32 +3460,77 @@ app.post("/api/private-tutors/:id/bookings", async (req, res) => {
     if (!dayOfWeek || !timeText) {
       return res.status(400).json({ ok: false, msg: "اختر اليوم والوقت" });
     }
-    const active = await db.query(
-      `SELECT 1 FROM private_tutor_codes
-       WHERE tutor_id=$1 AND student_email=$2 AND status='active'
-       AND (expires_at IS NULL OR expires_at>$3) LIMIT 1`,
-      [tutorId, user.email.toLowerCase(), Date.now()]
-    );
-    if (!active.rows.length) {
-      return res.status(403).json({ ok: false, msg: "فعّل الاشتراك أولاً" });
-    }
-    await db.query(
-      "UPDATE private_tutor_bookings SET status='replaced' WHERE tutor_id=$1 AND student_email=$2 AND status='pending'",
-      [tutorId, user.email.toLowerCase()]
-    );
-    const result = await db.query(
-      `INSERT INTO private_tutor_bookings
-       (id,tutor_id,student_email,day_of_week,time_text,notes,status,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) RETURNING *`,
-      [privateTutorId(), tutorId, user.email.toLowerCase(), dayOfWeek, timeText, notes, Date.now()]
-    );
+    const studentEmail = String(user.email).toLowerCase();
+    const result = await withDbTransaction(async (client) => {
+      const now = Date.now();
+      const month = await client.query(
+        `SELECT id FROM private_tutor_payments
+         WHERE tutor_id=$1 AND student_email=$2 AND plan='month' AND status='paid'
+         AND expires_at>$3 ORDER BY expires_at DESC LIMIT 1 FOR UPDATE`,
+        [tutorId, studentEmail, now]
+      );
+      let paidPlan = month.rows.length ? "month" : "";
+      if (!paidPlan) {
+        const lesson = await client.query(
+          `SELECT id FROM private_tutor_payments
+           WHERE tutor_id=$1 AND student_email=$2 AND plan='lesson' AND status='paid'
+           AND lessons_remaining>0 ORDER BY paid_at ASC LIMIT 1 FOR UPDATE`,
+          [tutorId, studentEmail]
+        );
+        if (lesson.rows.length) {
+          paidPlan = "lesson";
+          await client.query(
+            "UPDATE private_tutor_payments SET lessons_remaining=lessons_remaining-1 WHERE id=$1",
+            [lesson.rows[0].id]
+          );
+        }
+      }
+      if (!paidPlan) {
+        const legacy = await client.query(
+          `SELECT id,plan,lessons_remaining FROM private_tutor_codes
+           WHERE tutor_id=$1 AND student_email=$2 AND status='active'
+           AND (plan='month' OR lessons_remaining>0 OR plan IS NULL)
+           AND (expires_at IS NULL OR expires_at>$3)
+           ORDER BY activated_at ASC LIMIT 1 FOR UPDATE`,
+          [tutorId, studentEmail, now]
+        );
+        if (legacy.rows.length) {
+          const codeRow = legacy.rows[0];
+          paidPlan = codeRow.plan || "month";
+          if (paidPlan !== "month") {
+            const remaining = Math.max(0, Number(codeRow.lessons_remaining) - 1);
+            await client.query(
+              "UPDATE private_tutor_codes SET lessons_remaining=$1,status=$2 WHERE id=$3",
+              [remaining, remaining > 0 ? "active" : "used", codeRow.id]
+            );
+          }
+        }
+      }
+      if (!paidPlan) {
+        const error = new Error("payment_required");
+        error.code = "TUTOR_PAYMENT_REQUIRED";
+        throw error;
+      }
+      await client.query(
+        "UPDATE private_tutor_bookings SET status='replaced' WHERE tutor_id=$1 AND student_email=$2 AND status='pending'",
+        [tutorId, studentEmail]
+      );
+      return client.query(
+        `INSERT INTO private_tutor_bookings
+         (id,tutor_id,student_email,day_of_week,time_text,notes,status,created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) RETURNING *`,
+        [privateTutorId(), tutorId, studentEmail, dayOfWeek, timeText, notes, now]
+      );
+    });
     res.status(201).json({
       ok: true,
-      booking: {
-        id: result.rows[0].id, dayOfWeek, timeText, notes, status: "pending"
-      }
+      booking: { id: result.rows[0].id, dayOfWeek, timeText, notes, status: "pending" },
+      paidPlan: result.rows[0].paid_plan || null
     });
   } catch (e) {
+    if (e.code === "TUTOR_PAYMENT_REQUIRED") {
+      return res.status(403).json({ ok: false, msg: "ادفع قيمة شرح واحد أو اشترك شهرياً قبل الحجز" });
+    }
     console.error("private tutor booking:", e.message);
     res.status(500).json({ ok: false, msg: "تعذر حفظ الموعد" });
   }
@@ -3251,8 +3558,15 @@ async function tutorAccess(req,tutor){
   if(!row)return {user,role:null,tutor:null};
   if(tutorAdmin(user))return {user,role:"admin",tutor:row};
   if(row.tutor_email&&String(row.tutor_email).toLowerCase()===String(user.email).toLowerCase())return {user,role:"tutor",tutor:row};
-  const a=await db.query("SELECT 1 FROM private_tutor_codes WHERE tutor_id=$1 AND student_email=$2 AND status='active' AND (expires_at IS NULL OR expires_at>$3) LIMIT 1",[tutor,String(user.email).toLowerCase(),Date.now()]);
-  return {user,role:a.rows.length?"student":null,tutor:row};
+  const access=await tutorPaymentPlan(tutor,String(user.email).toLowerCase());
+  if(access.active)return {user,role:"student",tutor:row};
+  const booking=await db.query(
+    `SELECT 1 FROM private_tutor_bookings
+     WHERE tutor_id=$1 AND student_email=$2 AND status IN ('pending','confirmed')
+     ORDER BY created_at DESC LIMIT 1`,
+    [tutor,String(user.email).toLowerCase()]
+  );
+  return {user,role:booking.rows.length?"student":null,tutor:row};
 }
 async function roomAccess(req,id){
   const q=await db.query("SELECT * FROM private_tutor_rooms WHERE id=$1 LIMIT 1",[id]);const room=q.rows[0]||null;
