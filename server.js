@@ -199,6 +199,21 @@ async function initDB() {
       notes          TEXT DEFAULT '',
       status         TEXT DEFAULT 'pending',
       created_at     BIGINT NOT NULL
+    )
+    CREATE TABLE IF NOT EXISTS private_tutor_rooms (
+      id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
+      booking_id TEXT REFERENCES private_tutor_bookings(id) ON DELETE SET NULL,
+      student_email TEXT NOT NULL, tutor_email TEXT DEFAULT '', status TEXT DEFAULT 'waiting',
+      started_at BIGINT, ended_at BIGINT, created_at BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS private_tutor_messages (
+      id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES private_tutor_rooms(id) ON DELETE CASCADE,
+      sender_email TEXT NOT NULL, sender_role TEXT DEFAULT 'student', message TEXT NOT NULL, created_at BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS private_tutor_recordings (
+      id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES private_tutor_rooms(id) ON DELETE CASCADE,
+      uploaded_by TEXT NOT NULL, recording_url TEXT NOT NULL, duration_sec INTEGER DEFAULT 0,
+      mime_type TEXT DEFAULT 'video/webm', file_size BIGINT DEFAULT 0, created_at BIGINT NOT NULL
     );
   `);
 
@@ -212,6 +227,7 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS tutor_email TEXT DEFAULT ''`,
   ];
   for (const sql of safeCols) {
     try { await db.query(sql); } catch {}
@@ -3212,6 +3228,92 @@ app.post("/api/private-tutors/:id/bookings", async (req, res) => {
     res.status(500).json({ ok: false, msg: "تعذر حفظ الموعد" });
   }
 });
+
+
+
+// ══════════════════════════════════════════════════════════════
+// نظام الدروس المباشرة: WebRTC signaling + chat + recordings
+// الفيديو ينتقل مباشرة بين الطرفين عبر WebRTC، والسيرفر يمرر الإشارات فقط.
+// ══════════════════════════════════════════════════════════════
+const tutorRoomClients=new Map();
+const tutorRoomParticipants=new Map();
+const tutorId=()=>"ROOM-"+randomBytes(12).toString("hex");
+const tutorMsgId=()=>"MSG-"+randomBytes(12).toString("hex");
+const tutorRecId=()=>"REC-"+randomBytes(12).toString("hex");
+const participantId=()=>"P-"+randomBytes(10).toString("hex");
+function tutorAdmin(u){return !!(u&&(u.is_admin||u.is_super_admin||u.is_moderator||u.email===process.env.ADMIN_EMAIL));}
+function sseRoom(res,event,data){try{res.write("event: "+event+"\\ndata: "+JSON.stringify(data)+"\\n\\n");return true;}catch{return false;}}
+function emitRoom(room,event,data,except){const m=tutorRoomClients.get(room);if(!m)return;for(const [id,res] of m){if(id!==except&&!sseRoom(res,event,data))m.delete(id);}}
+function roomView(r){return {id:r.id,tutorId:r.tutor_id,bookingId:r.booking_id||null,studentEmail:r.student_email,tutorEmail:r.tutor_email||"",status:r.status,startedAt:Number(r.started_at)||0,endedAt:Number(r.ended_at)||0,createdAt:Number(r.created_at)||0};}
+async function tutorAccess(req,tutor){
+  const user=await privateTutorUser(req);if(!user)return {user:null,role:null,tutor:null};
+  const q=await db.query("SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE LIMIT 1",[tutor]);const row=q.rows[0]||null;
+  if(!row)return {user,role:null,tutor:null};
+  if(tutorAdmin(user))return {user,role:"admin",tutor:row};
+  if(row.tutor_email&&String(row.tutor_email).toLowerCase()===String(user.email).toLowerCase())return {user,role:"tutor",tutor:row};
+  const a=await db.query("SELECT 1 FROM private_tutor_codes WHERE tutor_id=$1 AND student_email=$2 AND status='active' AND (expires_at IS NULL OR expires_at>$3) LIMIT 1",[tutor,String(user.email).toLowerCase(),Date.now()]);
+  return {user,role:a.rows.length?"student":null,tutor:row};
+}
+async function roomAccess(req,id){
+  const q=await db.query("SELECT * FROM private_tutor_rooms WHERE id=$1 LIMIT 1",[id]);const room=q.rows[0]||null;
+  if(!room)return {room:null,user:null,role:null,tutor:null};
+  const a=await tutorAccess(req,room.tutor_id);return {...a,room};
+}
+
+app.post("/api/private-tutors/:id/rooms",async(req,res)=>{
+  try{
+    const a=await tutorAccess(req,String(req.params.id||""));
+    if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
+    if(!a.role)return res.status(403).json({ok:false,msg:"فعّل اشتراك المعلم أولاً"});
+    const student=a.role==="student"?String(a.user.email).toLowerCase():String(req.body?.studentEmail||"").toLowerCase().trim();
+    if(!student||!student.includes("@"))return res.status(400).json({ok:false,msg:"studentEmail مطلوب"});
+    const booking=req.body?.bookingId?String(req.body.bookingId).slice(0,120):null;
+    if(booking){const b=await db.query("SELECT 1 FROM private_tutor_bookings WHERE id=$1 AND tutor_id=$2 LIMIT 1",[booking,a.tutor.id]);if(!b.rows.length)return res.status(404).json({ok:false,msg:"الحجز غير موجود"});}
+    const id=tutorId(),now=Date.now();
+    const r=await db.query("INSERT INTO private_tutor_rooms (id,tutor_id,booking_id,student_email,tutor_email,status,created_at) VALUES ($1,$2,$3,$4,$5,'waiting',$6) RETURNING *",[id,a.tutor.id,booking,student,a.tutor.tutor_email||"",now]);
+    res.status(201).json({ok:true,room:roomView(r.rows[0]),eventsUrl:"/api/private-tutor-rooms/"+id+"/events"});
+  }catch(e){console.error("room create",e.message);res.status(500).json({ok:false,msg:"تعذر إنشاء الغرفة"});}
+});
+
+app.get("/api/private-tutor-rooms/:roomId",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room)return res.status(404).json({ok:false,msg:"الغرفة غير موجودة"});if(!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});res.json({ok:true,room:roomView(a.room)});}catch(e){res.status(500).json({ok:false,msg:"تعذر تحميل الغرفة"});}});
+
+app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
+  const id=String(req.params.roomId),a=await roomAccess(req,id);if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room)return res.status(404).json({ok:false,msg:"الغرفة غير موجودة"});if(!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
+  const p=participantId();if(!tutorRoomParticipants.has(id))tutorRoomParticipants.set(id,new Map());const ps=tutorRoomParticipants.get(id);ps.set(p,{email:a.user.email,role:a.role,joinedAt:Date.now()});
+  await db.query("UPDATE private_tutor_rooms SET status='active',started_at=COALESCE(started_at,$1) WHERE id=$2",[Date.now(),id]);
+  emitRoom(id,"participant-joined",{participantId:p,role:a.role,email:a.user.email});
+  res.json({ok:true,roomId:id,participantId:p,role:a.role,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email}))});
+}catch(e){res.status(500).json({ok:false,msg:"تعذر دخول الغرفة"});}});
+
+app.get("/api/private-tutor-rooms/:roomId/events",async(req,res)=>{try{
+  const id=String(req.params.roomId),a=await roomAccess(req,id),p=String(req.query.participantId||"");if(!a.user)return res.status(401).end();if(!a.room)return res.status(404).end();if(!a.role)return res.status(403).end();
+  const part=tutorRoomParticipants.get(id)?.get(p);if(!part||part.email!==a.user.email)return res.status(403).end();
+  res.writeHead(200,{"Content-Type":"text/event-stream; charset=utf-8","Cache-Control":"no-cache, no-transform","Connection":"keep-alive","X-Accel-Buffering":"no","Access-Control-Allow-Origin":"*"});
+  if(!tutorRoomClients.has(id))tutorRoomClients.set(id,new Map());const clients=tutorRoomClients.get(id);clients.set(p,res);sseRoom(res,"connected",{roomId:id,participantId:p,role:a.role});
+  emitRoom(id,"presence",{participants:[...(tutorRoomParticipants.get(id)||[])].map(([participantId,v])=>({participantId,role:v.role,email:v.email}))});
+  const close=()=>{clients.delete(p);tutorRoomParticipants.get(id)?.delete(p);emitRoom(id,"participant-left",{participantId:p});};req.on("close",close);req.on("error",close);
+}catch(e){if(!res.headersSent)res.status(500).end();}});
+
+app.post("/api/private-tutor-rooms/:roomId/signal",async(req,res)=>{try{
+  const id=String(req.params.roomId),a=await roomAccess(req,id),from=String(req.body?.from||""),to=String(req.body?.to||""),type=String(req.body?.type||"");if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
+  const p=tutorRoomParticipants.get(id)?.get(from);if(!p||p.email!==a.user.email)return res.status(403).json({ok:false,msg:"مشارك غير صالح"});if(!["offer","answer","ice-candidate","renegotiate"].includes(type))return res.status(400).json({ok:false,msg:"إشارة غير صالحة"});
+  const data={from,to,type,data:req.body?.data||null},clients=tutorRoomClients.get(id)||new Map();if(to&&clients.has(to))sseRoom(clients.get(to),"webrtc-signal",data);else emitRoom(id,"webrtc-signal",data,from);res.json({ok:true});
+}catch(e){res.status(500).json({ok:false,msg:"تعذر تمرير الاتصال"});}});
+
+app.post("/api/private-tutor-rooms/:roomId/messages",async(req,res)=>{try{
+  const id=String(req.params.roomId),a=await roomAccess(req,id),text=String(req.body?.message||"").trim().slice(0,4000);if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(!text)return res.status(400).json({ok:false,msg:"الرسالة فارغة"});
+  const r=await db.query("INSERT INTO private_tutor_messages (id,room_id,sender_email,sender_role,message,created_at) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *",[tutorMsgId(),id,a.user.email,a.role,text,Date.now()]);const x=r.rows[0],msg={id:x.id,roomId:x.room_id,senderEmail:x.sender_email,senderRole:x.sender_role,message:x.message,createdAt:Number(x.created_at)};emitRoom(id,"chat-message",msg);res.status(201).json({ok:true,message:msg});
+}catch(e){res.status(500).json({ok:false,msg:"تعذر إرسال الرسالة"});}});
+app.get("/api/private-tutor-rooms/:roomId/messages",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});const r=await db.query("SELECT * FROM private_tutor_messages WHERE room_id=$1 ORDER BY created_at ASC LIMIT 500",[a.room.id]);res.json({ok:true,messages:r.rows.map(x=>({id:x.id,roomId:x.room_id,senderEmail:x.sender_email,senderRole:x.sender_role,message:x.message,createdAt:Number(x.created_at)}))});}catch(e){res.status(500).json({ok:false,messages:[]});}});
+
+app.post("/api/private-tutor-rooms/:roomId/recordings",async(req,res)=>{try{
+  const a=await roomAccess(req,String(req.params.roomId)),url=String(req.body?.recordingUrl||"").trim();if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(!/^https?:\\/\\//i.test(url))return res.status(400).json({ok:false,msg:"رابط التسجيل غير صالح"});
+  const duration=Math.max(0,Math.min(86400,Number(req.body?.durationSec)||0)),size=Math.max(0,Number(req.body?.fileSize)||0),mime=String(req.body?.mimeType||"video/webm").slice(0,100);const r=await db.query("INSERT INTO private_tutor_recordings (id,room_id,uploaded_by,recording_url,duration_sec,mime_type,file_size,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",[tutorRecId(),a.room.id,a.user.email,url,duration,mime,size,Date.now()]);const rec={id:r.rows[0].id,roomId:a.room.id,recordingUrl:url,durationSec:duration,mimeType:mime,fileSize:size,createdAt:Number(r.rows[0].created_at)};emitRoom(a.room.id,"recording-ready",rec);res.status(201).json({ok:true,recording:rec});
+}catch(e){res.status(500).json({ok:false,msg:"تعذر حفظ التسجيل"});}});
+app.get("/api/private-tutor-rooms/:roomId/recordings",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});const r=await db.query("SELECT * FROM private_tutor_recordings WHERE room_id=$1 ORDER BY created_at DESC",[a.room.id]);res.json({ok:true,recordings:r.rows.map(x=>({id:x.id,roomId:x.room_id,recordingUrl:x.recording_url,durationSec:Number(x.duration_sec)||0,mimeType:x.mime_type,fileSize:Number(x.file_size)||0,createdAt:Number(x.created_at)}))});}catch(e){res.status(500).json({ok:false,recordings:[]});}});
+
+app.post("/api/private-tutor-rooms/:roomId/end",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(a.role!=="tutor"&&a.role!=="admin")return res.status(403).json({ok:false,msg:"المعلم فقط ينهي الدرس"});const t=Date.now(),r=await db.query("UPDATE private_tutor_rooms SET status='ended',ended_at=$1 WHERE id=$2 RETURNING *",[t,a.room.id]);emitRoom(a.room.id,"room-ended",{roomId:a.room.id,endedAt:t});res.json({ok:true,room:roomView(r.rows[0])});}catch(e){res.status(500).json({ok:false,msg:"تعذر إنهاء الدرس"});}});
+
 
 // API 404 — طلبات /api غير الموجودة تعيد JSON وليس HTML
 app.use("/api", (_req, res) => {
