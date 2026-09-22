@@ -16,6 +16,7 @@ import { randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto
 import https from "node:https";
 import nodemailer from "nodemailer";
 import path from "node:path";
+import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const { Pool } = pg;
@@ -219,9 +220,30 @@ async function initDB() {
       student_email  TEXT NOT NULL,
       day_of_week    TEXT NOT NULL,
       time_text      TEXT NOT NULL,
+      requested_date TEXT DEFAULT '',
+      requested_time TEXT DEFAULT '',
+      proposed_date  TEXT DEFAULT '',
+      proposed_time  TEXT DEFAULT '',
+      response_note  TEXT DEFAULT '',
+      responded_at   BIGINT DEFAULT 0,
       notes          TEXT DEFAULT '',
       status         TEXT DEFAULT 'pending',
       created_at     BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS private_tutor_reviews (
+      id             TEXT PRIMARY KEY,
+      tutor_id       TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
+      student_email  TEXT NOT NULL,
+      rating         INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      comment        TEXT DEFAULT '',
+      created_at     BIGINT NOT NULL,
+      UNIQUE (tutor_id, student_email)
+    );
+    CREATE TABLE IF NOT EXISTS private_tutor_likes (
+      tutor_id       TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
+      student_email  TEXT NOT NULL,
+      created_at     BIGINT NOT NULL,
+      PRIMARY KEY (tutor_id, student_email)
     );
     CREATE TABLE IF NOT EXISTS private_tutor_payments (
       id                TEXT PRIMARY KEY,
@@ -250,7 +272,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS private_tutor_recordings (
       id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES private_tutor_rooms(id) ON DELETE CASCADE,
       uploaded_by TEXT NOT NULL, recording_url TEXT NOT NULL, duration_sec INTEGER DEFAULT 0,
-      mime_type TEXT DEFAULT 'video/webm', file_size BIGINT DEFAULT 0, created_at BIGINT NOT NULL
+      mime_type TEXT DEFAULT 'video/webm', file_size BIGINT DEFAULT 0, file_path TEXT DEFAULT '', created_at BIGINT NOT NULL
     );
   `);
 
@@ -275,6 +297,13 @@ async function initDB() {
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS salla_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutor_codes ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'month'`,
     `ALTER TABLE private_tutor_codes ADD COLUMN IF NOT EXISTS lessons_remaining INTEGER DEFAULT 0`,
+    `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS requested_date TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS requested_time TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS proposed_date TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS proposed_time TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS response_note TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS responded_at BIGINT DEFAULT 0`,
+    `ALTER TABLE private_tutor_recordings ADD COLUMN IF NOT EXISTS file_path TEXT DEFAULT ''`,
   ];
   for (const sql of safeCols) {
     try { await db.query(sql); } catch {}
@@ -3034,6 +3063,7 @@ function formatPrivateTutor(row) {
     packageSallaUrl: row.package_salla_url || "",
     packageLessons: Math.max(1, Number(row.package_lessons) || 10),
     sallaUrl: row.salla_url || "",
+    tutorEmail: row.tutor_email || "",
     active: !!row.active,
     createdAt: Number(row.created_at) || 0
   };
@@ -3084,6 +3114,105 @@ app.get("/api/private-tutors", async (_req, res) => {
   } catch (e) {
     console.error("private tutors list:", e.message);
     res.status(500).json({ ok: false, tutors: [] });
+  }
+});
+
+app.get("/api/private-tutors/:id/profile", async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    const tutorResult = await db.query(
+      "SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE LIMIT 1",
+      [id]
+    );
+    if (!tutorResult.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
+    const user = privateTutorUser(req);
+    const email = user ? String(user.email || "").toLowerCase() : "";
+    const [reviews, likes, mine] = await Promise.all([
+      db.query(
+        `SELECT r.id,r.rating,r.comment,r.created_at,u.full_name
+         FROM private_tutor_reviews r
+         LEFT JOIN users u ON lower(u.email)=lower(r.student_email)
+         WHERE r.tutor_id=$1 ORDER BY r.created_at DESC LIMIT 100`,
+        [id]
+      ),
+      db.query("SELECT COUNT(*)::int AS count FROM private_tutor_likes WHERE tutor_id=$1", [id]),
+      email
+        ? db.query("SELECT 1 FROM private_tutor_likes WHERE tutor_id=$1 AND student_email=$2 LIMIT 1", [id, email])
+        : Promise.resolve({ rows: [] })
+    ]);
+    const tutor = formatPrivateTutor(tutorResult.rows[0]);
+    const reviewRows = reviews.rows.map((r) => ({
+      id: r.id,
+      rating: Number(r.rating) || 0,
+      comment: r.comment || "",
+      studentName: r.full_name || "طالب",
+      createdAt: Number(r.created_at) || 0
+    }));
+    res.json({
+      ok: true,
+      tutor,
+      stats: {
+        likes: Number(likes.rows[0]?.count) || 0,
+        reviews: reviewRows.length,
+        rating: reviewRows.length
+          ? Number((reviewRows.reduce((sum, r) => sum + r.rating, 0) / reviewRows.length).toFixed(1))
+          : 0,
+        liked: mine.rows.length > 0
+      },
+      reviews: reviewRows
+    });
+  } catch (e) {
+    console.error("private tutor profile:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر تحميل ملف المعلم" });
+  }
+});
+
+app.post("/api/private-tutors/:id/like", async (req, res) => {
+  try {
+    const user = privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const tutorId = String(req.params.id || "");
+    const email = String(user.email || "").toLowerCase();
+    const existing = await db.query(
+      "SELECT 1 FROM private_tutor_likes WHERE tutor_id=$1 AND student_email=$2 LIMIT 1",
+      [tutorId, email]
+    );
+    if (existing.rows.length) {
+      await db.query("DELETE FROM private_tutor_likes WHERE tutor_id=$1 AND student_email=$2", [tutorId, email]);
+    } else {
+      await db.query(
+        "INSERT INTO private_tutor_likes (tutor_id,student_email,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+        [tutorId, email, Date.now()]
+      );
+    }
+    const total = await db.query("SELECT COUNT(*)::int AS count FROM private_tutor_likes WHERE tutor_id=$1", [tutorId]);
+    res.json({ ok: true, liked: !existing.rows.length, likes: Number(total.rows[0]?.count) || 0 });
+  } catch (e) {
+    console.error("private tutor like:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر تسجيل الإعجاب" });
+  }
+});
+
+app.post("/api/private-tutors/:id/reviews", async (req, res) => {
+  try {
+    const user = privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const tutorId = String(req.params.id || "");
+    const rating = Math.max(1, Math.min(5, Number(req.body?.rating) || 0));
+    const comment = String(req.body?.comment || "").trim().slice(0, 1000);
+    if (!rating || !comment) return res.status(400).json({ ok: false, msg: "اكتب التقييم والتعليق" });
+    const email = String(user.email || "").toLowerCase();
+    await db.query(
+      `INSERT INTO private_tutor_reviews (id,tutor_id,student_email,rating,comment,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (tutor_id,student_email)
+       DO UPDATE SET rating=EXCLUDED.rating,comment=EXCLUDED.comment,created_at=EXCLUDED.created_at`,
+      [privateTutorId(), tutorId, email, rating, comment, Date.now()]
+    );
+    res.status(201).json({ ok: true, msg: "تم حفظ تقييمك" });
+  } catch (e) {
+    console.error("private tutor review:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر حفظ التقييم" });
   }
 });
 
@@ -3273,7 +3402,10 @@ app.get("/api/admin/private-tutors", async (req, res) => {
       bookings: bookings.rows.map((b) => ({
         id: b.id, tutorId: b.tutor_id, tutorName: b.tutor_name,
         studentEmail: b.student_email, dayOfWeek: b.day_of_week,
-        timeText: b.time_text, notes: b.notes || "", status: b.status
+        timeText: b.time_text, requestedDate: b.requested_date || "",
+        requestedTime: b.requested_time || "", proposedDate: b.proposed_date || "",
+        proposedTime: b.proposed_time || "", responseNote: b.response_note || "",
+        notes: b.notes || "", status: b.status, createdAt: Number(b.created_at) || 0
       }))
     });
   } catch (e) {
@@ -3291,6 +3423,7 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     const name = String(body.name || "").trim().slice(0, 120);
     const bio = String(body.bio || "").trim().slice(0, 2000);
     const subject = String(body.subject || "").trim().slice(0, 120);
+    const tutorEmail = String(body.tutorEmail || "").trim().toLowerCase().slice(0, 255);
     const imageUrl = String(body.imageUrl || "").trim().slice(0, 1000);
     const videoUrl = String(body.videoUrl || "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl || "").trim().slice(0, 1500);
@@ -3308,10 +3441,10 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     }
     const result = await db.query(
       `INSERT INTO private_tutors
-       (id,name,bio,subject,image_url,video_url,lesson_price,monthly_price,
+       (id,name,bio,subject,tutor_email,image_url,video_url,lesson_price,monthly_price,
         daily_salla_url,monthly_salla_url,package_salla_url,package_lessons,salla_url,active,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,$14) RETURNING *`,
-      [privateTutorId(), name, bio, subject, imageUrl, videoUrl, lessonPrice, monthlyPrice,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,TRUE,$15) RETURNING *`,
+      [privateTutorId(), name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
         dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, Date.now()]
     );
     broadcastEvent({ type: "private_tutors_updated" });
@@ -3336,6 +3469,7 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
     const name = String(body.name ?? old.name).trim().slice(0, 120);
     const bio = String(body.bio ?? old.bio ?? "").trim().slice(0, 2000);
     const subject = String(body.subject ?? old.subject ?? "").trim().slice(0, 120);
+    const tutorEmail = String(body.tutorEmail ?? old.tutor_email ?? "").trim().toLowerCase().slice(0, 255);
     const imageUrl = String(body.imageUrl ?? old.image_url ?? "").trim().slice(0, 1000);
     const videoUrl = String(body.videoUrl ?? old.video_url ?? "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl ?? old.salla_url).trim().slice(0, 1500);
@@ -3353,11 +3487,11 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
     }
     const result = await db.query(
-      `UPDATE private_tutors SET name=$1,bio=$2,subject=$3,image_url=$4,
-       video_url=$5,lesson_price=$6,monthly_price=$7,daily_salla_url=$8,
-       monthly_salla_url=$9,package_salla_url=$10,package_lessons=$11,
-       salla_url=$12,active=$13 WHERE id=$14 RETURNING *`,
-      [name, bio, subject, imageUrl, videoUrl, lessonPrice, monthlyPrice,
+      `UPDATE private_tutors SET name=$1,bio=$2,subject=$3,tutor_email=$4,image_url=$5,
+       video_url=$6,lesson_price=$7,monthly_price=$8,daily_salla_url=$9,
+       monthly_salla_url=$10,package_salla_url=$11,package_lessons=$12,
+       salla_url=$13,active=$14 WHERE id=$15 RETURNING *`,
+      [name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
         dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, active, id]
     );
     broadcastEvent({ type: "private_tutors_updated" });
@@ -3456,8 +3590,10 @@ app.post("/api/private-tutors/:id/bookings", async (req, res) => {
     const tutorId = String(req.params.id || "");
     const dayOfWeek = String(req.body?.dayOfWeek || "").trim().slice(0, 30);
     const timeText = String(req.body?.timeText || "").trim().slice(0, 30);
+    const requestedDate = String(req.body?.date || req.body?.requestedDate || "").trim().slice(0, 20);
+    const requestedTime = String(req.body?.time || req.body?.requestedTime || timeText).trim().slice(0, 30);
     const notes = String(req.body?.notes || "").trim().slice(0, 500);
-    if (!dayOfWeek || !timeText) {
+    if ((!dayOfWeek && !requestedDate) || (!timeText && !requestedTime)) {
       return res.status(400).json({ ok: false, msg: "اختر اليوم والوقت" });
     }
     const studentEmail = String(user.email).toLowerCase();
@@ -3517,14 +3653,18 @@ app.post("/api/private-tutors/:id/bookings", async (req, res) => {
       );
       return client.query(
         `INSERT INTO private_tutor_bookings
-         (id,tutor_id,student_email,day_of_week,time_text,notes,status,created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) RETURNING *`,
-        [privateTutorId(), tutorId, studentEmail, dayOfWeek, timeText, notes, now]
+         (id,tutor_id,student_email,day_of_week,time_text,requested_date,requested_time,notes,status,created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9) RETURNING *`,
+        [privateTutorId(), tutorId, studentEmail, dayOfWeek || requestedDate,
+          timeText || requestedTime, requestedDate, requestedTime, notes, now]
       );
     });
     res.status(201).json({
       ok: true,
-      booking: { id: result.rows[0].id, dayOfWeek, timeText, notes, status: "pending" },
+      booking: {
+        id: result.rows[0].id, dayOfWeek, timeText, requestedDate, requestedTime,
+        notes, status: "pending"
+      },
       paidPlan: result.rows[0].paid_plan || null
     });
   } catch (e) {
@@ -3535,6 +3675,89 @@ app.post("/api/private-tutors/:id/bookings", async (req, res) => {
     res.status(500).json({ ok: false, msg: "تعذر حفظ الموعد" });
   }
 });
+
+app.get("/api/private-tutors/:id/bookings", async (req, res) => {
+  try {
+    const user = privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const tutorId = String(req.params.id || "");
+    const rows = await db.query(
+      `SELECT id,day_of_week,time_text,requested_date,requested_time,
+              proposed_date,proposed_time,response_note,notes,status,created_at
+       FROM private_tutor_bookings
+       WHERE tutor_id=$1 AND student_email=$2
+       ORDER BY created_at DESC LIMIT 50`,
+      [tutorId, String(user.email || "").toLowerCase()]
+    );
+    res.json({
+      ok: true,
+      bookings: rows.rows.map((b) => ({
+        id: b.id, dayOfWeek: b.day_of_week, timeText: b.time_text,
+        requestedDate: b.requested_date || "", requestedTime: b.requested_time || "",
+        proposedDate: b.proposed_date || "", proposedTime: b.proposed_time || "",
+        responseNote: b.response_note || "", notes: b.notes || "",
+        status: b.status, createdAt: Number(b.created_at) || 0
+      }))
+    });
+  } catch (e) {
+    console.error("private tutor student bookings:", e.message);
+    res.status(500).json({ ok: false, bookings: [] });
+  }
+});
+
+async function updatePrivateTutorBooking(req, res) {
+  try {
+    const user = privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const bookingId = String(req.params.bookingId || "");
+    const found = await db.query(
+      `SELECT b.*,t.tutor_email
+       FROM private_tutor_bookings b
+       JOIN private_tutors t ON t.id=b.tutor_id
+       WHERE b.id=$1 LIMIT 1`,
+      [bookingId]
+    );
+    if (!found.rows.length) return res.status(404).json({ ok: false, msg: "الحجز غير موجود" });
+    const booking = found.rows[0];
+    const admin = await isAdminRequest(req);
+    const tutorEmail = String(booking.tutor_email || "").toLowerCase();
+    if (!admin && tutorEmail !== String(user.email || "").toLowerCase()) {
+      return res.status(403).json({ ok: false, msg: "غير مصرح" });
+    }
+    const action = String(req.body?.action || "").toLowerCase();
+    const status = action === "approve" ? "confirmed" :
+      action === "propose" ? "proposed" :
+      action === "reject" ? "rejected" : "";
+    if (!status) return res.status(400).json({ ok: false, msg: "الإجراء غير صحيح" });
+    const proposedDate = String(req.body?.proposedDate || "").trim().slice(0, 20);
+    const proposedTime = String(req.body?.proposedTime || "").trim().slice(0, 30);
+    const responseNote = String(req.body?.responseNote || "").trim().slice(0, 500);
+    if (status === "proposed" && (!proposedDate || !proposedTime)) {
+      return res.status(400).json({ ok: false, msg: "اكتب التاريخ والوقت المقترح" });
+    }
+    const result = await db.query(
+      `UPDATE private_tutor_bookings
+       SET status=$1,proposed_date=$2,proposed_time=$3,response_note=$4,responded_at=$5
+       WHERE id=$6 RETURNING *`,
+      [status, proposedDate, proposedTime, responseNote, Date.now(), bookingId]
+    );
+    res.json({
+      ok: true,
+      booking: {
+        id: result.rows[0].id, status: result.rows[0].status,
+        proposedDate: result.rows[0].proposed_date || "",
+        proposedTime: result.rows[0].proposed_time || "",
+        responseNote: result.rows[0].response_note || ""
+      }
+    });
+  } catch (e) {
+    console.error("private tutor booking response:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر تحديث الحجز" });
+  }
+}
+
+app.patch("/api/admin/private-tutor-bookings/:bookingId", updatePrivateTutorBooking);
+app.patch("/api/private-tutor-bookings/:bookingId", updatePrivateTutorBooking);
 
 
 
@@ -3549,7 +3772,7 @@ const tutorMsgId=()=>"MSG-"+randomBytes(12).toString("hex");
 const tutorRecId=()=>"REC-"+randomBytes(12).toString("hex");
 const participantId=()=>"P-"+randomBytes(10).toString("hex");
 function tutorAdmin(u){return !!(u&&(u.is_admin||u.is_super_admin||u.is_moderator||u.email===process.env.ADMIN_EMAIL));}
-function sseRoom(res,event,data){try{res.write("event: "+event+"\\ndata: "+JSON.stringify(data)+"\\n\\n");return true;}catch{return false;}}
+function sseRoom(res,event,data){try{res.write("event: "+event+"\ndata: "+JSON.stringify(data)+"\n\n");return true;}catch{return false;}}
 function emitRoom(room,event,data,except){const m=tutorRoomClients.get(room);if(!m)return;for(const [id,res] of m){if(id!==except&&!sseRoom(res,event,data))m.delete(id);}}
 function roomView(r){return {id:r.id,tutorId:r.tutor_id,bookingId:r.booking_id||null,studentEmail:r.student_email,tutorEmail:r.tutor_email||"",status:r.status,startedAt:Number(r.started_at)||0,endedAt:Number(r.ended_at)||0,createdAt:Number(r.created_at)||0};}
 async function tutorAccess(req,tutor){
@@ -3583,10 +3806,38 @@ app.post("/api/private-tutors/:id/rooms",async(req,res)=>{
     if(!student||!student.includes("@"))return res.status(400).json({ok:false,msg:"studentEmail مطلوب"});
     const booking=req.body?.bookingId?String(req.body.bookingId).slice(0,120):null;
     if(booking){const b=await db.query("SELECT 1 FROM private_tutor_bookings WHERE id=$1 AND tutor_id=$2 LIMIT 1",[booking,a.tutor.id]);if(!b.rows.length)return res.status(404).json({ok:false,msg:"الحجز غير موجود"});}
+    if(booking){
+      const existing=await db.query("SELECT * FROM private_tutor_rooms WHERE booking_id=$1 ORDER BY created_at DESC LIMIT 1",[booking]);
+      if(existing.rows.length)return res.status(200).json({ok:true,room:roomView(existing.rows[0]),eventsUrl:"/api/private-tutor-rooms/"+existing.rows[0].id+"/events"});
+    }
     const id=tutorId(),now=Date.now();
     const r=await db.query("INSERT INTO private_tutor_rooms (id,tutor_id,booking_id,student_email,tutor_email,status,created_at) VALUES ($1,$2,$3,$4,$5,'waiting',$6) RETURNING *",[id,a.tutor.id,booking,student,a.tutor.tutor_email||"",now]);
     res.status(201).json({ok:true,room:roomView(r.rows[0]),eventsUrl:"/api/private-tutor-rooms/"+id+"/events"});
   }catch(e){console.error("room create",e.message);res.status(500).json({ok:false,msg:"تعذر إنشاء الغرفة"});}
+});
+
+app.get("/api/private-tutors/:id/manage-bookings",async(req,res)=>{
+  try{
+    const a=await tutorAccess(req,String(req.params.id||""));
+    if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
+    if(a.role!=="tutor"&&a.role!=="admin")return res.status(403).json({ok:false,msg:"هذه الصفحة للمعلم فقط"});
+    const q=await db.query(
+      `SELECT b.*,u.full_name, r.id AS room_id
+       FROM private_tutor_bookings b
+       LEFT JOIN users u ON lower(u.email)=lower(b.student_email)
+       LEFT JOIN private_tutor_rooms r ON r.booking_id=b.id
+       WHERE b.tutor_id=$1 AND b.status IN ('pending','confirmed','proposed')
+       ORDER BY b.created_at DESC LIMIT 100`,
+      [String(req.params.id||"")]
+    );
+    res.json({ok:true,bookings:q.rows.map(b=>({
+      id:b.id,studentEmail:b.student_email,studentName:b.full_name||"طالب",
+      requestedDate:b.requested_date||"",requestedTime:b.requested_time||"",
+      dayOfWeek:b.day_of_week,timeText:b.time_text,proposedDate:b.proposed_date||"",
+      proposedTime:b.proposed_time||"",responseNote:b.response_note||"",
+      notes:b.notes||"",status:b.status,roomId:b.room_id||""
+    }))});
+  }catch(e){res.status(500).json({ok:false,msg:"تعذر تحميل حجوزات المعلم"});}
 });
 
 app.get("/api/private-tutor-rooms/:roomId",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room)return res.status(404).json({ok:false,msg:"الغرفة غير موجودة"});if(!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});res.json({ok:true,room:roomView(a.room)});}catch(e){res.status(500).json({ok:false,msg:"تعذر تحميل الغرفة"});}});
@@ -3624,6 +3875,32 @@ app.post("/api/private-tutor-rooms/:roomId/recordings",async(req,res)=>{try{
   const a=await roomAccess(req,String(req.params.roomId)),url=String(req.body?.recordingUrl||"").trim();if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(!/^https?:\/\//i.test(url))return res.status(400).json({ok:false,msg:"رابط التسجيل غير صالح"});
   const duration=Math.max(0,Math.min(86400,Number(req.body?.durationSec)||0)),size=Math.max(0,Number(req.body?.fileSize)||0),mime=String(req.body?.mimeType||"video/webm").slice(0,100);const r=await db.query("INSERT INTO private_tutor_recordings (id,room_id,uploaded_by,recording_url,duration_sec,mime_type,file_size,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",[tutorRecId(),a.room.id,a.user.email,url,duration,mime,size,Date.now()]);const rec={id:r.rows[0].id,roomId:a.room.id,recordingUrl:url,durationSec:duration,mimeType:mime,fileSize:size,createdAt:Number(r.rows[0].created_at)};emitRoom(a.room.id,"recording-ready",rec);res.status(201).json({ok:true,recording:rec});
 }catch(e){res.status(500).json({ok:false,msg:"تعذر حفظ التسجيل"});}});
+app.post("/api/private-tutor-rooms/:roomId/recordings/upload",async(req,res)=>{try{
+  const roomId=String(req.params.roomId),a=await roomAccess(req,roomId),raw=String(req.body?.recordingData||"");
+  if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
+  if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
+  const match=/^data:([^;]+);base64,([\s\S]+)$/.exec(raw);
+  if(!match)return res.status(400).json({ok:false,msg:"ملف التسجيل غير صالح"});
+  const buffer=Buffer.from(match[2],"base64");
+  if(!buffer.length||buffer.length>80*1024*1024)return res.status(413).json({ok:false,msg:"حجم التسجيل أكبر من 80MB"});
+  const id=tutorRecId(),mime=String(match[1]||"video/webm").slice(0,100),root=path.join(__dirname,"private-tutor-recordings");
+  await fs.mkdir(root,{recursive:true});
+  const filePath=path.join(root,id+".webm");
+  await fs.writeFile(filePath,buffer);
+  const url="/api/private-tutor-rooms/"+roomId+"/recordings/"+id+"/file";
+  const r=await db.query(
+    "INSERT INTO private_tutor_recordings (id,room_id,uploaded_by,recording_url,duration_sec,mime_type,file_size,file_path,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",
+    [id,roomId,a.user.email,url,Math.max(0,Math.min(86400,Number(req.body?.durationSec)||0)),mime,buffer.length,filePath,Date.now()]
+  );
+  const rec={id:r.rows[0].id,roomId,recordingUrl:url,durationSec:Number(r.rows[0].duration_sec)||0,mimeType:mime,fileSize:buffer.length,createdAt:Number(r.rows[0].created_at)};
+  emitRoom(roomId,"recording-ready",rec);res.status(201).json({ok:true,recording:rec});
+}catch(e){console.error("recording upload",e.message);res.status(500).json({ok:false,msg:"تعذر رفع التسجيل"});}});
+app.get("/api/private-tutor-rooms/:roomId/recordings/:recordingId/file",async(req,res)=>{try{
+  const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).end();if(!a.room||!a.role)return res.status(403).end();
+  const q=await db.query("SELECT file_path,mime_type FROM private_tutor_recordings WHERE id=$1 AND room_id=$2 LIMIT 1",[String(req.params.recordingId),a.room.id]);
+  if(!q.rows.length||!q.rows[0].file_path)return res.status(404).end();
+  res.type(q.rows[0].mime_type||"video/webm").sendFile(q.rows[0].file_path);
+}catch(e){res.status(500).end();}});
 app.get("/api/private-tutor-rooms/:roomId/recordings",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});const r=await db.query("SELECT * FROM private_tutor_recordings WHERE room_id=$1 ORDER BY created_at DESC",[a.room.id]);res.json({ok:true,recordings:r.rows.map(x=>({id:x.id,roomId:x.room_id,recordingUrl:x.recording_url,durationSec:Number(x.duration_sec)||0,mimeType:x.mime_type,fileSize:Number(x.file_size)||0,createdAt:Number(x.created_at)}))});}catch(e){res.status(500).json({ok:false,recordings:[]});}});
 
 app.post("/api/private-tutor-rooms/:roomId/end",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(a.role!=="tutor"&&a.role!=="admin")return res.status(403).json({ok:false,msg:"المعلم فقط ينهي الدرس"});const t=Date.now(),r=await db.query("UPDATE private_tutor_rooms SET status='ended',ended_at=$1 WHERE id=$2 RETURNING *",[t,a.room.id]);emitRoom(a.room.id,"room-ended",{roomId:a.room.id,endedAt:t});res.json({ok:true,room:roomView(r.rows[0])});}catch(e){res.status(500).json({ok:false,msg:"تعذر إنهاء الدرس"});}});
