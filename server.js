@@ -185,6 +185,20 @@ async function initDB() {
       used       BOOLEAN DEFAULT FALSE,
       created_at BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS teacher_applications (
+      id              TEXT PRIMARY KEY,
+      user_email      TEXT NOT NULL UNIQUE REFERENCES users(email) ON DELETE CASCADE,
+      full_name       TEXT NOT NULL,
+      subject         TEXT NOT NULL,
+      bio             TEXT DEFAULT '',
+      gender          TEXT NOT NULL CHECK (gender IN ('male','female')),
+      image_data      TEXT NOT NULL,
+      status          TEXT DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+      rejection_reason TEXT DEFAULT '',
+      reviewed_by     TEXT DEFAULT '',
+      reviewed_at     BIGINT DEFAULT 0,
+      created_at      BIGINT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS private_tutors (
       id             TEXT PRIMARY KEY,
       name           TEXT NOT NULL,
@@ -287,7 +301,15 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type TEXT DEFAULT 'student'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS teacher_status TEXT DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS teacher_subject TEXT DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS teacher_bio TEXT DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS teacher_gender TEXT DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS teacher_image_data TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS tutor_email TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS application_id TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS video_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS lesson_price NUMERIC(10,2) DEFAULT 0`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS monthly_price NUMERIC(10,2) DEFAULT 0`,
@@ -700,6 +722,51 @@ async function sendVerificationEmail(toEmail, code, fullName) {
   return true;
 }
 
+async function sendTeacherDecisionEmail(toEmail, fullName, approved, reason = "") {
+  const safeName = String(fullName || "المعلم").replace(/[<>&"]/g, "");
+  const safeReason = String(reason || "").replace(/[<>&"]/g, "");
+  const subject = approved
+    ? "✅ تمت الموافقة على طلبك — A+ الطبي"
+    : "❌ تحديث طلب التسجيل كمعلم — A+ الطبي";
+  const htmlBody = `<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8"></head>
+  <body style="margin:0;background:#0a0a0f;font-family:Tahoma,Arial,sans-serif;direction:rtl">
+    <div style="max-width:560px;margin:35px auto;background:#151021;border:1px solid ${approved ? "#10b981" : "#ef4444"};border-radius:18px;padding:30px;color:#eee">
+      <div style="font-size:28px;text-align:center">${approved ? "🎓✅" : "📩❌"}</div>
+      <h2 style="text-align:center;color:${approved ? "#6ee7b7" : "#fca5a5"}">A+ الطبي</h2>
+      <p>مرحباً ${safeName}،</p>
+      <p>${approved
+        ? "تمت الموافقة على طلب تسجيلك كمعلم خصوصي. أصبح ملفك ظاهراً للطلاب ويمكنك تسجيل الدخول بحسابك."
+        : "نعتذر، لم تتم الموافقة على طلب تسجيلك كمعلم خصوصي حالياً."}</p>
+      ${!approved && safeReason ? `<div style="background:#2a1620;border-radius:10px;padding:12px;margin-top:18px">سبب الرفض: ${safeReason}</div>` : ""}
+      <p style="color:#9b8ec4;font-size:13px;margin-top:25px">هذه رسالة آلية من منصة A+ الطبي.</p>
+    </div>
+  </body></html>`;
+
+  if (RESEND_KEY) {
+    try {
+      await _sendViaResend(toEmail, subject, htmlBody);
+      return true;
+    } catch (e) {
+      console.error("teacher decision resend:", e.message);
+    }
+  }
+  if (GMAIL_USER && GMAIL_PASS) {
+    try {
+      const transporter = nodemailer.createTransport({
+        service: "gmail",
+        auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+        connectionTimeout: 8000, greetingTimeout: 8000, socketTimeout: 10000
+      });
+      await transporter.sendMail({ from: `"A+ الطبي" <${GMAIL_USER}>`, to: toEmail, subject, html: htmlBody });
+      return true;
+    } catch (e) {
+      console.error("teacher decision gmail:", e.message);
+    }
+  }
+  console.log(`[DEV] teacher decision email for ${toEmail}: ${approved ? "approved" : "rejected"}`);
+  return true;
+}
+
 function hashPassword(password) {
   const salt = randomBytes(16).toString("hex");
   const hash = scryptSync(password, salt, 64).toString("hex");
@@ -876,6 +943,12 @@ function formatUser(u) {
     lastSeen: u.last_seen || 0,
     loginAttempts: Number(u.login_attempts) || 0,
     lockedUntil: Number(u.locked_until) || 0,
+    accountType: u.account_type || "student",
+    teacherStatus: u.teacher_status || "",
+    teacherSubject: u.teacher_subject || "",
+    teacherBio: u.teacher_bio || "",
+    teacherGender: u.teacher_gender || "",
+    teacherImageData: u.teacher_image_data || "",
   };
 }
 
@@ -1086,12 +1159,27 @@ app.post("/api/auth/admin-create", async (req, res) => {
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { fullName, email, password } = req.body;
+    const accountType = String(req.body?.accountType || "student").toLowerCase();
+    const teacherGender = String(req.body?.teacherGender || "").toLowerCase();
+    const teacherSubject = String(req.body?.teacherSubject || "").trim().slice(0, 120);
+    const teacherBio = String(req.body?.teacherBio || "").trim().slice(0, 2000);
+    const teacherImageData = String(req.body?.teacherImageData || "");
     if (!email || !password)
       return res.json({ ok: false, msg: "البريد الإلكتروني وكلمة المرور مطلوبان" });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email))
       return res.json({ ok: false, msg: "صيغة البريد الإلكتروني غير صحيحة" });
     if (password.length < 6)
       return res.json({ ok: false, msg: "كلمة المرور 6 أحرف على الأقل" });
+    if (!["student", "teacher"].includes(accountType))
+      return res.json({ ok: false, msg: "نوع الحساب غير صحيح" });
+    if (accountType === "teacher") {
+      if (!teacherSubject || !["male", "female"].includes(teacherGender))
+        return res.json({ ok: false, msg: "اسم التخصص ونوع المعلم مطلوبان" });
+      if (!/^data:image\/(?:jpeg|jpg|png|webp);base64,[a-z0-9+/=\r\n]+$/i.test(teacherImageData) ||
+          teacherImageData.length > 7_000_000) {
+        return res.json({ ok: false, msg: "ارفع صورة شخصية واضحة بصيغة JPG أو PNG أو WEBP وحجم أقل من 5MB" });
+      }
+    }
 
     const norm = email.toLowerCase().trim();
     const ex = await db.query("SELECT email, deleted_at FROM users WHERE email=$1", [norm]);
@@ -1105,6 +1193,37 @@ app.post("/api/auth/register", async (req, res) => {
         return res.json({ ok: true, msg: "تم إعادة تفعيل حسابك", reactivated: true });
       }
       return res.json({ ok: false, msg: "البريد الإلكتروني مسجل مسبقاً" });
+    }
+
+    if (accountType === "teacher") {
+      await db.query(
+        `INSERT INTO users
+         (email, full_name, password_hash, account_type, teacher_status,
+          teacher_subject, teacher_bio, teacher_gender, teacher_image_data,
+          created_at, last_seen)
+         VALUES ($1,$2,$3,'teacher','pending',$4,$5,$6,$7,$8,$8)`,
+        [norm, fullName?.trim() || "", hashPassword(password), teacherSubject,
+          teacherBio, teacherGender, teacherImageData, Date.now()]
+      );
+      await db.query(
+        `INSERT INTO teacher_applications
+         (id,user_email,full_name,subject,bio,gender,image_data,status,created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8)`,
+        [randomBytes(12).toString("hex"), norm, fullName?.trim() || "",
+          teacherSubject, teacherBio, teacherGender, teacherImageData, Date.now()]
+      );
+      const verifyCode = String(Math.floor(100000 + Math.random() * 900000));
+      await db.query("DELETE FROM email_verification_tokens WHERE email=$1", [norm]);
+      await db.query(
+        "INSERT INTO email_verification_tokens (token,email,expires_at,used,created_at) VALUES ($1,$2,$3,FALSE,$4)",
+        [verifyCode, norm, Date.now() + 15 * 60_000, Date.now()]
+      );
+      await sendVerificationEmail(norm, verifyCode, fullName?.trim() || "");
+      broadcastEvent({ type: "teacher_applications_updated" });
+      return res.json({
+        ok: true, requiresVerification: true, teacherPending: true, email: norm,
+        msg: "تم إرسال كود التأكيد. بعد التأكيد سيراجع المدير طلبك."
+      });
     }
 
     await db.query(
@@ -1166,6 +1285,16 @@ app.post("/api/auth/login", async (req, res) => {
     // ❸٫٥ فحص تأكيد البريد الإلكتروني
     if (!user.email_verified && !user.is_admin && !user.is_super_admin) {
       return res.json({ ok: false, requiresVerification: true, email: norm, msg: "⚠️ يرجى تأكيد بريدك الإلكتروني أولاً — راجع صندوق الوارد" });
+    }
+    if (user.account_type === "teacher" && user.teacher_status !== "approved") {
+      return res.json({
+        ok: false,
+        teacherPending: user.teacher_status === "pending",
+        teacherRejected: user.teacher_status === "rejected",
+        msg: user.teacher_status === "rejected"
+          ? "تم رفض طلب المعلم. يمكنك التواصل مع الإدارة وتقديم طلب جديد."
+          : "طلب المعلم قيد مراجعة المدير. سيصلك إشعار بالبريد عند القرار."
+      });
     }
 
     // ❹ فحص قفل الحساب
@@ -1237,14 +1366,21 @@ app.post("/api/auth/verify-email", async (req, res) => {
     await db.query("UPDATE users SET email_verified=TRUE WHERE email=$1", [norm]);
     await db.query("UPDATE email_verification_tokens SET used=TRUE WHERE token=$1", [String(code).trim()]);
 
+    const verifiedRow = await db.query("SELECT * FROM users WHERE email=$1", [norm]);
+    if (verifiedRow.rows[0]?.account_type === "teacher" &&
+        verifiedRow.rows[0]?.teacher_status !== "approved") {
+      return res.json({
+        ok: true, teacherPending: true, email: norm,
+        msg: "تم تأكيد البريد، وطلبك الآن بانتظار موافقة المدير."
+      });
+    }
     const token = generateToken();
     await db.query(
       "INSERT INTO sessions (token, user_id, created_at, last_used) VALUES ($1,$2,$3,$3)",
       [token, norm, Date.now()]
     );
-    const userRow = await db.query("SELECT * FROM users WHERE email=$1", [norm]);
     console.log(`✅ تم تأكيد البريد: ${norm}`);
-    res.json({ ok: true, token, user: formatUser(userRow.rows[0]) });
+    res.json({ ok: true, token, user: formatUser(verifiedRow.rows[0]) });
   } catch (e) {
     console.error("verify-email error:", e.message);
     res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
@@ -3066,7 +3202,8 @@ function formatPrivateTutor(row) {
     packageLessons: Math.max(1, Number(row.package_lessons) || 10),
     sallaUrl: row.salla_url || "",
     isFree: !!row.free_access,
-    tutorEmail: row.tutor_email || "",
+    gender: row.gender || "",
+    verified: row.active !== false,
     active: !!row.active,
     createdAt: Number(row.created_at) || 0
   };
@@ -3425,6 +3562,124 @@ app.get("/api/private-tutors/:id/subscription", async (req, res) => {
   }
 });
 
+app.get("/api/admin/teacher-applications", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const result = await db.query(
+      `SELECT a.*, u.email_verified
+       FROM teacher_applications a
+       LEFT JOIN users u ON lower(u.email)=lower(a.user_email)
+       ORDER BY CASE WHEN a.status='pending' THEN 0 ELSE 1 END, a.created_at DESC`
+    );
+    res.json({
+      ok: true,
+      applications: result.rows.map((a) => ({
+        id: a.id, email: a.user_email, fullName: a.full_name, subject: a.subject,
+        bio: a.bio || "", gender: a.gender, imageData: a.image_data,
+        status: a.status, rejectionReason: a.rejection_reason || "",
+        emailVerified: !!a.email_verified, createdAt: Number(a.created_at) || 0,
+        reviewedAt: Number(a.reviewed_at) || 0
+      }))
+    });
+  } catch (e) {
+    console.error("teacher applications list:", e.message);
+    res.status(500).json({ ok: false, applications: [] });
+  }
+});
+
+app.patch("/api/admin/teacher-applications/:id", async (req, res) => {
+  try {
+    const admin = await isAdminRequest(req);
+    if (!admin) return res.status(403).json({ ok: false, error: "forbidden" });
+    const action = String(req.body?.action || "").toLowerCase();
+    if (!["approve", "reject"].includes(action)) {
+      return res.status(400).json({ ok: false, msg: "قرار غير صحيح" });
+    }
+    const application = await db.query(
+      "SELECT * FROM teacher_applications WHERE id=$1 LIMIT 1",
+      [String(req.params.id || "")]
+    );
+    if (!application.rows.length) return res.status(404).json({ ok: false, msg: "الطلب غير موجود" });
+    const a = application.rows[0];
+    const reason = String(req.body?.reason || "").trim().slice(0, 500);
+    if (action === "reject" && !reason) {
+      return res.status(400).json({ ok: false, msg: "اكتب سبب الرفض" });
+    }
+    const now = Date.now();
+    let tutor = null;
+    await withDbTransaction(async (client) => {
+      const locked = await client.query("SELECT * FROM teacher_applications WHERE id=$1 FOR UPDATE", [a.id]);
+      if (!locked.rows.length) throw new Error("application-not-found");
+      const current = locked.rows[0];
+      if (current.status !== "pending") throw new Error("تم اتخاذ قرار على هذا الطلب مسبقاً");
+      if (action === "approve") {
+        await client.query(
+          `UPDATE users SET account_type='teacher',teacher_status='approved',
+           teacher_subject=$1,teacher_bio=$2,teacher_gender=$3,teacher_image_data=$4
+           WHERE email=$5`,
+          [a.subject, a.bio || "", a.gender, a.image_data, a.user_email]
+        );
+        const existing = await client.query(
+          "SELECT * FROM private_tutors WHERE lower(tutor_email)=lower($1) LIMIT 1",
+          [a.user_email]
+        );
+        if (existing.rows.length) {
+          const updated = await client.query(
+            `UPDATE private_tutors SET name=$1,bio=$2,subject=$3,tutor_email=$4,
+             image_url=$5,gender=$6,application_id=$7,active=TRUE,free_access=TRUE
+             WHERE id=$8 RETURNING *`,
+            [a.full_name, a.bio || "", a.subject, a.user_email, a.image_data,
+              a.gender, a.id, existing.rows[0].id]
+          );
+          tutor = updated.rows[0];
+        } else {
+          const created = await client.query(
+            `INSERT INTO private_tutors
+             (id,name,bio,subject,tutor_email,image_url,gender,application_id,
+              free_access,active,created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,TRUE,$9) RETURNING *`,
+            [privateTutorId(), a.full_name, a.bio || "", a.subject, a.user_email,
+              a.image_data, a.gender, a.id, now]
+          );
+          tutor = created.rows[0];
+        }
+      } else {
+        await client.query(
+          "UPDATE users SET teacher_status='rejected' WHERE email=$1",
+          [a.user_email]
+        );
+      }
+      await client.query(
+        `UPDATE teacher_applications
+         SET status=$1,rejection_reason=$2,reviewed_by=$3,reviewed_at=$4
+         WHERE id=$5`,
+        [action === "approve" ? "approved" : "rejected", action === "approve" ? "" : reason,
+          admin.email || "admin", now, a.id]
+      );
+      await client.query(
+        `INSERT INTO notifications (id,user_email,message,type,read,created_at)
+         VALUES ($1,$2,$3,$4,FALSE,$5)`,
+        [randomBytes(12).toString("hex"), a.user_email,
+          action === "approve"
+            ? "تمت الموافقة على طلبك كمعلم خصوصي وأصبح ملفك ظاهراً للطلاب."
+            : `تم رفض طلب المعلم: ${reason}`,
+          action === "approve" ? "success" : "warning", now]
+      );
+    });
+    await auditLog("teacher_application_decision", admin.email || "admin", {
+      applicationId: a.id, decision: action, applicant: a.user_email
+    });
+    await sendTeacherDecisionEmail(a.user_email, a.full_name, action === "approve", reason);
+    broadcastEvent({ type: "teacher_applications_updated", applicationId: a.id });
+    broadcastEvent({ type: "private_tutors_updated" });
+    res.json({ ok: true, status: action === "approve" ? "approved" : "rejected", tutor: tutor ? formatPrivateTutor(tutor) : null });
+  } catch (e) {
+    console.error("teacher application decision:", e.message);
+    res.status(e.message === "تم اتخاذ قرار على هذا الطلب مسبقاً" ? 409 : 500)
+      .json({ ok: false, msg: e.message === "تم اتخاذ قرار على هذا الطلب مسبقاً" ? e.message : "تعذر حفظ قرار الطلب" });
+  }
+});
+
 app.get("/api/admin/private-tutors", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) {
@@ -3438,6 +3693,12 @@ app.get("/api/admin/private-tutors", async (req, res) => {
        JOIN private_tutors t ON t.id=b.tutor_id
        WHERE b.status='pending'
        ORDER BY b.created_at DESC`
+    );
+    const applications = await db.query(
+      `SELECT a.*, u.email_verified
+       FROM teacher_applications a
+       LEFT JOIN users u ON lower(u.email)=lower(a.user_email)
+       ORDER BY CASE WHEN a.status='pending' THEN 0 ELSE 1 END, a.created_at DESC`
     );
     res.json({
       ok: true,
@@ -3455,6 +3716,12 @@ app.get("/api/admin/private-tutors", async (req, res) => {
         requestedTime: b.requested_time || "", proposedDate: b.proposed_date || "",
         proposedTime: b.proposed_time || "", responseNote: b.response_note || "",
         notes: b.notes || "", status: b.status, createdAt: Number(b.created_at) || 0
+      })),
+      applications: applications.rows.map((a) => ({
+        id: a.id, email: a.user_email, fullName: a.full_name, subject: a.subject,
+        bio: a.bio || "", gender: a.gender, imageData: a.image_data,
+        status: a.status, rejectionReason: a.rejection_reason || "",
+        emailVerified: !!a.email_verified, createdAt: Number(a.created_at) || 0
       }))
     });
   } catch (e) {
