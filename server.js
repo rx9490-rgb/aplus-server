@@ -199,6 +199,7 @@ async function initDB() {
       package_salla_url TEXT DEFAULT '',
       package_lessons INTEGER DEFAULT 10,
       salla_url      TEXT DEFAULT '',
+      free_access    BOOLEAN DEFAULT FALSE,
       active         BOOLEAN DEFAULT TRUE,
       created_at     BIGINT NOT NULL
     );
@@ -295,6 +296,7 @@ async function initDB() {
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS package_salla_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS package_lessons INTEGER DEFAULT 10`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS salla_url TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS free_access BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE private_tutor_codes ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'month'`,
     `ALTER TABLE private_tutor_codes ADD COLUMN IF NOT EXISTS lessons_remaining INTEGER DEFAULT 0`,
     `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS requested_date TEXT DEFAULT ''`,
@@ -3063,15 +3065,62 @@ function formatPrivateTutor(row) {
     packageSallaUrl: row.package_salla_url || "",
     packageLessons: Math.max(1, Number(row.package_lessons) || 10),
     sallaUrl: row.salla_url || "",
+    isFree: !!row.free_access,
     tutorEmail: row.tutor_email || "",
     active: !!row.active,
     createdAt: Number(row.created_at) || 0
   };
 }
 
+async function ensurePrivateTutorAccount(email, password, fullName) {
+  const normalized = String(email || "").trim().toLowerCase();
+  const secret = String(password || "");
+  if (!normalized && !secret) return;
+  if (!normalized || secret.length < 6) {
+    const error = new Error("إيميل المعلم وكلمة المرور (6 أحرف على الأقل) مطلوبان معاً");
+    error.code = "TUTOR_ACCOUNT_INVALID";
+    throw error;
+  }
+  const existing = await db.query(
+    "SELECT email,is_admin,is_super_admin FROM users WHERE email=$1 LIMIT 1",
+    [normalized]
+  );
+  if (existing.rows[0]?.is_admin || existing.rows[0]?.is_super_admin) {
+    const error = new Error("لا يمكن استخدام إيميل المدير كحساب معلم");
+    error.code = "TUTOR_ACCOUNT_ADMIN";
+    throw error;
+  }
+  const name = String(fullName || normalized.split("@")[0]).trim().slice(0, 120);
+  if (existing.rows.length) {
+    await db.query(
+      `UPDATE users SET full_name=$1,password_hash=$2,email_verified=TRUE,
+       deleted_at=NULL,banned=FALSE,login_attempts=0,locked_until=0,last_seen=$3
+       WHERE email=$4`,
+      [name, hashPassword(secret), Date.now(), normalized]
+    );
+  } else {
+    await db.query(
+      `INSERT INTO users
+       (email,full_name,password_hash,email_verified,created_at,last_seen)
+       VALUES ($1,$2,$3,TRUE,$4,$4)`,
+      [normalized, name, hashPassword(secret), Date.now()]
+    );
+  }
+  invalidateSessionCache(normalized);
+}
+
 async function tutorEntitlement(tutorId, email) {
   const normalizedEmail = String(email || "").toLowerCase();
   const now = Date.now();
+  const tutor = await db.query("SELECT free_access FROM private_tutors WHERE id=$1 LIMIT 1", [tutorId]);
+  if (tutor.rows[0]?.free_access) {
+    return {
+      lessonsRemaining: 999999,
+      monthExpiresAt: 0,
+      legacyActive: true,
+      active: true
+    };
+  }
   const paid = await db.query(
     `SELECT
        COALESCE(SUM(CASE WHEN plan='lesson' AND lessons_remaining>0 THEN lessons_remaining ELSE 0 END),0) AS lessons_remaining,
@@ -3424,6 +3473,7 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     const bio = String(body.bio || "").trim().slice(0, 2000);
     const subject = String(body.subject || "").trim().slice(0, 120);
     const tutorEmail = String(body.tutorEmail || "").trim().toLowerCase().slice(0, 255);
+    const tutorPassword = String(body.tutorPassword || "");
     const imageUrl = String(body.imageUrl || "").trim().slice(0, 1000);
     const videoUrl = String(body.videoUrl || "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl || "").trim().slice(0, 1500);
@@ -3433,8 +3483,9 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     const monthlySallaUrl = String(body.monthlySallaUrl || "").trim().slice(0, 1500);
     const packageSallaUrl = String(body.packageSallaUrl || "").trim().slice(0, 1500);
     const packageLessons = Math.min(100, Math.max(1, Number(body.packageLessons) || 10));
-    if (!name || !subject || (lessonPrice < 5 && monthlyPrice < 5)) {
-      return res.status(400).json({ ok: false, msg: "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
+    const freeAccess = body.freeAccess === true || String(body.freeAccess).toLowerCase() === "true";
+    if (!name || !subject || (!freeAccess && lessonPrice < 5 && monthlyPrice < 5)) {
+      return res.status(400).json({ ok: false, msg: freeAccess ? "الاسم والتخصص مطلوبان" : "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
     }
     if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
@@ -3442,11 +3493,12 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     const result = await db.query(
       `INSERT INTO private_tutors
        (id,name,bio,subject,tutor_email,image_url,video_url,lesson_price,monthly_price,
-        daily_salla_url,monthly_salla_url,package_salla_url,package_lessons,salla_url,active,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,TRUE,$15) RETURNING *`,
+        daily_salla_url,monthly_salla_url,package_salla_url,package_lessons,salla_url,free_access,active,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE,$16) RETURNING *`,
       [privateTutorId(), name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
-        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, Date.now()]
+        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, freeAccess, Date.now()]
     );
+    await ensurePrivateTutorAccount(tutorEmail, tutorPassword, name);
     broadcastEvent({ type: "private_tutors_updated" });
     res.status(201).json({ ok: true, tutor: formatPrivateTutor(result.rows[0]) });
   } catch (e) {
@@ -3470,6 +3522,7 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
     const bio = String(body.bio ?? old.bio ?? "").trim().slice(0, 2000);
     const subject = String(body.subject ?? old.subject ?? "").trim().slice(0, 120);
     const tutorEmail = String(body.tutorEmail ?? old.tutor_email ?? "").trim().toLowerCase().slice(0, 255);
+    const tutorPassword = String(body.tutorPassword || "");
     const imageUrl = String(body.imageUrl ?? old.image_url ?? "").trim().slice(0, 1000);
     const videoUrl = String(body.videoUrl ?? old.video_url ?? "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl ?? old.salla_url).trim().slice(0, 1500);
@@ -3479,9 +3532,12 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
     const monthlySallaUrl = String(body.monthlySallaUrl ?? old.monthly_salla_url ?? old.salla_url ?? "").trim().slice(0, 1500);
     const packageSallaUrl = String(body.packageSallaUrl ?? old.package_salla_url ?? "").trim().slice(0, 1500);
     const packageLessons = Math.min(100, Math.max(1, Number(body.packageLessons ?? old.package_lessons) || 10));
+    const freeAccess = body.freeAccess === undefined
+      ? !!old.free_access
+      : body.freeAccess === true || String(body.freeAccess).toLowerCase() === "true";
     const active = body.active === undefined ? !!old.active : !!body.active;
-    if (!name || !subject || (lessonPrice < 5 && monthlyPrice < 5)) {
-      return res.status(400).json({ ok: false, msg: "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
+    if (!name || !subject || (!freeAccess && lessonPrice < 5 && monthlyPrice < 5)) {
+      return res.status(400).json({ ok: false, msg: freeAccess ? "الاسم والتخصص مطلوبان" : "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
     }
     if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
@@ -3490,10 +3546,11 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
       `UPDATE private_tutors SET name=$1,bio=$2,subject=$3,tutor_email=$4,image_url=$5,
        video_url=$6,lesson_price=$7,monthly_price=$8,daily_salla_url=$9,
        monthly_salla_url=$10,package_salla_url=$11,package_lessons=$12,
-       salla_url=$13,active=$14 WHERE id=$15 RETURNING *`,
+       salla_url=$13,free_access=$14,active=$15 WHERE id=$16 RETURNING *`,
       [name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
-        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, active, id]
+        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, freeAccess, active, id]
     );
+    await ensurePrivateTutorAccount(tutorEmail, tutorPassword, name);
     broadcastEvent({ type: "private_tutors_updated" });
     res.json({ ok: true, tutor: formatPrivateTutor(result.rows[0]) });
   } catch (e) {
