@@ -190,6 +190,11 @@ async function initDB() {
       name           TEXT NOT NULL,
       bio            TEXT DEFAULT '',
       subject        TEXT DEFAULT '',
+      whatsapp       TEXT DEFAULT '',
+      experience     TEXT DEFAULT '',
+      verification_status TEXT DEFAULT 'approved',
+      application_id TEXT DEFAULT '',
+      approved_at    BIGINT DEFAULT 0,
       image_url      TEXT DEFAULT '',
       video_url      TEXT DEFAULT '',
       lesson_price   NUMERIC(10,2) DEFAULT 0,
@@ -266,6 +271,17 @@ async function initDB() {
       uploaded_by TEXT NOT NULL, recording_url TEXT NOT NULL, duration_sec INTEGER DEFAULT 0,
       mime_type TEXT DEFAULT 'video/webm', file_size BIGINT DEFAULT 0, file_path TEXT DEFAULT '', created_at BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS private_tutor_applications (
+      id TEXT PRIMARY KEY, full_name TEXT NOT NULL, email TEXT NOT NULL, password_hash TEXT NOT NULL,
+      whatsapp TEXT DEFAULT '', subject TEXT NOT NULL, bio TEXT DEFAULT '', experience TEXT DEFAULT '',
+      certificate_path TEXT DEFAULT '', certificate_name TEXT DEFAULT '', certificate_mime TEXT DEFAULT '',
+      status TEXT DEFAULT 'pending', review_note TEXT DEFAULT '', tutor_id TEXT DEFAULT '',
+      created_at BIGINT NOT NULL, reviewed_at BIGINT DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS private_tutor_profile_views (
+      id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
+      viewer_email TEXT DEFAULT '', created_at BIGINT NOT NULL
+    );
   `);
 
   // أعمدة جديدة لم تكن موجودة — آمن للتشغيل أكثر من مرة
@@ -279,6 +295,11 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS tutor_email TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS whatsapp TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS experience TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'approved'`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS application_id TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS approved_at BIGINT DEFAULT 0`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS video_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS lesson_price NUMERIC(10,2) DEFAULT 0`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS monthly_price NUMERIC(10,2) DEFAULT 0`,
@@ -3032,6 +3053,9 @@ app.post("/api/payment/paylink/confirm", async (req, res) => {
 function privateTutorId() {
   return randomBytes(12).toString("hex");
 }
+function privateTutorApplicationId() {
+  return "PTA-" + randomBytes(12).toString("hex");
+}
 
 function privateTutorCode() {
   return "TUTOR-" + randomBytes(5).toString("hex").toUpperCase();
@@ -3048,6 +3072,9 @@ function formatPrivateTutor(row) {
     name: row.name,
     bio: row.bio || "",
     subject: row.subject || "",
+    whatsapp: row.whatsapp || "",
+    experience: row.experience || "",
+    verificationStatus: row.verification_status || "approved",
     imageUrl: row.image_url || "",
     videoUrl: row.video_url || "",
     lessonPrice: Number(row.lesson_price) || 0,
@@ -3063,6 +3090,76 @@ function formatPrivateTutor(row) {
     createdAt: Number(row.created_at) || 0
   };
 }
+
+async function notifyTutorByEmail(email, subject, title, message) {
+  const html = `<!doctype html><html dir="rtl" lang="ar"><body style="font-family:Arial;background:#f6f7fb;padding:30px"><div style="max-width:560px;margin:auto;background:#fff;border-radius:16px;padding:28px;border:1px solid #e5e7eb"><h2 style="color:#4f46e5">${title}</h2><p style="line-height:2;color:#374151">${message}</p><p style="color:#6b7280;font-size:12px">منصة A+ — إشعار تلقائي</p></div></body></html>`;
+  if (RESEND_KEY) {
+    try { await _sendViaResend(email, subject, html); return true; } catch (e) { console.error("tutor email:", e.message); }
+  }
+  if (GMAIL_USER && GMAIL_PASS) {
+    try {
+      const transporter = nodemailer.createTransport({service:"gmail",auth:{user:GMAIL_USER,pass:GMAIL_PASS},connectionTimeout:8000});
+      await transporter.sendMail({from:`"A+ الطبي" <${GMAIL_USER}>`,to:email,subject,html});
+      return true;
+    } catch (e) { console.error("tutor gmail:", e.message); }
+  }
+  console.log(`[TUTOR EMAIL DEV] ${email}: ${subject}`);
+  return false;
+}
+
+app.post("/api/private-tutor-applications", async (req, res) => {
+  try {
+    const b = req.body || {}, name = String(b.fullName || "").trim().slice(0, 120);
+    const email = String(b.email || "").trim().toLowerCase(), password = String(b.password || "");
+    const whatsapp = String(b.whatsapp || "").trim().slice(0, 40), subject = String(b.subject || "").trim().slice(0, 120);
+    const bio = String(b.bio || "").trim().slice(0, 3000), experience = String(b.experience || "").trim().slice(0, 2000);
+    const certificate = String(b.certificateData || ""), certificateName = String(b.certificateName || "").slice(0, 180);
+    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || password.length < 6 || !subject || !certificate) {
+      return res.status(400).json({ ok: false, msg: "الاسم والإيميل وكلمة المرور والتخصص والشهادة مطلوبة" });
+    }
+    const existingUser = await db.query("SELECT 1 FROM users WHERE email=$1 LIMIT 1", [email]);
+    if (existingUser.rows.length) return res.status(409).json({ ok: false, msg: "الإيميل مستخدم مسبقاً. استخدم إيميلاً آخر." });
+    const previous = await db.query("SELECT status FROM private_tutor_applications WHERE email=$1 AND status='pending' LIMIT 1", [email]);
+    if (previous.rows.length) return res.status(409).json({ ok: false, msg: "لديك طلب قيد المراجعة مسبقاً" });
+    const match = certificate.match(/^data:([a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!match || !["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(match[1]) || Buffer.byteLength(match[2], "base64") > 8 * 1024 * 1024) {
+      return res.status(400).json({ ok: false, msg: "الشهادة يجب أن تكون PDF أو صورة وأقل من 8MB" });
+    }
+    const id = privateTutorApplicationId(), dir = path.join(__dirname, "private-tutor-certificates");
+    await fs.mkdir(dir, { recursive: true });
+    const ext = match[1] === "application/pdf" ? "pdf" : match[1].split("/")[1];
+    const filePath = path.join(dir, `${id}.${ext}`);
+    await fs.writeFile(filePath, Buffer.from(match[2], "base64"));
+    await db.query(
+      `INSERT INTO private_tutor_applications
+       (id,full_name,email,password_hash,whatsapp,subject,bio,experience,certificate_path,certificate_name,certificate_mime,status,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12)`,
+      [id, name, email, hashPassword(password), whatsapp, subject, bio, experience, filePath, certificateName || `${id}.${ext}`, match[1], Date.now()]
+    );
+    await db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), email, "تم استلام طلب تسجيلك كمعلم خصوصي وسيتم مراجعته.", "tutor_application", Date.now()]).catch(() => {});
+    await notifyTutorByEmail(email, "تم استلام طلب المعلم الخصوصي", "تم استلام طلبك", "تم إرسال طلبك بنجاح. سيقوم فريق الإدارة بمراجعته والرد عليك عبر البريد الإلكتروني.");
+    res.status(201).json({ ok: true, msg: "تم إرسال طلبك، سيتم الرد عليك بعد المراجعة." });
+  } catch (e) {
+    console.error("tutor application:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر إرسال طلب التسجيل" });
+  }
+});
+
+app.get("/api/private-tutor/me", async (req, res) => {
+  try {
+    const user = privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const t = await db.query("SELECT * FROM private_tutors WHERE lower(tutor_email)=lower($1) AND active=TRUE LIMIT 1", [user.email]);
+    if (!t.rows.length) return res.status(403).json({ ok: false, msg: "لا توجد لوحة معلم مفعلة لهذا الحساب" });
+    const tutor = t.rows[0], [bookings, rooms, recordings, views] = await Promise.all([
+      db.query(`SELECT b.*,u.full_name AS student_name FROM private_tutor_bookings b LEFT JOIN users u ON lower(u.email)=lower(b.student_email) WHERE b.tutor_id=$1 ORDER BY b.created_at DESC LIMIT 100`, [tutor.id]),
+      db.query(`SELECT r.*,b.requested_date,b.requested_time FROM private_tutor_rooms r LEFT JOIN private_tutor_bookings b ON b.id=r.booking_id WHERE r.tutor_id=$1 AND r.status IN ('waiting','active') ORDER BY r.created_at DESC`, [tutor.id]),
+      db.query(`SELECT rec.*,r.student_email FROM private_tutor_recordings rec JOIN private_tutor_rooms r ON r.id=rec.room_id WHERE r.tutor_id=$1 ORDER BY rec.created_at DESC LIMIT 100`, [tutor.id]),
+      db.query("SELECT COUNT(*)::int AS count FROM private_tutor_profile_views WHERE tutor_id=$1", [tutor.id])
+    ]);
+    res.json({ ok: true, tutor: formatPrivateTutor(tutor), stats: { views: Number(views.rows[0]?.count) || 0, bookings: bookings.rows.length, live: rooms.rows.length, recordings: recordings.rows.length }, bookings: bookings.rows, currentLectures: rooms.rows, recordings: recordings.rows });
+  } catch (e) { res.status(500).json({ ok: false, msg: "تعذر تحميل لوحة المعلم" }); }
+});
 
 async function ensurePrivateTutorAccount(email, password, fullName) {
   const normalized = String(email || "").trim().toLowerCase();
@@ -3149,7 +3246,7 @@ async function tutorPaymentPlan(tutorId, email) {
 app.get("/api/private-tutors", async (_req, res) => {
   try {
     const result = await db.query(
-      "SELECT * FROM private_tutors WHERE active=TRUE ORDER BY created_at DESC"
+      "SELECT * FROM private_tutors WHERE active=TRUE AND COALESCE(verification_status,'approved')='approved' ORDER BY created_at DESC"
     );
     res.json({ ok: true, tutors: result.rows.map(formatPrivateTutor) });
   } catch (e) {
@@ -3162,12 +3259,13 @@ app.get("/api/private-tutors/:id/profile", async (req, res) => {
   try {
     const id = String(req.params.id || "");
     const tutorResult = await db.query(
-      "SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE LIMIT 1",
+      "SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE AND COALESCE(verification_status,'approved')='approved' LIMIT 1",
       [id]
     );
     if (!tutorResult.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
     const user = privateTutorUser(req);
     const email = user ? String(user.email || "").toLowerCase() : "";
+    await db.query("INSERT INTO private_tutor_profile_views (id,tutor_id,viewer_email,created_at) VALUES ($1,$2,$3,$4)", [randomBytes(12).toString("hex"), id, email, Date.now()]).catch(() => {});
     const [likes, mine] = await Promise.all([
       db.query("SELECT COUNT(*)::int AS count FROM private_tutor_likes WHERE tutor_id=$1", [id]),
       email
@@ -3373,6 +3471,60 @@ app.get("/api/private-tutors/:id/subscription", async (req, res) => {
   } catch {
     res.status(500).json({ ok: false, active: false, canBook: false, lessonsRemaining: 0, expiresAt: 0 });
   }
+});
+
+app.get("/api/admin/private-tutor-applications/:id/certificate", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).end();
+    const q = await db.query("SELECT certificate_path,certificate_name,certificate_mime FROM private_tutor_applications WHERE id=$1", [String(req.params.id)]);
+    if (!q.rows.length || !q.rows[0].certificate_path) return res.status(404).end();
+    res.type(q.rows[0].certificate_mime || "application/octet-stream");
+    res.sendFile(q.rows[0].certificate_path);
+  } catch { res.status(500).end(); }
+});
+
+app.get("/api/admin/private-tutor-applications", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const q = await db.query("SELECT id,full_name,email,whatsapp,subject,bio,experience,certificate_name,certificate_mime,status,review_note,created_at,reviewed_at FROM private_tutor_applications ORDER BY created_at DESC LIMIT 200");
+    res.json({ ok: true, applications: q.rows });
+  } catch (e) { res.status(500).json({ ok: false, msg: "تعذر تحميل طلبات المعلمين" }); }
+});
+
+app.patch("/api/admin/private-tutor-applications/:id", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const id = String(req.params.id), action = String(req.body?.action || ""), note = String(req.body?.note || "").trim().slice(0, 1000);
+    const q = await db.query("SELECT * FROM private_tutor_applications WHERE id=$1 LIMIT 1", [id]);
+    if (!q.rows.length) return res.status(404).json({ ok: false, msg: "الطلب غير موجود" });
+    const appRow = q.rows[0];
+    if (appRow.status !== "pending") return res.status(400).json({ ok: false, msg: "تمت معالجة الطلب مسبقاً" });
+    if (action === "reject") {
+      await db.query("UPDATE private_tutor_applications SET status='rejected',review_note=$1,reviewed_at=$2 WHERE id=$3", [note, Date.now(), id]);
+      await db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), appRow.email, "تم تحديث طلب تسجيلك كمعلم خصوصي. راجع بريدك الإلكتروني.", "tutor_application", Date.now()]).catch(() => {});
+      await notifyTutorByEmail(appRow.email, "تحديث طلب المعلم الخصوصي", "تحديث طلبك", `لم تتم الموافقة على الطلب حالياً.${note ? `<br>الملاحظة: ${note}` : ""}`);
+      return res.json({ ok: true, status: "rejected" });
+    }
+    if (action !== "approve") return res.status(400).json({ ok: false, msg: "إجراء غير صالح" });
+    const tutorId = privateTutorId(), now = Date.now();
+    const inserted = await db.query(
+      `INSERT INTO private_tutors
+       (id,name,bio,subject,whatsapp,experience,verification_status,application_id,tutor_email,active,approved_at,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'approved',$7,$8,TRUE,$9,$9) RETURNING *`,
+      [tutorId, appRow.full_name, appRow.bio, appRow.subject, appRow.whatsapp, appRow.experience, id, appRow.email, now]
+    );
+    await db.query(
+      `INSERT INTO users (email,full_name,password_hash,email_verified,created_at,last_seen)
+       VALUES ($1,$2,$3,TRUE,$4,$4)
+       ON CONFLICT (email) DO UPDATE SET full_name=EXCLUDED.full_name,password_hash=EXCLUDED.password_hash,email_verified=TRUE,deleted_at=NULL,banned=FALSE`,
+      [appRow.email, appRow.full_name, appRow.password_hash, now]
+    );
+    await db.query("UPDATE private_tutor_applications SET status='approved',review_note=$1,tutor_id=$2,reviewed_at=$3 WHERE id=$4", [note, tutorId, now, id]);
+    invalidateSessionCache(appRow.email);
+    await db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), appRow.email, "تمت الموافقة على طلبك. يمكنك الآن الدخول بحساب المعلم.", "tutor_application", now]).catch(() => {});
+    await notifyTutorByEmail(appRow.email, "تمت الموافقة على حساب المعلم الخصوصي", "تمت الموافقة على طلبك 🎉", "تم تفعيل حسابك كمعلم خصوصي. يمكنك الدخول الآن باستخدام إيميلك وكلمة المرور التي اخترتها عند التقديم.");
+    res.json({ ok: true, status: "approved", tutor: formatPrivateTutor(inserted.rows[0]) });
+  } catch (e) { console.error("tutor application review:", e.message); res.status(500).json({ ok: false, msg: "تعذر معالجة الطلب" }); }
 });
 
 app.get("/api/admin/private-tutors", async (req, res) => {
