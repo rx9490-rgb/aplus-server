@@ -242,6 +242,15 @@ async function initDB() {
       created_at     BIGINT NOT NULL,
       PRIMARY KEY (tutor_id, student_email)
     );
+    CREATE TABLE IF NOT EXISTS private_tutor_ratings (
+      id             TEXT PRIMARY KEY,
+      tutor_id       TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
+      booking_id     TEXT NOT NULL UNIQUE REFERENCES private_tutor_bookings(id) ON DELETE CASCADE,
+      student_email  TEXT NOT NULL,
+      rating         INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      review          TEXT DEFAULT '',
+      created_at      BIGINT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS private_tutor_payments (
       id                TEXT PRIMARY KEY,
       transaction_no    TEXT UNIQUE NOT NULL,
@@ -3066,6 +3075,12 @@ function privateTutorUser(req) {
   return token ? getSessionUser(token) : null;
 }
 
+function tutorEmailHtmlText(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+  })[char]);
+}
+
 function formatPrivateTutor(row) {
   return {
     id: row.id,
@@ -3246,9 +3261,18 @@ async function tutorPaymentPlan(tutorId, email) {
 app.get("/api/private-tutors", async (_req, res) => {
   try {
     const result = await db.query(
-      "SELECT * FROM private_tutors WHERE active=TRUE AND COALESCE(verification_status,'approved')='approved' ORDER BY created_at DESC"
+      `SELECT t.*,
+        (SELECT COALESCE(ROUND(AVG(r.rating)::numeric,1),0) FROM private_tutor_ratings r WHERE r.tutor_id=t.id) AS rating,
+        (SELECT COUNT(*)::int FROM private_tutor_ratings r WHERE r.tutor_id=t.id) AS rating_count
+       FROM private_tutors t
+       WHERE t.active=TRUE AND COALESCE(t.verification_status,'approved')='approved'
+       ORDER BY t.created_at DESC`
     );
-    res.json({ ok: true, tutors: result.rows.map(formatPrivateTutor) });
+    res.json({ ok: true, tutors: result.rows.map((row) => ({
+      ...formatPrivateTutor(row),
+      rating: Number(row.rating) || 0,
+      ratingCount: Number(row.rating_count) || 0
+    })) });
   } catch (e) {
     console.error("private tutors list:", e.message);
     res.status(500).json({ ok: false, tutors: [] });
@@ -3266,11 +3290,12 @@ app.get("/api/private-tutors/:id/profile", async (req, res) => {
     const user = privateTutorUser(req);
     const email = user ? String(user.email || "").toLowerCase() : "";
     await db.query("INSERT INTO private_tutor_profile_views (id,tutor_id,viewer_email,created_at) VALUES ($1,$2,$3,$4)", [randomBytes(12).toString("hex"), id, email, Date.now()]).catch(() => {});
-    const [likes, mine] = await Promise.all([
+    const [likes, mine, ratings] = await Promise.all([
       db.query("SELECT COUNT(*)::int AS count FROM private_tutor_likes WHERE tutor_id=$1", [id]),
       email
         ? db.query("SELECT 1 FROM private_tutor_likes WHERE tutor_id=$1 AND student_email=$2 LIMIT 1", [id, email])
-        : Promise.resolve({ rows: [] })
+        : Promise.resolve({ rows: [] }),
+      db.query("SELECT COALESCE(ROUND(AVG(rating)::numeric,1),0) AS average,COUNT(*)::int AS count FROM private_tutor_ratings WHERE tutor_id=$1", [id])
     ]);
     const tutor = formatPrivateTutor(tutorResult.rows[0]);
     res.json({
@@ -3278,7 +3303,9 @@ app.get("/api/private-tutors/:id/profile", async (req, res) => {
       tutor,
       stats: {
         likes: Number(likes.rows[0]?.count) || 0,
-        liked: mine.rows.length > 0
+        liked: mine.rows.length > 0,
+        rating: Number(ratings.rows[0]?.average) || 0,
+        ratingCount: Number(ratings.rows[0]?.count) || 0
       }
     });
   } catch (e) {
@@ -3310,6 +3337,50 @@ app.post("/api/private-tutors/:id/like", async (req, res) => {
   } catch (e) {
     console.error("private tutor like:", e.message);
     res.status(500).json({ ok: false, msg: "تعذر تسجيل الإعجاب" });
+  }
+});
+
+app.post("/api/private-tutor-bookings/:bookingId/rating", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const rating = Number(req.body?.rating);
+    const review = String(req.body?.review || "").trim().slice(0, 1000);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ ok: false, msg: "اختر تقييماً من نجمة إلى خمس نجوم" });
+    }
+    const booking = await db.query(
+      `SELECT id,tutor_id,status FROM private_tutor_bookings
+       WHERE id=$1 AND lower(student_email)=lower($2) LIMIT 1`,
+      [String(req.params.bookingId || ""), String(user.email || "")]
+    );
+    if (!booking.rows.length) return res.status(404).json({ ok: false, msg: "الحجز غير موجود" });
+    if (booking.rows[0].status !== "completed") {
+      return res.status(409).json({ ok: false, msg: "يمكنك تقييم المعلم بعد انتهاء الدرس" });
+    }
+    await db.query(
+      `INSERT INTO private_tutor_ratings
+       (id,tutor_id,booking_id,student_email,rating,review,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (booking_id) DO UPDATE
+       SET rating=EXCLUDED.rating,review=EXCLUDED.review,created_at=EXCLUDED.created_at`,
+      [randomBytes(12).toString("hex"), booking.rows[0].tutor_id, booking.rows[0].id,
+        String(user.email).toLowerCase(), rating, review, Date.now()]
+    );
+    const summary = await db.query(
+      "SELECT COALESCE(ROUND(AVG(rating)::numeric,1),0) AS average,COUNT(*)::int AS count FROM private_tutor_ratings WHERE tutor_id=$1",
+      [booking.rows[0].tutor_id]
+    );
+    res.json({
+      ok: true,
+      rating,
+      review,
+      average: Number(summary.rows[0]?.average) || 0,
+      ratingCount: Number(summary.rows[0]?.count) || 0
+    });
+  } catch (e) {
+    console.error("private tutor rating:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر حفظ التقييم" });
   }
 });
 
@@ -3742,94 +3813,120 @@ app.post("/api/private-tutors/:id/activate", async (req, res) => {
   }
 });
 
+app.get("/api/private-tutors/:id/availability", async (req, res) => {
+  try {
+    const tutorId = String(req.params.id || "");
+    const from = String(req.query.from || new Date().toISOString().slice(0, 10));
+    const to = String(req.query.to || new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return res.status(400).json({ ok: false, msg: "نطاق التاريخ غير صالح" });
+    }
+    const tutor = await db.query(
+      "SELECT id FROM private_tutors WHERE id=$1 AND active=TRUE AND COALESCE(verification_status,'approved')='approved' LIMIT 1",
+      [tutorId]
+    );
+    if (!tutor.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
+    const rows = await db.query(
+      `SELECT COALESCE(NULLIF(proposed_date,''),requested_date) AS date,
+              COALESCE(NULLIF(proposed_time,''),requested_time) AS time,status
+       FROM private_tutor_bookings
+       WHERE tutor_id=$1
+         AND COALESCE(NULLIF(proposed_date,''),requested_date) >= $2
+         AND COALESCE(NULLIF(proposed_date,''),requested_date) <= $3
+         AND status IN ('pending','confirmed','proposed')
+       ORDER BY 1,2`,
+      [tutorId, from, to]
+    );
+    res.json({ ok: true, slots: rows.rows.map((slot) => ({
+      date: slot.date, time: slot.time, status: slot.status, available: false
+    })) });
+  } catch (e) {
+    console.error("private tutor availability:", e.message);
+    res.status(500).json({ ok: false, slots: [] });
+  }
+});
+
 app.post("/api/private-tutors/:id/bookings", async (req, res) => {
   try {
     const user = await privateTutorUser(req);
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const tutorId = String(req.params.id || "");
-    const dayOfWeek = String(req.body?.dayOfWeek || "").trim().slice(0, 30);
-    const timeText = String(req.body?.timeText || "").trim().slice(0, 30);
-    const requestedDate = String(req.body?.date || req.body?.requestedDate || "").trim().slice(0, 20);
-    const requestedTime = String(req.body?.time || req.body?.requestedTime || timeText).trim().slice(0, 30);
+    const requestedDate = String(req.body?.date || req.body?.requestedDate || "").trim().slice(0, 10);
+    const requestedTime = String(req.body?.time || req.body?.requestedTime || "").trim().slice(0, 5);
     const notes = String(req.body?.notes || "").trim().slice(0, 500);
-    if ((!dayOfWeek && !requestedDate) || (!timeText && !requestedTime)) {
-      return res.status(400).json({ ok: false, msg: "اختر اليوم والوقت" });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedDate) || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(requestedTime)) {
+      return res.status(400).json({ ok: false, msg: "اختر تاريخاً ووقتاً صالحين" });
     }
-    const studentEmail = String(user.email).toLowerCase();
+    const calendarDay = new Date(requestedDate + "T12:00:00Z");
+    if (!Number.isFinite(calendarDay.getTime()) || calendarDay.toISOString().slice(0, 10) !== requestedDate) {
+      return res.status(400).json({ ok: false, msg: "التاريخ غير صالح" });
+    }
+    const earliestParts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Amman", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+    }).formatToParts(new Date(Date.now() + 5 * 60000));
+    const earliest = Object.fromEntries(earliestParts.map((part) => [part.type, part.value]));
+    const earliestLocal = `${earliest.year}-${earliest.month}-${earliest.day}T${earliest.hour}:${earliest.minute}`;
+    if (requestedDate + "T" + requestedTime < earliestLocal) {
+      return res.status(400).json({ ok: false, msg: "اختر موعداً يبدأ بعد خمس دقائق على الأقل" });
+    }
+    const studentEmail = String(user.email || "").trim().toLowerCase();
+    const bookingId = privateTutorId();
+    const dayOfWeek = new Intl.DateTimeFormat("ar", { weekday: "long", timeZone: "Asia/Amman" }).format(calendarDay);
     const result = await withDbTransaction(async (client) => {
-      const now = Date.now();
-      const month = await client.query(
-        `SELECT id FROM private_tutor_payments
-         WHERE tutor_id=$1 AND student_email=$2 AND plan='month' AND status='paid'
-         AND expires_at>$3 ORDER BY expires_at DESC LIMIT 1 FOR UPDATE`,
-        [tutorId, studentEmail, now]
+      const tutor = await client.query(
+        "SELECT id,name,tutor_email FROM private_tutors WHERE id=$1 AND active=TRUE AND COALESCE(verification_status,'approved')='approved' FOR UPDATE",
+        [tutorId]
       );
-      let paidPlan = month.rows.length ? "month" : "";
-      if (!paidPlan) {
-        const lesson = await client.query(
-          `SELECT id FROM private_tutor_payments
-           WHERE tutor_id=$1 AND student_email=$2 AND plan='lesson' AND status='paid'
-           AND lessons_remaining>0 ORDER BY paid_at ASC LIMIT 1 FOR UPDATE`,
-          [tutorId, studentEmail]
-        );
-        if (lesson.rows.length) {
-          paidPlan = "lesson";
-          await client.query(
-            "UPDATE private_tutor_payments SET lessons_remaining=lessons_remaining-1 WHERE id=$1",
-            [lesson.rows[0].id]
-          );
-        }
-      }
-      if (!paidPlan) {
-        const legacy = await client.query(
-          `SELECT id,plan,lessons_remaining FROM private_tutor_codes
-           WHERE tutor_id=$1 AND student_email=$2 AND status='active'
-           AND (plan='month' OR lessons_remaining>0 OR plan IS NULL)
-           AND (expires_at IS NULL OR expires_at>$3)
-           ORDER BY activated_at ASC LIMIT 1 FOR UPDATE`,
-          [tutorId, studentEmail, now]
-        );
-        if (legacy.rows.length) {
-          const codeRow = legacy.rows[0];
-          paidPlan = codeRow.plan || "month";
-          if (paidPlan !== "month") {
-            const remaining = Math.max(0, Number(codeRow.lessons_remaining) - 1);
-            await client.query(
-              "UPDATE private_tutor_codes SET lessons_remaining=$1,status=$2 WHERE id=$3",
-              [remaining, remaining > 0 ? "active" : "used", codeRow.id]
-            );
-          }
-        }
-      }
-      if (!paidPlan) {
-        const error = new Error("payment_required");
-        error.code = "TUTOR_PAYMENT_REQUIRED";
+      if (!tutor.rows.length) {
+        const error = new Error("tutor_not_found");
+        error.code = "TUTOR_NOT_FOUND";
         throw error;
       }
-      await client.query(
-        "UPDATE private_tutor_bookings SET status='replaced' WHERE tutor_id=$1 AND student_email=$2 AND status='pending'",
-        [tutorId, studentEmail]
+      const occupied = await client.query(
+        `SELECT id FROM private_tutor_bookings
+         WHERE tutor_id=$1
+           AND COALESCE(NULLIF(proposed_date,''),requested_date)=$2
+           AND COALESCE(NULLIF(proposed_time,''),requested_time)=$3
+           AND status IN ('pending','confirmed','proposed')
+         LIMIT 1`,
+        [tutorId, requestedDate, requestedTime]
       );
-      return client.query(
+      if (occupied.rows.length) {
+        const error = new Error("slot_taken");
+        error.code = "TUTOR_SLOT_TAKEN";
+        throw error;
+      }
+      const booking = await client.query(
         `INSERT INTO private_tutor_bookings
          (id,tutor_id,student_email,day_of_week,time_text,requested_date,requested_time,notes,status,created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9) RETURNING *`,
-        [privateTutorId(), tutorId, studentEmail, dayOfWeek || requestedDate,
-          timeText || requestedTime, requestedDate, requestedTime, notes, now]
+         VALUES ($1,$2,$3,$4,$5,$6,$5,$7,'pending',$8) RETURNING *`,
+        [bookingId, tutorId, studentEmail, dayOfWeek, requestedTime, requestedDate, notes, Date.now()]
       );
+      return { booking: booking.rows[0], tutor: tutor.rows[0] };
     });
+    const safeTutorName = tutorEmailHtmlText(result.tutor.name);
+    const safeStudentEmail = tutorEmailHtmlText(studentEmail);
+    const safeNotes = tutorEmailHtmlText(notes || "لا توجد ملاحظات");
+    const message = `طلب حجز جديد: ${result.tutor.name} — ${requestedDate} الساعة ${requestedTime}.`;
+    const emailMessage = `طلب حجز جديد: ${safeTutorName} — ${requestedDate} الساعة ${requestedTime}.`;
+    const now = Date.now();
+    await Promise.all([
+      db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), studentEmail, "تم إرسال طلب الحجز وينتظر موافقة المعلم.", "tutor_booking", now]).catch(() => {}),
+      result.tutor.tutor_email ? db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), result.tutor.tutor_email, message, "tutor_booking", now]).catch(() => {}) : Promise.resolve(),
+      result.tutor.tutor_email ? notifyTutorByEmail(result.tutor.tutor_email, "طلب حجز درس جديد", "طلب حجز جديد", `${emailMessage}<br>الطالب: ${safeStudentEmail}<br>الملاحظة: ${safeNotes}`) : Promise.resolve(),
+      notifyTutorByEmail(studentEmail, "تأكيد استلام طلب الحجز", "تم استلام طلبك", `${emailMessage}<br>سيصلك إشعار عند رد المعلم.`)
+    ]);
     res.status(201).json({
       ok: true,
       booking: {
-        id: result.rows[0].id, dayOfWeek, timeText, requestedDate, requestedTime,
-        notes, status: "pending"
-      },
-      paidPlan: result.rows[0].paid_plan || null
+        id: result.booking.id, dayOfWeek, timeText: requestedTime,
+        requestedDate, requestedTime, notes, status: "pending"
+      }
     });
   } catch (e) {
-    if (e.code === "TUTOR_PAYMENT_REQUIRED") {
-      return res.status(403).json({ ok: false, msg: "ادفع قيمة شرح واحد أو اشترك شهرياً قبل الحجز" });
-    }
+    if (e.code === "TUTOR_NOT_FOUND") return res.status(404).json({ ok: false, msg: "المعلم غير متاح حالياً" });
+    if (e.code === "TUTOR_SLOT_TAKEN") return res.status(409).json({ ok: false, msg: "هذا الموعد حُجز للتو. اختر وقتاً آخر." });
     console.error("private tutor booking:", e.message);
     res.status(500).json({ ok: false, msg: "تعذر حفظ الموعد" });
   }
@@ -3841,11 +3938,13 @@ app.get("/api/private-tutors/:id/bookings", async (req, res) => {
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const tutorId = String(req.params.id || "");
     const rows = await db.query(
-      `SELECT id,day_of_week,time_text,requested_date,requested_time,
-              proposed_date,proposed_time,response_note,notes,status,created_at
-       FROM private_tutor_bookings
-       WHERE tutor_id=$1 AND student_email=$2
-       ORDER BY created_at DESC LIMIT 50`,
+      `SELECT b.id,b.day_of_week,b.time_text,b.requested_date,b.requested_time,
+              b.proposed_date,b.proposed_time,b.response_note,b.notes,b.status,b.created_at,
+              r.rating AS student_rating,r.review AS student_review
+       FROM private_tutor_bookings b
+       LEFT JOIN private_tutor_ratings r ON r.booking_id=b.id
+       WHERE b.tutor_id=$1 AND b.student_email=$2
+       ORDER BY b.created_at DESC LIMIT 50`,
       [tutorId, String(user.email || "").toLowerCase()]
     );
     res.json({
@@ -3855,7 +3954,8 @@ app.get("/api/private-tutors/:id/bookings", async (req, res) => {
         requestedDate: b.requested_date || "", requestedTime: b.requested_time || "",
         proposedDate: b.proposed_date || "", proposedTime: b.proposed_time || "",
         responseNote: b.response_note || "", notes: b.notes || "",
-        status: b.status, createdAt: Number(b.created_at) || 0
+        status: b.status, rating: Number(b.student_rating) || 0,
+        review: b.student_review || "", createdAt: Number(b.created_at) || 0
       }))
     });
   } catch (e) {
@@ -3891,15 +3991,54 @@ async function updatePrivateTutorBooking(req, res) {
     const proposedDate = String(req.body?.proposedDate || "").trim().slice(0, 20);
     const proposedTime = String(req.body?.proposedTime || "").trim().slice(0, 30);
     const responseNote = String(req.body?.responseNote || "").trim().slice(0, 500);
-    if (status === "proposed" && (!proposedDate || !proposedTime)) {
+    if (status === "proposed" && (!/^\d{4}-\d{2}-\d{2}$/.test(proposedDate) || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(proposedTime))) {
       return res.status(400).json({ ok: false, msg: "اكتب التاريخ والوقت المقترح" });
     }
-    const result = await db.query(
-      `UPDATE private_tutor_bookings
-       SET status=$1,proposed_date=$2,proposed_time=$3,response_note=$4,responded_at=$5
-       WHERE id=$6 RETURNING *`,
-      [status, proposedDate, proposedTime, responseNote, Date.now(), bookingId]
-    );
+    const result = await withDbTransaction(async (client) => {
+      await client.query("SELECT id FROM private_tutors WHERE id=$1 FOR UPDATE", [booking.tutor_id]);
+      if (status === "proposed") {
+        const occupied = await client.query(
+          `SELECT id FROM private_tutor_bookings
+           WHERE tutor_id=$1 AND id<>$2
+             AND COALESCE(NULLIF(proposed_date,''),requested_date)=$3
+             AND COALESCE(NULLIF(proposed_time,''),requested_time)=$4
+             AND status IN ('pending','confirmed','proposed')
+           LIMIT 1`,
+          [booking.tutor_id, bookingId, proposedDate, proposedTime]
+        );
+        if (occupied.rows.length) {
+          const error = new Error("slot_taken");
+          error.code = "TUTOR_SLOT_TAKEN";
+          throw error;
+        }
+      }
+      return client.query(
+        `UPDATE private_tutor_bookings
+         SET status=$1,proposed_date=$2,proposed_time=$3,response_note=$4,responded_at=$5
+         WHERE id=$6 RETURNING *`,
+        [status, proposedDate, proposedTime, responseNote, Date.now(), bookingId]
+      );
+    });
+    const bookingDate = status === "proposed" ? proposedDate : booking.requested_date;
+    const bookingTime = status === "proposed" ? proposedTime : booking.requested_time;
+    const updateMessage = status === "confirmed"
+      ? `تم تأكيد درس ${bookingDate} الساعة ${bookingTime}.`
+      : status === "proposed"
+        ? `اقترح المعلم موعداً جديداً: ${bookingDate} الساعة ${bookingTime}.`
+        : `اعتذر المعلم عن الموعد ${booking.requested_date} الساعة ${booking.requested_time}.`;
+    const safeBookingDate = tutorEmailHtmlText(bookingDate);
+    const safeBookingTime = tutorEmailHtmlText(bookingTime);
+    const emailUpdateMessage = status === "confirmed"
+      ? `تم تأكيد درس ${safeBookingDate} الساعة ${safeBookingTime}.`
+      : status === "proposed"
+        ? `اقترح المعلم موعداً جديداً: ${safeBookingDate} الساعة ${safeBookingTime}.`
+        : `اعتذر المعلم عن الموعد ${tutorEmailHtmlText(booking.requested_date)} الساعة ${tutorEmailHtmlText(booking.requested_time)}.`;
+    const notificationAt = Date.now();
+    await Promise.all([
+      db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), booking.student_email, updateMessage, "tutor_booking", notificationAt]).catch(() => {}),
+      notifyTutorByEmail(booking.student_email, "تحديث موعد الدرس", "تحديث الحجز", emailUpdateMessage),
+      tutorEmail ? notifyTutorByEmail(tutorEmail, "تم تحديث موعد الدرس", "تم تحديث الحجز", emailUpdateMessage) : Promise.resolve()
+    ]);
     res.json({
       ok: true,
       booking: {
@@ -3910,6 +4049,7 @@ async function updatePrivateTutorBooking(req, res) {
       }
     });
   } catch (e) {
+    if (e.code === "TUTOR_SLOT_TAKEN") return res.status(409).json({ ok: false, msg: "الموعد المقترح محجوز مسبقاً. اختر وقتاً آخر." });
     console.error("private tutor booking response:", e.message);
     res.status(500).json({ ok: false, msg: "تعذر تحديث الحجز" });
   }
@@ -4084,13 +4224,15 @@ app.post("/api/private-tutor-rooms/:roomId/recordings/upload",async(req,res)=>{t
   if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
   if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
   if(a.role==="student"&&![...(tutorRoomParticipants.get(roomId)||new Map()).values()].some(v=>v.email===a.user.email&&v.approved))return res.status(403).json({ok:false,msg:"انتظر موافقة المعلم أولاً"});
-  const match=/^data:([^;]+);base64,([\s\S]+)$/.exec(raw);
+  const match=/^data:(video\/(?:webm|mp4))(?:;[^;]*)*;base64,([\s\S]+)$/i.exec(raw);
   if(!match)return res.status(400).json({ok:false,msg:"ملف التسجيل غير صالح"});
   const buffer=Buffer.from(match[2],"base64");
   if(!buffer.length||buffer.length>80*1024*1024)return res.status(413).json({ok:false,msg:"حجم التسجيل أكبر من 80MB"});
-  const id=tutorRecId(),mime=String(match[1]||"video/webm").slice(0,100),root=path.join(__dirname,"private-tutor-recordings");
+  const mediaType=String(match[1]||"video/webm").toLowerCase();
+  if(!["video/webm","video/mp4"].includes(mediaType))return res.status(415).json({ok:false,msg:"صيغة التسجيل غير مدعومة"});
+  const id=tutorRecId(),mime=mediaType,extension=mediaType==="video/mp4"?"mp4":"webm",root=path.join(__dirname,"private-tutor-recordings");
   await fs.mkdir(root,{recursive:true});
-  const filePath=path.join(root,id+".webm");
+  const filePath=path.join(root,id+"."+extension);
   await fs.writeFile(filePath,buffer);
   const url="/api/private-tutor-rooms/"+roomId+"/recordings/"+id+"/file";
   const r=await db.query(
@@ -4109,7 +4251,17 @@ app.get("/api/private-tutor-rooms/:roomId/recordings/:recordingId/file",async(re
 }catch(e){res.status(500).end();}});
 app.get("/api/private-tutor-rooms/:roomId/recordings",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(a.role==="student"&&![...(tutorRoomParticipants.get(a.room.id)||new Map()).values()].some(v=>v.email===a.user.email&&v.approved))return res.status(403).json({ok:false,msg:"انتظر موافقة المعلم أولاً"});const r=await db.query("SELECT * FROM private_tutor_recordings WHERE room_id=$1 ORDER BY created_at DESC",[a.room.id]);res.json({ok:true,recordings:r.rows.map(x=>({id:x.id,roomId:x.room_id,recordingUrl:x.recording_url,durationSec:Number(x.duration_sec)||0,mimeType:x.mime_type,fileSize:Number(x.file_size)||0,createdAt:Number(x.created_at)}))});}catch(e){res.status(500).json({ok:false,recordings:[]});}});
 
-app.post("/api/private-tutor-rooms/:roomId/end",async(req,res)=>{try{const a=await roomAccess(req,String(req.params.roomId));if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(a.role!=="tutor"&&a.role!=="admin")return res.status(403).json({ok:false,msg:"المعلم فقط ينهي الدرس"});const t=Date.now(),r=await db.query("UPDATE private_tutor_rooms SET status='ended',ended_at=$1 WHERE id=$2 RETURNING *",[t,a.room.id]);emitRoom(a.room.id,"room-ended",{roomId:a.room.id,endedAt:t});res.json({ok:true,room:roomView(r.rows[0])});}catch(e){res.status(500).json({ok:false,msg:"تعذر إنهاء الدرس"});}});
+app.post("/api/private-tutor-rooms/:roomId/end",async(req,res)=>{try{
+  const a=await roomAccess(req,String(req.params.roomId));
+  if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
+  if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
+  if(a.role!=="tutor"&&a.role!=="admin")return res.status(403).json({ok:false,msg:"المعلم فقط ينهي الدرس"});
+  const t=Date.now();
+  const r=await db.query("UPDATE private_tutor_rooms SET status='ended',ended_at=$1 WHERE id=$2 RETURNING *",[t,a.room.id]);
+  if(a.room.booking_id)await db.query("UPDATE private_tutor_bookings SET status='completed',responded_at=$1 WHERE id=$2 AND status='confirmed'",[t,a.room.booking_id]);
+  emitRoom(a.room.id,"room-ended",{roomId:a.room.id,endedAt:t});
+  res.json({ok:true,room:roomView(r.rows[0])});
+}catch(e){res.status(500).json({ok:false,msg:"تعذر إنهاء الدرس"});}});
 
 
 // API 404 — طلبات /api غير الموجودة تعيد JSON وليس HTML
