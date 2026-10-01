@@ -327,7 +327,6 @@ async function initDB() {
     `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS response_note TEXT DEFAULT ''`,
     `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS responded_at BIGINT DEFAULT 0`,
     `ALTER TABLE private_tutor_recordings ADD COLUMN IF NOT EXISTS file_path TEXT DEFAULT ''`,
-    `DROP TABLE IF EXISTS private_tutor_reviews`,
   ];
   for (const sql of safeCols) {
     try { await db.query(sql); } catch {}
@@ -989,6 +988,54 @@ app.get("/api/healthz", (_req, res) => {
     return res.status(503).json({ status: "starting", message: "قاعدة البيانات قيد التشغيل" });
   }
   res.json({ status: "ok", time: Date.now(), clients: sseClients.size });
+});
+
+app.get("/api/notifications", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    const requested = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requested) ? Math.min(50, Math.max(1, requested)) : 20;
+    const result = await db.query(
+      "SELECT id, message, type, read, created_at FROM notifications WHERE user_email = $1 ORDER BY created_at DESC LIMIT $2",
+      [user.email, limit]
+    );
+    res.json({ ok: true, notifications: result.rows });
+  } catch (error) {
+    console.error("notifications list error:", error.message);
+    res.status(500).json({ ok: false, msg: "تعذر تحميل الإشعارات" });
+  }
+});
+
+app.patch("/api/notifications/read-all", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    await db.query(
+      "UPDATE notifications SET read = TRUE WHERE user_email = $1 AND read = FALSE",
+      [user.email]
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("notifications read-all error:", error.message);
+    res.status(500).json({ ok: false, msg: "تعذر تحديث الإشعارات" });
+  }
+});
+
+app.patch("/api/notifications/:id/read", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    const result = await db.query(
+      "UPDATE notifications SET read = TRUE WHERE id = $1 AND user_email = $2 RETURNING id",
+      [String(req.params.id || ""), user.email]
+    );
+    if (!result.rows.length) return res.status(404).json({ ok: false, msg: "الإشعار غير موجود" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("notifications read error:", error.message);
+    res.status(500).json({ ok: false, msg: "تعذر تحديث الإشعار" });
+  }
 });
 
 app.get("/ping", (_req, res) => res.send("pong"));
