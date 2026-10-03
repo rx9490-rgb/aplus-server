@@ -293,6 +293,38 @@ async function initDB() {
       id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
       viewer_email TEXT DEFAULT '', created_at BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS community_messages (
+      id TEXT PRIMARY KEY,
+      author_email TEXT NOT NULL,
+      author_name TEXT NOT NULL DEFAULT '',
+      channel TEXT NOT NULL DEFAULT 'general',
+      content TEXT NOT NULL,
+      content_type TEXT NOT NULL DEFAULT 'message',
+      reply_to TEXT,
+      created_at BIGINT NOT NULL,
+      deleted_at BIGINT DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS community_messages_channel_created_idx
+      ON community_messages(channel, created_at DESC) WHERE deleted_at = 0;
+    CREATE TABLE IF NOT EXISTS community_reports (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL,
+      reporter_email TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at BIGINT NOT NULL,
+      UNIQUE(message_id, reporter_email)
+    );
+    CREATE INDEX IF NOT EXISTS community_reports_status_created_idx
+      ON community_reports(status, created_at DESC);
+    CREATE TABLE IF NOT EXISTS community_blocks (
+      id TEXT PRIMARY KEY,
+      owner_email TEXT NOT NULL,
+      blocked_email TEXT NOT NULL,
+      display_name TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL,
+      UNIQUE(owner_email, blocked_email)
+    );
   `);
 
   // أعمدة جديدة لم تكن موجودة — آمن للتشغيل أكثر من مرة
@@ -2988,6 +3020,310 @@ app.post("/api/openrouter/vision", async (req, res) => {
     else code = String(lastErr.status);
   }
   res.status(502).json({ ok: false, error: code });
+});
+
+// ══════════════════════════════════════════════
+// Community discussion — authenticated posting, plain text, reporting and blocking
+// ══════════════════════════════════════════════
+const COMMUNITY_CHANNELS = new Set([
+  "general", "medicine", "nursing", "pharmacy", "dentistry",
+  "laboratory", "allied_health", "public_health", "study_support",
+  "allied-health", "other"
+]);
+const COMMUNITY_CONTENT_TYPES = new Set([
+  "message", "discussion", "question", "summary", "study_question"
+]);
+const communityPostWindows = new Map();
+
+function communityChannel(value) {
+  const channel = String(value || "general").trim().toLowerCase();
+  return COMMUNITY_CHANNELS.has(channel) ? channel : null;
+}
+
+function communityUserName(user) {
+  return String(user?.full_name || user?.fullName || user?.email?.split("@")[0] || "عضو")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 60) || "عضو";
+}
+
+async function requireCommunityUser(req, res) {
+  const auth = String(req.headers.authorization || "");
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const token = req.headers["x-session-token"] || bearer;
+  const user = await getSessionUser(token);
+  if (!user) {
+    res.status(401).json({ ok: false, error: "login_required", msg: "سجل الدخول للمشاركة" });
+    return null;
+  }
+  if (user.banned) {
+    res.status(403).json({ ok: false, error: "account_blocked", msg: "الحساب موقوف" });
+    return null;
+  }
+  return user;
+}
+
+function communityRateAllowed(email) {
+  const now = Date.now();
+  const key = String(email || "");
+  const record = communityPostWindows.get(key);
+  if (!record || now - record.startedAt >= 60_000) {
+    communityPostWindows.set(key, { startedAt: now, count: 1 });
+    return true;
+  }
+  if (record.count >= 12) return false;
+  record.count += 1;
+  return true;
+}
+
+function publicCommunityMessage(row, mine = false) {
+  return {
+    id: row.id,
+    authorName: row.author_name,
+    channel: row.channel,
+    content: row.content,
+    contentType: row.content_type,
+    replyTo: row.reply_to || null,
+    createdAt: Number(row.created_at) || 0,
+    mine: !!mine
+  };
+}
+
+app.get("/api/community/messages", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const channel = communityChannel(req.query.channel);
+    if (!channel) return res.status(400).json({ ok: false, error: "invalid_channel" });
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(60, Math.max(1, requestedLimit)) : 40;
+    const requestedBefore = Number(req.query.before);
+    const before = Number.isFinite(requestedBefore) && requestedBefore > 0 ? requestedBefore : 0;
+    const token = req.headers["x-session-token"];
+    const viewer = token ? await getSessionUser(token).catch(() => null) : null;
+    const result = await db.query(
+      `SELECT m.id, m.author_email, m.author_name, m.channel, m.content,
+              m.content_type, m.reply_to, m.created_at
+       FROM community_messages m
+       WHERE m.channel = $1 AND m.deleted_at = 0
+         AND ($2::bigint = 0 OR m.created_at < $2)
+         AND ($3::text IS NULL OR NOT EXISTS (
+           SELECT 1 FROM community_blocks b
+           WHERE b.owner_email = $3 AND b.blocked_email = m.author_email
+         ))
+       ORDER BY m.created_at DESC LIMIT $4`,
+      [channel, before, viewer?.email || null, limit]
+    );
+    const messages = result.rows.reverse().map((row) =>
+      publicCommunityMessage(row, viewer?.email === row.author_email)
+    );
+    res.json({ ok: true, messages });
+  } catch (error) {
+    console.error("community messages error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_unavailable" });
+  }
+});
+
+app.post("/api/community/messages", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const channel = communityChannel(req.body?.channel);
+    const contentType = String(req.body?.contentType || "message");
+    const content = String(req.body?.content || "").replace(/\u0000/g, "").trim();
+    const replyTo = req.body?.replyTo ? String(req.body.replyTo).slice(0, 64) : null;
+    if (!channel) return res.status(400).json({ ok: false, error: "invalid_channel" });
+    if (!COMMUNITY_CONTENT_TYPES.has(contentType)) {
+      return res.status(400).json({ ok: false, error: "invalid_content_type" });
+    }
+    if (!content || content.length > 4000) {
+      return res.status(400).json({ ok: false, error: "content_length", msg: "الرسالة مطلوبة وبحد أقصى 4000 حرف" });
+    }
+    if (!communityRateAllowed(user.email)) {
+      return res.status(429).json({ ok: false, error: "posting_rate_limit", msg: "أرسلت رسائل كثيرة؛ انتظر دقيقة ثم حاول مجدداً" });
+    }
+    if (replyTo) {
+      const parent = await db.query(
+        "SELECT id FROM community_messages WHERE id=$1 AND channel=$2 AND deleted_at=0",
+        [replyTo, channel]
+      );
+      if (!parent.rows.length) return res.status(400).json({ ok: false, error: "reply_target_not_found" });
+    }
+    const id = randomBytes(16).toString("hex");
+    const createdAt = Date.now();
+    const authorName = communityUserName(user);
+    await db.query(
+      `INSERT INTO community_messages
+       (id, author_email, author_name, channel, content, content_type, reply_to, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [id, user.email, authorName, channel, content, contentType, replyTo, createdAt]
+    );
+    res.status(201).json({
+      ok: true,
+      message: publicCommunityMessage({
+        id, author_name: authorName, channel, content,
+        content_type: contentType, reply_to: replyTo, created_at: createdAt
+      }, true)
+    });
+  } catch (error) {
+    console.error("community post error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_post_failed" });
+  }
+});
+
+app.delete("/api/community/messages/:id", async (req, res) => {
+  try {
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const result = await db.query(
+      `UPDATE community_messages SET deleted_at=$1
+       WHERE id=$2 AND author_email=$3 AND deleted_at=0`,
+      [Date.now(), String(req.params.id || "").slice(0, 64), user.email]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "message_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community delete error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_delete_failed" });
+  }
+});
+
+app.post("/api/community/reports", async (req, res) => {
+  try {
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const messageId = String(req.body?.messageId || "").slice(0, 64);
+    const reason = String(req.body?.reason || "").replace(/\u0000/g, "").trim().slice(0, 500);
+    if (!messageId || !reason) return res.status(400).json({ ok: false, error: "report_details_required" });
+    const target = await db.query(
+      "SELECT author_email FROM community_messages WHERE id=$1 AND deleted_at=0",
+      [messageId]
+    );
+    if (!target.rows.length) return res.status(404).json({ ok: false, error: "message_not_found" });
+    if (target.rows[0].author_email === user.email) {
+      return res.status(400).json({ ok: false, error: "cannot_report_own_message" });
+    }
+    const id = randomBytes(16).toString("hex");
+    const result = await db.query(
+      `INSERT INTO community_reports (id, message_id, reporter_email, reason, created_at)
+       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (message_id, reporter_email) DO NOTHING`,
+      [id, messageId, user.email, reason, Date.now()]
+    );
+    if (!result.rowCount) return res.status(409).json({ ok: false, error: "already_reported" });
+    res.status(201).json({ ok: true });
+  } catch (error) {
+    console.error("community report error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_report_failed" });
+  }
+});
+
+app.post("/api/community/blocks", async (req, res) => {
+  try {
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const messageId = String(req.body?.messageId || "").slice(0, 64);
+    const target = await db.query(
+      "SELECT author_email, author_name FROM community_messages WHERE id=$1 AND deleted_at=0",
+      [messageId]
+    );
+    if (!target.rows.length) return res.status(404).json({ ok: false, error: "message_not_found" });
+    if (target.rows[0].author_email === user.email) {
+      return res.status(400).json({ ok: false, error: "cannot_block_self" });
+    }
+    const id = randomBytes(16).toString("hex");
+    const result = await db.query(
+      `INSERT INTO community_blocks (id, owner_email, blocked_email, display_name, created_at)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (owner_email, blocked_email) DO UPDATE SET display_name=EXCLUDED.display_name
+       RETURNING id, display_name, created_at`,
+      [id, user.email, target.rows[0].author_email, target.rows[0].author_name, Date.now()]
+    );
+    res.json({ ok: true, block: result.rows[0] });
+  } catch (error) {
+    console.error("community block error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_block_failed" });
+  }
+});
+
+app.get("/api/community/blocks", async (req, res) => {
+  try {
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const result = await db.query(
+      "SELECT id, display_name, created_at FROM community_blocks WHERE owner_email=$1 ORDER BY created_at DESC",
+      [user.email]
+    );
+    res.json({
+      ok: true,
+      blocks: result.rows.map((row) => ({
+        id: row.id, displayName: row.display_name, createdAt: Number(row.created_at) || 0
+      }))
+    });
+  } catch (error) {
+    console.error("community block list error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_blocks_failed" });
+  }
+});
+
+app.delete("/api/community/blocks/:id", async (req, res) => {
+  try {
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const result = await db.query(
+      "DELETE FROM community_blocks WHERE id=$1 AND owner_email=$2",
+      [String(req.params.id || "").slice(0, 64), user.email]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "block_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community unblock error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_unblock_failed" });
+  }
+});
+
+app.get("/api/admin/community/reports", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const result = await db.query(
+      `SELECT r.id, r.message_id, r.reason, r.status, r.created_at,
+              COALESCE(u.full_name, 'عضو') AS reporter_name,
+              m.content, m.channel, m.author_name, m.deleted_at
+       FROM community_reports r
+       LEFT JOIN users u ON u.email=r.reporter_email
+       LEFT JOIN community_messages m ON m.id=r.message_id
+       WHERE r.status='open'
+       ORDER BY r.created_at DESC LIMIT 200`
+    );
+    res.json({ ok: true, reports: result.rows });
+  } catch (error) {
+    console.error("community admin reports error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_reports_failed" });
+  }
+});
+
+app.patch("/api/admin/community/reports/:id", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const status = String(req.body?.status || "");
+    if (!["dismissed", "hidden"].includes(status)) {
+      return res.status(400).json({ ok: false, error: "invalid_report_status" });
+    }
+    const result = await db.query(
+      "UPDATE community_reports SET status=$1 WHERE id=$2 AND status='open' RETURNING message_id",
+      [status, String(req.params.id || "").slice(0, 64)]
+    );
+    if (!result.rows.length) return res.status(404).json({ ok: false, error: "report_not_found" });
+    if (status === "hidden") {
+      await db.query(
+        "UPDATE community_messages SET deleted_at=$1 WHERE id=$2 AND deleted_at=0",
+        [Date.now(), result.rows[0].message_id]
+      );
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community admin review error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_review_failed" });
+  }
 });
 
 // Static files — يخدم من public/ داخل standalone أو من ../public
