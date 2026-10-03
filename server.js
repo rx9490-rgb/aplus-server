@@ -325,6 +325,26 @@ async function initDB() {
       created_at BIGINT NOT NULL,
       UNIQUE(owner_email, blocked_email)
     );
+    CREATE TABLE IF NOT EXISTS community_direct_threads (
+      id TEXT PRIMARY KEY,
+      user_a TEXT NOT NULL,
+      user_b TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      hidden_a BOOLEAN NOT NULL DEFAULT FALSE,
+      hidden_b BOOLEAN NOT NULL DEFAULT FALSE,
+      UNIQUE(user_a, user_b)
+    );
+    CREATE TABLE IF NOT EXISTS community_direct_messages (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL REFERENCES community_direct_threads(id) ON DELETE CASCADE,
+      sender_email TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      deleted_at BIGINT NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS community_direct_messages_thread_created_idx
+      ON community_direct_messages(thread_id, created_at DESC) WHERE deleted_at = 0;
   `);
 
   // أعمدة جديدة لم تكن موجودة — آمن للتشغيل أكثر من مرة
@@ -3142,12 +3162,14 @@ app.post("/api/community/messages", async (req, res) => {
     if (!communityRateAllowed(user.email)) {
       return res.status(429).json({ ok: false, error: "posting_rate_limit", msg: "أرسلت رسائل كثيرة؛ انتظر دقيقة ثم حاول مجدداً" });
     }
+    let replyTargetEmail = "";
     if (replyTo) {
       const parent = await db.query(
-        "SELECT id FROM community_messages WHERE id=$1 AND channel=$2 AND deleted_at=0",
+        "SELECT id, author_email FROM community_messages WHERE id=$1 AND channel=$2 AND deleted_at=0",
         [replyTo, channel]
       );
       if (!parent.rows.length) return res.status(400).json({ ok: false, error: "reply_target_not_found" });
+      replyTargetEmail = parent.rows[0].author_email;
     }
     const id = randomBytes(16).toString("hex");
     const createdAt = Date.now();
@@ -3158,6 +3180,12 @@ app.post("/api/community/messages", async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [id, user.email, authorName, channel, content, contentType, replyTo, createdAt]
     );
+    if (replyTargetEmail && replyTargetEmail !== user.email) {
+      await db.query(
+        "INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)",
+        [randomBytes(12).toString("hex"), replyTargetEmail, `رد ${authorName} على مشاركتك في قناة ${channel}`, "community_reply", createdAt]
+      ).catch((error) => console.warn("community reply notification failed:", error.message));
+    }
     res.status(201).json({
       ok: true,
       message: publicCommunityMessage({
@@ -3278,6 +3306,202 @@ app.delete("/api/community/blocks/:id", async (req, res) => {
   } catch (error) {
     console.error("community unblock error:", error?.message || error);
     res.status(500).json({ ok: false, error: "community_unblock_failed" });
+  }
+});
+
+// الرسائل الخاصة بين أعضاء المجتمع
+app.get("/api/community/direct", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const result = await db.query(
+      `SELECT t.id, t.updated_at,
+              CASE WHEN t.user_a=$1 THEN t.user_b ELSE t.user_a END AS partner_email,
+              COALESCE(u.full_name, split_part(CASE WHEN t.user_a=$1 THEN t.user_b ELSE t.user_a END, '@', 1), 'عضو') AS partner_name,
+              latest.content AS last_message, latest.created_at AS last_message_at
+       FROM community_direct_threads t
+       LEFT JOIN users u ON u.email = CASE WHEN t.user_a=$1 THEN t.user_b ELSE t.user_a END
+       LEFT JOIN LATERAL (
+         SELECT content, created_at FROM community_direct_messages
+         WHERE thread_id=t.id AND deleted_at=0 ORDER BY created_at DESC LIMIT 1
+       ) latest ON TRUE
+       WHERE ((t.user_a=$1 AND t.hidden_a=FALSE) OR (t.user_b=$1 AND t.hidden_b=FALSE))
+         AND NOT EXISTS (
+           SELECT 1 FROM community_blocks b
+           WHERE (b.owner_email=$1 AND b.blocked_email=CASE WHEN t.user_a=$1 THEN t.user_b ELSE t.user_a END)
+              OR (b.owner_email=CASE WHEN t.user_a=$1 THEN t.user_b ELSE t.user_a END AND b.blocked_email=$1)
+         )
+       ORDER BY t.updated_at DESC LIMIT 50`,
+      [user.email]
+    );
+    res.json({
+      ok: true,
+      conversations: result.rows.map((row) => ({
+        id: row.id,
+        partnerName: row.partner_name || "عضو",
+        lastMessage: row.last_message || "",
+        updatedAt: Number(row.last_message_at || row.updated_at) || 0
+      }))
+    });
+  } catch (error) {
+    console.error("community direct list error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "direct_list_failed" });
+  }
+});
+
+app.post("/api/community/direct/start", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const messageId = String(req.body?.messageId || "").slice(0, 64);
+    const target = await db.query(
+      "SELECT author_email FROM community_messages WHERE id=$1 AND deleted_at=0",
+      [messageId]
+    );
+    if (!target.rows.length) return res.status(404).json({ ok: false, error: "message_not_found" });
+    const partner = target.rows[0].author_email;
+    if (!partner || partner === user.email) return res.status(400).json({ ok: false, error: "invalid_recipient" });
+    const blocked = await db.query(
+      `SELECT 1 FROM community_blocks
+       WHERE (owner_email=$1 AND blocked_email=$2) OR (owner_email=$2 AND blocked_email=$1)
+       LIMIT 1`,
+      [user.email, partner]
+    );
+    if (blocked.rows.length) return res.status(403).json({ ok: false, error: "direct_blocked" });
+    const userA = user.email < partner ? user.email : partner;
+    const userB = user.email < partner ? partner : user.email;
+    const id = randomBytes(16).toString("hex");
+    const now = Date.now();
+    const thread = await db.query(
+      `INSERT INTO community_direct_threads (id,user_a,user_b,created_at,updated_at)
+       VALUES ($1,$2,$3,$4,$4)
+       ON CONFLICT (user_a,user_b) DO UPDATE SET updated_at=GREATEST(community_direct_threads.updated_at,EXCLUDED.updated_at)
+       RETURNING id`,
+      [id, userA, userB, now]
+    );
+    await db.query(
+      "UPDATE community_direct_threads SET hidden_a=FALSE WHERE id=$1 AND user_a=$2",
+      [thread.rows[0].id, user.email]
+    );
+    await db.query(
+      "UPDATE community_direct_threads SET hidden_b=FALSE WHERE id=$1 AND user_b=$2",
+      [thread.rows[0].id, user.email]
+    );
+    res.status(201).json({ ok: true, threadId: thread.rows[0].id });
+  } catch (error) {
+    console.error("community direct start error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "direct_start_failed" });
+  }
+});
+
+app.get("/api/community/direct/:id/messages", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const threadId = String(req.params.id || "").slice(0, 64);
+    const thread = await db.query(
+      `SELECT user_a,user_b FROM community_direct_threads
+       WHERE id=$1 AND (user_a=$2 OR user_b=$2)`,
+      [threadId, user.email]
+    );
+    if (!thread.rows.length) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+    const partner = thread.rows[0].user_a === user.email ? thread.rows[0].user_b : thread.rows[0].user_a;
+    const blocked = await db.query(
+      `SELECT 1 FROM community_blocks
+       WHERE (owner_email=$1 AND blocked_email=$2) OR (owner_email=$2 AND blocked_email=$1)
+       LIMIT 1`,
+      [user.email, partner]
+    );
+    if (blocked.rows.length) return res.status(403).json({ ok: false, error: "direct_blocked" });
+    const result = await db.query(
+      `SELECT id,sender_email,content,created_at FROM community_direct_messages
+       WHERE thread_id=$1 AND deleted_at=0 ORDER BY created_at DESC LIMIT 100`,
+      [threadId]
+    );
+    res.json({
+      ok: true,
+      messages: result.rows.reverse().map((row) => ({
+        id: row.id, mine: row.sender_email === user.email,
+        content: row.content, createdAt: Number(row.created_at) || 0
+      }))
+    });
+  } catch (error) {
+    console.error("community direct messages error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "direct_messages_failed" });
+  }
+});
+
+app.post("/api/community/direct/:id/messages", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const threadId = String(req.params.id || "").slice(0, 64);
+    const content = String(req.body?.content || "").replace(/\u0000/g, "").trim();
+    if (!content || content.length > 4000) {
+      return res.status(400).json({ ok: false, error: "content_length" });
+    }
+    if (!communityRateAllowed(user.email)) {
+      return res.status(429).json({ ok: false, error: "posting_rate_limit", msg: "أرسلت رسائل كثيرة؛ انتظر دقيقة ثم حاول مجدداً" });
+    }
+    const thread = await db.query(
+      `SELECT user_a,user_b FROM community_direct_threads
+       WHERE id=$1 AND (user_a=$2 OR user_b=$2)`,
+      [threadId, user.email]
+    );
+    if (!thread.rows.length) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+    const partner = thread.rows[0].user_a === user.email ? thread.rows[0].user_b : thread.rows[0].user_a;
+    const blocked = await db.query(
+      `SELECT 1 FROM community_blocks
+       WHERE (owner_email=$1 AND blocked_email=$2) OR (owner_email=$2 AND blocked_email=$1)
+       LIMIT 1`,
+      [user.email, partner]
+    );
+    if (blocked.rows.length) return res.status(403).json({ ok: false, error: "direct_blocked" });
+    const id = randomBytes(16).toString("hex");
+    const createdAt = Date.now();
+    await withDbTransaction(async (client) => {
+      await client.query(
+        "INSERT INTO community_direct_messages (id,thread_id,sender_email,content,created_at) VALUES ($1,$2,$3,$4,$5)",
+        [id, threadId, user.email, content, createdAt]
+      );
+      await client.query(
+        "UPDATE community_direct_threads SET updated_at=$1,hidden_a=FALSE,hidden_b=FALSE WHERE id=$2",
+        [createdAt, threadId]
+      );
+    });
+    await db.query(
+      "INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)",
+      [randomBytes(12).toString("hex"), partner, `رسالة خاصة جديدة من ${communityUserName(user)}`, "community_direct", createdAt]
+    ).catch((error) => console.warn("community direct notification failed:", error.message));
+    res.status(201).json({ ok: true, message: { id, mine: true, content, createdAt } });
+  } catch (error) {
+    console.error("community direct send error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "direct_send_failed" });
+  }
+});
+
+app.delete("/api/community/direct/:id", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const threadId = String(req.params.id || "").slice(0, 64);
+    const result = await db.query(
+      `UPDATE community_direct_threads
+       SET hidden_a=CASE WHEN user_a=$2 THEN TRUE ELSE hidden_a END,
+           hidden_b=CASE WHEN user_b=$2 THEN TRUE ELSE hidden_b END
+       WHERE id=$1 AND (user_a=$2 OR user_b=$2) RETURNING id`,
+      [threadId, user.email]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community direct delete error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "direct_delete_failed" });
   }
 });
 
