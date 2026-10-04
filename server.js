@@ -306,6 +306,13 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS community_messages_channel_created_idx
       ON community_messages(channel, created_at DESC) WHERE deleted_at = 0;
+    CREATE TABLE IF NOT EXISTS community_members (
+      email TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL DEFAULT '',
+      joined_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS community_members_joined_idx
+      ON community_members(joined_at DESC);
     CREATE TABLE IF NOT EXISTS community_reports (
       id TEXT PRIMARY KEY,
       message_id TEXT NOT NULL,
@@ -346,6 +353,21 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS community_direct_messages_thread_created_idx
       ON community_direct_messages(thread_id, created_at DESC) WHERE deleted_at = 0;
   `);
+
+  try {
+    await db.query(
+      `INSERT INTO community_members (email, display_name, joined_at)
+       SELECT LOWER(TRIM(author_email)),
+              COALESCE(MAX(NULLIF(TRIM(author_name), '')), 'عضو'),
+              MIN(created_at)
+       FROM community_messages
+       WHERE TRIM(author_email) <> ''
+       GROUP BY LOWER(TRIM(author_email))
+       ON CONFLICT (email) DO NOTHING`
+    );
+  } catch (error) {
+    console.warn("community member backfill skipped:", error?.message || error);
+  }
 
   // أعمدة جديدة لم تكن موجودة — آمن للتشغيل أكثر من مرة
   const safeCols = [
@@ -3109,6 +3131,71 @@ function publicCommunityMessage(row, mine = false) {
   };
 }
 
+app.get("/api/community/membership", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const auth = String(req.headers.authorization || "");
+    const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const token = req.headers["x-session-token"] || bearer;
+    let viewer = null;
+    if (token) {
+      viewer = await getSessionUser(token).catch(() => null);
+      if (!viewer) return res.status(401).json({ ok: false, error: "login_required" });
+    }
+    const email = String(viewer?.email || "").trim().toLowerCase();
+    const result = await db.query(
+      `SELECT EXISTS(
+         SELECT 1 FROM community_members WHERE email = $1
+       ) AS joined,
+       (SELECT COUNT(*)::int FROM community_members) AS member_count`,
+      [email]
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      ok: true,
+      joined: !!row.joined,
+      memberCount: Number(row.member_count) || 0
+    });
+  } catch (error) {
+    console.error("community membership error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_unavailable" });
+  }
+});
+
+app.post("/api/community/membership", async (req, res) => {
+  try {
+    if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
+    const user = await requireCommunityUser(req, res);
+    if (!user) return;
+    const email = String(user.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ ok: false, error: "account_email_required" });
+    const joinedAt = Date.now();
+    const inserted = await db.query(
+      `INSERT INTO community_members (email, display_name, joined_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (email) DO NOTHING
+       RETURNING joined_at`,
+      [email, communityUserName(user), joinedAt]
+    );
+    const result = await db.query(
+      `SELECT joined_at, (SELECT COUNT(*)::int FROM community_members) AS member_count
+       FROM community_members WHERE email = $1`,
+      [email]
+    );
+    const member = result.rows[0] || {};
+    res.status(inserted.rows.length ? 201 : 200).json({
+      ok: true,
+      joined: true,
+      alreadyJoined: !inserted.rows.length,
+      joinedAt: Number(member.joined_at) || joinedAt,
+      memberCount: Number(member.member_count) || 0
+    });
+  } catch (error) {
+    console.error("community join error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_join_failed" });
+  }
+});
+
 app.get("/api/community/messages", async (req, res) => {
   try {
     if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
@@ -3148,6 +3235,17 @@ app.post("/api/community/messages", async (req, res) => {
     if (!dbReady) return res.status(503).json({ ok: false, error: "database_unavailable" });
     const user = await requireCommunityUser(req, res);
     if (!user) return;
+    const membership = await db.query(
+      "SELECT 1 FROM community_members WHERE email=$1",
+      [String(user.email || "").trim().toLowerCase()]
+    );
+    if (!membership.rows.length) {
+      return res.status(403).json({
+        ok: false,
+        error: "community_join_required",
+        msg: "انضم إلى المجتمع أولاً للمشاركة"
+      });
+    }
     const channel = communityChannel(req.body?.channel);
     const contentType = String(req.body?.contentType || "message");
     const content = String(req.body?.content || "").replace(/\u0000/g, "").trim();
