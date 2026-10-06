@@ -171,6 +171,17 @@ async function initDB() {
       read       BOOLEAN DEFAULT FALSE,
       created_at BIGINT
     );
+    CREATE TABLE IF NOT EXISTS academic_archive (
+      id         TEXT PRIMARY KEY,
+      user_email TEXT NOT NULL,
+      item_type  TEXT NOT NULL,
+      title      TEXT NOT NULL DEFAULT '',
+      content    TEXT NOT NULL DEFAULT '',
+      metadata   JSONB NOT NULL DEFAULT '{}',
+      created_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS academic_archive_user_created_idx
+      ON academic_archive(user_email, created_at DESC);
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
       token      TEXT PRIMARY KEY,
       email      TEXT NOT NULL,
@@ -1113,6 +1124,87 @@ app.patch("/api/notifications/:id/read", async (req, res) => {
   } catch (error) {
     console.error("notifications read error:", error.message);
     res.status(500).json({ ok: false, msg: "تعذر تحديث الإشعار" });
+  }
+});
+
+app.get("/api/academic/archive", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    const type = String(req.query.type || "").trim().slice(0, 40) || null;
+    const requested = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requested) ? Math.min(50, Math.max(1, requested)) : 30;
+    const result = await db.query(
+      `SELECT id,item_type,title,content,metadata,created_at
+       FROM academic_archive
+       WHERE user_email=$1 AND ($2::text IS NULL OR item_type=$2)
+       ORDER BY created_at DESC LIMIT $3`,
+      [user.email, type, limit]
+    );
+    res.json({ ok: true, items: result.rows });
+  } catch (error) {
+    console.error("academic archive list error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر تحميل السجل الأكاديمي" });
+  }
+});
+
+app.post("/api/academic/archive", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    const body = req.body || {};
+    const allowedTypes = new Set([
+      "summary","explain","quiz","termquiz","flashcards","quickrev","assignment",
+      "presentation","project","research","thesis","osce","image","patient",
+      "compare","translate","assistant","diagnosis","dosage","tutor","testme",
+      "mindmap","nanda"
+    ]);
+    const itemType = String(body.type || "").trim().toLowerCase();
+    const title = String(body.title || itemType).replace(/\u0000/g, "").trim().slice(0, 200);
+    const content = String(body.content || "").replace(/\u0000/g, "").slice(0, 60000);
+    const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+      ? body.metadata : {};
+    if (!allowedTypes.has(itemType) || !title || (!content && !Object.keys(metadata).length)) {
+      return res.status(400).json({ ok: false, error: "archive_item_invalid" });
+    }
+    if (Buffer.byteLength(JSON.stringify(metadata), "utf8") > 12000) {
+      return res.status(413).json({ ok: false, error: "archive_metadata_too_large" });
+    }
+    const id = randomBytes(16).toString("hex");
+    const createdAt = Date.now();
+    await db.query(
+      `INSERT INTO academic_archive (id,user_email,item_type,title,content,metadata,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
+      [id, user.email, itemType, title, content, JSON.stringify(metadata), createdAt]
+    );
+    await db.query(
+      `DELETE FROM academic_archive
+       WHERE user_email=$1 AND id IN (
+         SELECT id FROM academic_archive WHERE user_email=$1
+         ORDER BY created_at DESC OFFSET 200
+       )`,
+      [user.email]
+    ).catch((error) => console.warn("academic archive retention warning:", error?.message || error));
+    res.status(201).json({ ok: true, item: { id, type: itemType, title, createdAt } });
+  } catch (error) {
+    console.error("academic archive save error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر حفظ العنصر في السجل الأكاديمي" });
+  }
+});
+
+app.delete("/api/academic/archive/:id", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    const result = await db.query(
+      "DELETE FROM academic_archive WHERE id=$1 AND user_email=$2 RETURNING id",
+      [String(req.params.id || "").slice(0, 64), user.email]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "archive_item_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("academic archive delete error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر حذف العنصر من السجل الأكاديمي" });
   }
 });
 
@@ -2213,11 +2305,32 @@ app.get("/api/subscriptions/list", async (req, res) => {
 app.post("/api/broadcast", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
-    const { message, notifType, targetEmail } = req.body;
-    if (!message) return res.json({ ok: false });
-    broadcastEvent({ type: "broadcast", message, notifType: notifType || "info" }, targetEmail || null);
-    res.json({ ok: true, reached: sseClients.size });
-  } catch { res.status(500).json({ error: "server error" }); }
+    const body = req.body || {};
+    const message = String(body.message || "").replace(/\u0000/g, "").trim().slice(0, 1000);
+    const notifType = ["info","success","warning","error"].includes(String(body.notifType || body.type || "info"))
+      ? String(body.notifType || body.type || "info") : "info";
+    const targetEmail = String(body.targetEmail || "").trim().toLowerCase().slice(0, 254);
+    if (!message) return res.status(400).json({ ok: false, error: "message_required" });
+    const idPrefix = randomBytes(16).toString("hex");
+    const createdAt = Date.now();
+    const recipients = await db.query(
+      `INSERT INTO notifications (id,user_email,message,type,read,created_at)
+       SELECT $1 || ':' || lower(email), lower(email), $2, $3, FALSE, $4
+       FROM users
+       WHERE deleted_at IS NULL AND banned=FALSE
+         AND ($5::text = '' OR lower(email)=$5)
+       RETURNING user_email`,
+      [idPrefix, message, notifType, createdAt, targetEmail]
+    );
+    if (targetEmail && !recipients.rowCount) {
+      return res.status(404).json({ ok: false, error: "target_user_not_found" });
+    }
+    broadcastEvent({ type: "broadcast", message, notifType }, targetEmail || null);
+    res.json({ ok: true, reached: recipients.rowCount });
+  } catch (error) {
+    console.error("broadcast error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
 });
 
 // ══════════════════════════════════════════════
@@ -3102,6 +3215,14 @@ async function requireCommunityUser(req, res) {
     res.status(403).json({ ok: false, error: "account_blocked", msg: "الحساب موقوف" });
     return null;
   }
+  const communityBlock = await db.query(
+    "SELECT 1 FROM community_blocks WHERE owner_email='__admin__' AND blocked_email=$1 LIMIT 1",
+    [user.email]
+  );
+  if (communityBlock.rowCount) {
+    res.status(403).json({ ok: false, error: "community_access_blocked", msg: "تم إيقاف المشاركة في المجتمع" });
+    return null;
+  }
   return user;
 }
 
@@ -3645,6 +3766,183 @@ app.patch("/api/admin/community/reports/:id", async (req, res) => {
   } catch (error) {
     console.error("community admin review error:", error?.message || error);
     res.status(500).json({ ok: false, error: "community_review_failed" });
+  }
+});
+
+app.post("/api/admin/community/members", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const email = String(req.body?.email || "").trim().toLowerCase().slice(0, 254);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+      return res.status(400).json({ ok: false, error: "valid_email_required" });
+    }
+    const account = await db.query(
+      "SELECT email,full_name,banned,deleted_at FROM users WHERE lower(email)=lower($1) LIMIT 1",
+      [email]
+    );
+    if (!account.rows.length || account.rows[0].deleted_at) {
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+    }
+    if (account.rows[0].banned) return res.status(409).json({ ok: false, error: "user_banned" });
+    const now = Date.now();
+    const member = await db.query(
+      `INSERT INTO community_members (email,display_name,joined_at)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (email) DO UPDATE SET display_name=EXCLUDED.display_name
+       RETURNING email,display_name,joined_at`,
+      [email, communityUserName(account.rows[0]), now]
+    );
+    res.status(201).json({ ok: true, member: member.rows[0] });
+  } catch (error) {
+    console.error("community admin add member error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_member_add_failed" });
+  }
+});
+
+app.get("/api/admin/community/blocks", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const result = await db.query(
+      `SELECT b.id,b.blocked_email,b.display_name,b.created_at
+       FROM community_blocks b
+       WHERE b.owner_email='__admin__'
+       ORDER BY b.created_at DESC LIMIT 200`
+    );
+    res.json({ ok: true, blocks: result.rows });
+  } catch (error) {
+    console.error("community admin block list error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_admin_blocks_failed" });
+  }
+});
+
+app.post("/api/admin/community/blocks", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const email = String(req.body?.email || "").trim().toLowerCase().slice(0, 254);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+      return res.status(400).json({ ok: false, error: "valid_email_required" });
+    }
+    const account = await db.query(
+      "SELECT email,full_name,deleted_at FROM users WHERE lower(email)=lower($1) LIMIT 1",
+      [email]
+    );
+    if (!account.rows.length || account.rows[0].deleted_at) {
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+    }
+    const result = await db.query(
+      `INSERT INTO community_blocks (id,owner_email,blocked_email,display_name,created_at)
+       VALUES ($1,'__admin__',$2,$3,$4)
+       ON CONFLICT (owner_email,blocked_email) DO UPDATE
+         SET display_name=EXCLUDED.display_name
+       RETURNING id,blocked_email,display_name,created_at`,
+      [randomBytes(16).toString("hex"), account.rows[0].email, communityUserName(account.rows[0]), Date.now()]
+    );
+    await db.query("DELETE FROM community_members WHERE email=$1", [account.rows[0].email]);
+    res.status(201).json({ ok: true, block: result.rows[0] });
+  } catch (error) {
+    console.error("community admin block user error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_admin_block_failed" });
+  }
+});
+
+app.delete("/api/admin/community/blocks/:email", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const email = decodeURIComponent(String(req.params.email || "")).trim().toLowerCase().slice(0, 254);
+    const result = await db.query(
+      "DELETE FROM community_blocks WHERE owner_email='__admin__' AND blocked_email=$1 RETURNING id",
+      [email]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "community_block_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community admin unblock user error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_admin_unblock_failed" });
+  }
+});
+
+app.delete("/api/admin/community/members/:email", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const email = decodeURIComponent(String(req.params.email || "")).trim().toLowerCase().slice(0, 254);
+    const result = await db.query("DELETE FROM community_members WHERE email=$1 RETURNING email", [email]);
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "community_member_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community admin remove member error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_member_remove_failed" });
+  }
+});
+
+app.delete("/api/admin/community/messages/:id", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const result = await db.query(
+      "UPDATE community_messages SET deleted_at=$1 WHERE id=$2 AND deleted_at=0 RETURNING id",
+      [Date.now(), String(req.params.id || "").slice(0, 64)]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "message_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community admin delete message error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_admin_delete_failed" });
+  }
+});
+
+app.delete("/api/admin/community/direct/messages/:id", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const result = await db.query(
+      "UPDATE community_direct_messages SET deleted_at=$1 WHERE id=$2 AND deleted_at=0 RETURNING id",
+      [Date.now(), String(req.params.id || "").slice(0, 64)]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "direct_message_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community admin delete direct message error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_direct_admin_delete_failed" });
+  }
+});
+
+app.get("/api/admin/community/direct", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const requested = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requested) ? Math.min(100, Math.max(1, requested)) : 50;
+    const result = await db.query(
+      `SELECT t.id,t.user_a,t.user_b,t.updated_at,
+              COALESCE(ua.full_name,t.user_a) AS name_a,
+              COALESCE(ub.full_name,t.user_b) AS name_b,
+              COUNT(m.id) FILTER (WHERE m.deleted_at=0)::int AS message_count,
+              MAX(m.created_at) FILTER (WHERE m.deleted_at=0) AS last_message_at
+       FROM community_direct_threads t
+       LEFT JOIN users ua ON ua.email=t.user_a
+       LEFT JOIN users ub ON ub.email=t.user_b
+       LEFT JOIN community_direct_messages m ON m.thread_id=t.id
+       GROUP BY t.id,ua.full_name,ub.full_name
+       ORDER BY COALESCE(MAX(m.created_at) FILTER (WHERE m.deleted_at=0),t.updated_at) DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ ok: true, conversations: result.rows });
+  } catch (error) {
+    console.error("community admin direct list error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_admin_direct_list_failed" });
+  }
+});
+
+app.delete("/api/admin/community/direct/:id", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
+    const result = await db.query(
+      "DELETE FROM community_direct_threads WHERE id=$1 RETURNING id",
+      [String(req.params.id || "").slice(0, 64)]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("community admin delete conversation error:", error?.message || error);
+    res.status(500).json({ ok: false, error: "community_direct_admin_delete_failed" });
   }
 });
 
