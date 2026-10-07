@@ -12,7 +12,7 @@ import compression from "compression";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import pg from "pg";
-import { randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomInt, scryptSync, timingSafeEqual, createHmac } from "node:crypto";
 import https from "node:https";
 import nodemailer from "nodemailer";
 import path from "node:path";
@@ -5029,15 +5029,41 @@ async function updatePrivateTutorBooking(req, res) {
       action === "propose" ? "proposed" :
       action === "reject" ? "rejected" : "";
     if (!status) return res.status(400).json({ ok: false, msg: "الإجراء غير صحيح" });
-    const proposedDate = String(req.body?.proposedDate || "").trim().slice(0, 20);
-    const proposedTime = String(req.body?.proposedTime || "").trim().slice(0, 30);
+    const submittedDate = String(req.body?.proposedDate || "").trim().slice(0, 10);
+    const submittedTime = String(req.body?.proposedTime || "").trim().slice(0, 5);
     const responseNote = String(req.body?.responseNote || "").trim().slice(0, 500);
-    if (status === "proposed" && (!/^\d{4}-\d{2}-\d{2}$/.test(proposedDate) || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(proposedTime))) {
-      return res.status(400).json({ ok: false, msg: "اكتب التاريخ والوقت المقترح" });
+    const selectedDate = status === "confirmed"
+      ? (submittedDate || String(booking.proposed_date || booking.requested_date || "").slice(0, 10))
+      : submittedDate;
+    const selectedTime = status === "confirmed"
+      ? (submittedTime || String(booking.proposed_time || booking.requested_time || "").slice(0, 5))
+      : submittedTime;
+    if ((status === "proposed" || status === "confirmed") &&
+        (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate) || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(selectedTime))) {
+      return res.status(400).json({ ok: false, msg: "اختر تاريخ ووقت الدرس" });
     }
+    if (status === "confirmed" || status === "proposed") {
+      const dateCheck = new Date(selectedDate + "T12:00:00Z");
+      if (!Number.isFinite(dateCheck.getTime()) || dateCheck.toISOString().slice(0, 10) !== selectedDate) {
+        return res.status(400).json({ ok: false, msg: "تاريخ الدرس غير صالح" });
+      }
+      if (status === "confirmed") {
+        const parts = new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Asia/Amman", year: "numeric", month: "2-digit", day: "2-digit",
+          hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+        }).formatToParts(new Date(Date.now() + 5 * 60000));
+        const local = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+        if (selectedDate + "T" + selectedTime < `${local.year}-${local.month}-${local.day}T${local.hour}:${local.minute}`) {
+          return res.status(400).json({ ok: false, msg: "اختر موعداً مستقبلياً" });
+        }
+      }
+    }
+    const selectedDay = status === "confirmed"
+      ? new Intl.DateTimeFormat("ar", { weekday: "long", timeZone: "Asia/Amman" }).format(new Date(selectedDate + "T12:00:00Z"))
+      : booking.day_of_week;
     const result = await withDbTransaction(async (client) => {
       await client.query("SELECT id FROM private_tutors WHERE id=$1 FOR UPDATE", [booking.tutor_id]);
-      if (status === "proposed") {
+      if (status === "proposed" || status === "confirmed") {
         const occupied = await client.query(
           `SELECT id FROM private_tutor_bookings
            WHERE tutor_id=$1 AND id<>$2
@@ -5045,7 +5071,7 @@ async function updatePrivateTutorBooking(req, res) {
              AND COALESCE(NULLIF(proposed_time,''),requested_time)=$4
              AND status IN ('pending','confirmed','proposed')
            LIMIT 1`,
-          [booking.tutor_id, bookingId, proposedDate, proposedTime]
+          [booking.tutor_id, bookingId, selectedDate, selectedTime]
         );
         if (occupied.rows.length) {
           const error = new Error("slot_taken");
@@ -5055,13 +5081,20 @@ async function updatePrivateTutorBooking(req, res) {
       }
       return client.query(
         `UPDATE private_tutor_bookings
-         SET status=$1,proposed_date=$2,proposed_time=$3,response_note=$4,responded_at=$5
-         WHERE id=$6 RETURNING *`,
-        [status, proposedDate, proposedTime, responseNote, Date.now(), bookingId]
+         SET status=$1,
+             day_of_week=CASE WHEN $1='confirmed' THEN $2 ELSE day_of_week END,
+             time_text=CASE WHEN $1='confirmed' THEN $4 ELSE time_text END,
+             requested_date=CASE WHEN $1='confirmed' THEN $3 ELSE requested_date END,
+             requested_time=CASE WHEN $1='confirmed' THEN $4 ELSE requested_time END,
+             proposed_date=CASE WHEN $1='proposed' THEN $3 ELSE '' END,
+             proposed_time=CASE WHEN $1='proposed' THEN $4 ELSE '' END,
+             response_note=$5,responded_at=$6
+         WHERE id=$7 RETURNING *`,
+        [status, selectedDay, selectedDate, selectedTime, responseNote, Date.now(), bookingId]
       );
     });
-    const bookingDate = status === "proposed" ? proposedDate : booking.requested_date;
-    const bookingTime = status === "proposed" ? proposedTime : booking.requested_time;
+    const bookingDate = status === "proposed" ? selectedDate : status === "confirmed" ? selectedDate : booking.requested_date;
+    const bookingTime = status === "proposed" ? selectedTime : status === "confirmed" ? selectedTime : booking.requested_time;
     const updateMessage = status === "confirmed"
       ? `تم تأكيد درس ${bookingDate} الساعة ${bookingTime}.`
       : status === "proposed"
@@ -5205,6 +5238,30 @@ app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
   res.json({ok:true,roomId:id,participantId:p,role:a.role,waiting:!approved,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
 }catch(e){res.status(500).json({ok:false,msg:"تعذر دخول الغرفة"});}});
 
+// اتصال STUN الأساسي يعمل دون إعداد إضافي. للاتصال الموثوق خلف شبكات NAT أضف
+// TUTOR_TURN_URLS و TUTOR_TURN_SHARED_SECRET إلى أسرار الخادم (Coturn REST API).
+function tutorIceServersFor(user){
+  const iceServers=[{urls:"stun:stun.l.google.com:19302"}];
+  const urls=String(process.env.TUTOR_TURN_URLS||"").split(",").map(x=>x.trim()).filter(Boolean);
+  const secret=String(process.env.TUTOR_TURN_SHARED_SECRET||"");
+  if(urls.length&&secret&&user?.email){
+    const expires=Math.floor(Date.now()/1000)+3600;
+    const username=expires+":"+String(user.email).toLowerCase();
+    const credential=createHmac("sha1",secret).update(username).digest("base64");
+    iceServers.push({urls,username,credential});
+  }
+  return iceServers;
+}
+app.get("/api/private-tutor-rooms/:roomId/ice-servers",async(req,res)=>{try{
+  const id=String(req.params.roomId),a=await roomAccess(req,id),p=String(req.query.participantId||"");
+  if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
+  if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
+  const participant=tutorRoomParticipants.get(id)?.get(p);
+  if(!participant||String(participant.email).toLowerCase()!==String(a.user.email).toLowerCase())return res.status(403).json({ok:false,msg:"المشارك غير صالح"});
+  const iceServers=tutorIceServersFor(a.user);
+  res.json({ok:true,iceServers,turnAvailable:iceServers.length>1});
+}catch(e){res.status(500).json({ok:false,msg:"تعذر إعداد اتصال الصوت والصورة"});}});
+
 app.get("/api/private-tutor-rooms/:roomId/events",async(req,res)=>{try{
   const id=String(req.params.roomId),a=await roomAccess(req,id),p=String(req.query.participantId||"");if(!a.user)return res.status(401).end();if(!a.room)return res.status(404).end();if(!a.role)return res.status(403).end();
   const part=tutorRoomParticipants.get(id)?.get(p);if(!part||part.email!==a.user.email)return res.status(403).end();
@@ -5248,6 +5305,18 @@ app.post("/api/private-tutor-rooms/:roomId/remove-participant",async(req,res)=>{
   emitRoom(id,"presence",{participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
   res.json({ok:true,participantId:participant});
 }catch(e){res.status(500).json({ok:false,msg:"تعذر إزالة المشارك"});}});
+
+app.post("/api/private-tutor-rooms/:roomId/recording-state",async(req,res)=>{try{
+  const id=String(req.params.roomId),a=await roomAccess(req,id),action=String(req.body?.action||"");
+  if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
+  if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
+  if(!["started","stopped"].includes(action))return res.status(400).json({ok:false,msg:"حالة التسجيل غير صالحة"});
+  const member=[...(tutorRoomParticipants.get(id)||new Map()).values()].find(v=>String(v.email).toLowerCase()===String(a.user.email).toLowerCase());
+  if(!member||!member.approved||a.room.status==="ended")return res.status(403).json({ok:false,msg:"يجب أن تكون داخل المحاضرة"});
+  const event={state:action,role:a.role,at:Date.now()};
+  emitRoom(id,"recording-status",event);
+  res.json({ok:true,state:action});
+}catch(e){res.status(500).json({ok:false,msg:"تعذر تحديث حالة التسجيل"});}});
 
 app.post("/api/private-tutor-rooms/:roomId/messages",async(req,res)=>{try{
   const id=String(req.params.roomId),a=await roomAccess(req,id),text=String(req.body?.message||"").trim().slice(0,4000);if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room||!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});if(!text)return res.status(400).json({ok:false,msg:"الرسالة فارغة"});
