@@ -5011,7 +5011,7 @@ async function updatePrivateTutorBooking(req, res) {
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const bookingId = String(req.params.bookingId || "");
     const found = await db.query(
-      `SELECT b.*,t.tutor_email
+      `SELECT b.*,t.tutor_email,t.name AS tutor_name
        FROM private_tutor_bookings b
        JOIN private_tutors t ON t.id=b.tutor_id
        WHERE b.id=$1 LIMIT 1`,
@@ -5096,17 +5096,18 @@ async function updatePrivateTutorBooking(req, res) {
     const bookingDate = status === "proposed" ? selectedDate : status === "confirmed" ? selectedDate : booking.requested_date;
     const bookingTime = status === "proposed" ? selectedTime : status === "confirmed" ? selectedTime : booking.requested_time;
     const updateMessage = status === "confirmed"
-      ? `تم تأكيد درس ${bookingDate} الساعة ${bookingTime}.`
+      ? `تمت الموافقة على شرحك مع المعلم ${booking.tutor_name || "المعلم"} بتاريخ ${bookingDate} الساعة ${bookingTime}.`
       : status === "proposed"
-        ? `اقترح المعلم موعداً جديداً: ${bookingDate} الساعة ${bookingTime}.`
-        : `اعتذر المعلم عن الموعد ${booking.requested_date} الساعة ${booking.requested_time}.`;
+        ? `اقترح المعلم ${booking.tutor_name || ""} موعداً جديداً بتاريخ ${bookingDate} الساعة ${bookingTime}.`
+        : `اعتذر المعلم ${booking.tutor_name || ""} عن الموعد ${booking.requested_date} الساعة ${booking.requested_time}.`;
     const safeBookingDate = tutorEmailHtmlText(bookingDate);
     const safeBookingTime = tutorEmailHtmlText(bookingTime);
+    const safeTutorName = tutorEmailHtmlText(booking.tutor_name || "المعلم");
     const emailUpdateMessage = status === "confirmed"
-      ? `تم تأكيد درس ${safeBookingDate} الساعة ${safeBookingTime}.`
+      ? `تمت الموافقة على شرحك مع المعلم ${safeTutorName} بتاريخ ${safeBookingDate} الساعة ${safeBookingTime}.`
       : status === "proposed"
-        ? `اقترح المعلم موعداً جديداً: ${safeBookingDate} الساعة ${safeBookingTime}.`
-        : `اعتذر المعلم عن الموعد ${tutorEmailHtmlText(booking.requested_date)} الساعة ${tutorEmailHtmlText(booking.requested_time)}.`;
+        ? `اقترح المعلم ${safeTutorName} موعداً جديداً بتاريخ ${safeBookingDate} الساعة ${safeBookingTime}.`
+        : `اعتذر المعلم ${safeTutorName} عن الموعد ${tutorEmailHtmlText(booking.requested_date)} الساعة ${tutorEmailHtmlText(booking.requested_time)}.`;
     const notificationAt = Date.now();
     await Promise.all([
       db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), booking.student_email, updateMessage, "tutor_booking", notificationAt]).catch(() => {}),
@@ -5229,10 +5230,16 @@ app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
   const id=String(req.params.roomId),a=await roomAccess(req,id);if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room)return res.status(404).json({ok:false,msg:"الغرفة غير موجودة"});if(!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
   if(a.room.status==="ended")return res.status(410).json({ok:false,msg:"انتهت المحاضرة"});
   if(!tutorRoomParticipants.has(id))tutorRoomParticipants.set(id,new Map());const ps=tutorRoomParticipants.get(id);
-  if([...ps.values()].some(v=>String(v.email).toLowerCase()===String(a.user.email).toLowerCase()))return res.status(409).json({ok:false,msg:"أنت داخل المحاضرة من نافذة أخرى"});
+  const joinKey=String(req.body?.joinKey||"").slice(0,80);
+  const existing=[...ps].find(([,v])=>String(v.email).toLowerCase()===String(a.user.email).toLowerCase());
+  if(existing){
+    const [existingId,existingParticipant]=existing;
+    if(joinKey&&existingParticipant.joinKey===joinKey)return res.json({ok:true,roomId:id,participantId:existingId,role:existingParticipant.role,waiting:!existingParticipant.approved,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
+    return res.status(409).json({ok:false,msg:"أنت داخل المحاضرة من نافذة أخرى"});
+  }
   if(ps.size>=2)return res.status(409).json({ok:false,msg:"المحاضرة ممتلئة"});
   const p=participantId(),approved=a.role==="tutor"||a.role==="admin";
-  ps.set(p,{email:a.user.email,role:a.role,approved,joinedAt:Date.now()});
+  ps.set(p,{email:a.user.email,role:a.role,approved,joinKey,joinedAt:Date.now()});
   await db.query("UPDATE private_tutor_rooms SET status='active',started_at=COALESCE(started_at,$1) WHERE id=$2",[Date.now(),id]);
   emitRoom(id,"participant-joined",{participantId:p,role:a.role,email:a.user.email});
   res.json({ok:true,roomId:id,participantId:p,role:a.role,waiting:!approved,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
