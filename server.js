@@ -4182,7 +4182,7 @@ app.post("/api/private-tutor-applications", async (req, res) => {
 
 app.get("/api/private-tutor/me", async (req, res) => {
   try {
-    const user = privateTutorUser(req);
+    const user = await privateTutorUser(req);
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const t = await db.query("SELECT * FROM private_tutors WHERE lower(tutor_email)=lower($1) AND active=TRUE LIMIT 1", [user.email]);
     if (!t.rows.length) return res.status(403).json({ ok: false, msg: "لا توجد لوحة معلم مفعلة لهذا الحساب" });
@@ -4307,7 +4307,7 @@ app.get("/api/private-tutors/:id/profile", async (req, res) => {
       [id]
     );
     if (!tutorResult.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
-    const user = privateTutorUser(req);
+    const user = await privateTutorUser(req);
     const email = user ? String(user.email || "").toLowerCase() : "";
     await db.query("INSERT INTO private_tutor_profile_views (id,tutor_id,viewer_email,created_at) VALUES ($1,$2,$3,$4)", [randomBytes(12).toString("hex"), id, email, Date.now()]).catch(() => {});
     const [likes, mine, ratings] = await Promise.all([
@@ -4336,7 +4336,7 @@ app.get("/api/private-tutors/:id/profile", async (req, res) => {
 
 app.post("/api/private-tutors/:id/like", async (req, res) => {
   try {
-    const user = privateTutorUser(req);
+    const user = await privateTutorUser(req);
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const tutorId = String(req.params.id || "");
     const email = String(user.email || "").toLowerCase();
@@ -5001,7 +5001,7 @@ app.post("/api/private-tutors/:id/bookings", async (req, res) => {
 
 app.get("/api/private-tutors/:id/bookings", async (req, res) => {
   try {
-    const user = privateTutorUser(req);
+    const user = await privateTutorUser(req);
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const tutorId = String(req.params.id || "");
     const rows = await db.query(
@@ -5033,7 +5033,7 @@ app.get("/api/private-tutors/:id/bookings", async (req, res) => {
 
 async function updatePrivateTutorBooking(req, res) {
   try {
-    const user = privateTutorUser(req);
+    const user = await privateTutorUser(req);
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const bookingId = String(req.params.bookingId || "");
     const found = await db.query(
@@ -5200,6 +5200,40 @@ async function roomAccess(req,id){
   return {...a,room};
 }
 
+app.get("/api/private-tutor/student-invitations",async(req,res)=>{
+  try{
+    const user=await privateTutorUser(req);
+    if(!user||user.banned)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
+    const q=await db.query(
+      `SELECT r.id AS room_id,r.tutor_id,r.booking_id,r.status,r.created_at,
+              r.tutor_email,t.name AS tutor_name,t.subject,
+              b.requested_date,b.requested_time,b.proposed_date,b.proposed_time
+       FROM private_tutor_rooms r
+       JOIN private_tutors t ON t.id=r.tutor_id AND t.active=TRUE
+       JOIN private_tutor_bookings b ON b.id=r.booking_id AND b.status='confirmed'
+       WHERE lower(r.student_email)=lower($1) AND r.status IN ('waiting','active')
+       ORDER BY r.created_at DESC LIMIT 20`,
+      [String(user.email||"").toLowerCase()]
+    );
+    const invitations=q.rows.map(row=>{
+      const participants=tutorRoomParticipants.get(String(row.room_id))||new Map();
+      const teacherWaiting=[...participants.values()].some(participant=>
+        participant.approved&&participant.role==="tutor"&&
+        String(participant.email||"").toLowerCase()===String(row.tutor_email||"").toLowerCase()
+      );
+      if(!teacherWaiting)return null;
+      return {
+        roomId:row.room_id,tutorId:row.tutor_id,bookingId:row.booking_id,
+        tutorName:row.tutor_name||"المعلم",subject:row.subject||"",
+        requestedDate:row.proposed_date||row.requested_date||"",
+        requestedTime:row.proposed_time||row.requested_time||"",
+        teacherWaiting:true,createdAt:Number(row.created_at)||0
+      };
+    }).filter(Boolean);
+    res.json({ok:true,invitations});
+  }catch(e){console.error("private tutor student invitations:",e.message);res.status(500).json({ok:false,invitations:[]});}
+});
+
 app.post("/api/private-tutors/:id/rooms",async(req,res)=>{
   try{
     const a=await tutorAccess(req,String(req.params.id||""));
@@ -5266,6 +5300,16 @@ app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
   const p=participantId(),approved=a.role==="tutor"||a.role==="admin";
   ps.set(p,{email:a.user.email,role:a.role,approved,joinKey,joinedAt:Date.now()});
   await db.query("UPDATE private_tutor_rooms SET status='active',started_at=COALESCE(started_at,$1) WHERE id=$2",[Date.now(),id]);
+  if(a.role==="tutor"){
+    const notificationText=`المعلم ${a.tutor?.name||"المعلم"} بانتظارك الآن في المحاضرة المباشرة.`;
+    db.query(
+      "INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)",
+      [randomBytes(12).toString("hex"),String(a.room.student_email||"").toLowerCase(),notificationText,"tutor_live_invitation",Date.now()]
+    ).catch(error=>console.error("private tutor invitation notification:",error.message));
+    const tutorName=tutorEmailHtmlText(a.tutor?.name||"المعلم");
+    notifyTutorByEmail(String(a.room.student_email||"").toLowerCase(),"المعلم بانتظارك في المحاضرة","محاضرتك المباشرة جاهزة",`المعلم ${tutorName} بانتظارك الآن. سجّل الدخول إلى حسابك لفتح صفحة المعلمين والانضمام.`)
+      .catch(error=>console.error("private tutor invitation email:",error.message));
+  }
   emitRoom(id,"participant-joined",{participantId:p,role:a.role,email:a.user.email});
   res.json({ok:true,roomId:id,participantId:p,role:a.role,waiting:!approved,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
 }catch(e){res.status(500).json({ok:false,msg:"تعذر دخول الغرفة"});}});
