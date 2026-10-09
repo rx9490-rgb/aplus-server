@@ -168,6 +168,7 @@ async function initDB() {
       user_email TEXT,
       message    TEXT,
       type       TEXT DEFAULT 'info',
+      action_url TEXT DEFAULT '',
       read       BOOLEAN DEFAULT FALSE,
       created_at BIGINT
     );
@@ -402,6 +403,7 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
+    `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS tutor_email TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS whatsapp TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS experience TEXT DEFAULT ''`,
@@ -1102,7 +1104,7 @@ app.get("/api/notifications", async (req, res) => {
     const requested = Number.parseInt(req.query.limit, 10);
     const limit = Number.isFinite(requested) ? Math.min(50, Math.max(1, requested)) : 20;
     const result = await db.query(
-      "SELECT id, message, type, read, created_at FROM notifications WHERE user_email = $1 ORDER BY created_at DESC LIMIT $2",
+      "SELECT id, message, type, action_url, read, created_at FROM notifications WHERE user_email = $1 ORDER BY created_at DESC LIMIT $2",
       [user.email, limit]
     );
     res.json({ ok: true, notifications: result.rows });
@@ -5280,7 +5282,7 @@ async function updatePrivateTutorBooking(req, res) {
         : `اعتذر المعلم ${safeTutorName} عن الموعد ${tutorEmailHtmlText(booking.requested_date)} الساعة ${tutorEmailHtmlText(booking.requested_time)}.`;
     const notificationAt = Date.now();
     await Promise.all([
-      db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), booking.student_email, updateMessage, "tutor_booking", notificationAt]).catch(() => {}),
+      db.query("INSERT INTO notifications (id,user_email,message,type,action_url,created_at) VALUES ($1,$2,$3,$4,$5,$6)", [randomBytes(12).toString("hex"), booking.student_email, updateMessage, "tutor_booking", status === "confirmed" ? `tutor-booking:${booking.tutor_id}:${bookingId}` : "", notificationAt]).catch(() => {}),
       notifyTutorByEmail(booking.student_email, "تحديث موعد الدرس", "تحديث الحجز", emailUpdateMessage),
       tutorEmail ? notifyTutorByEmail(tutorEmail, "تم تحديث موعد الدرس", "تم تحديث الحجز", emailUpdateMessage) : Promise.resolve()
     ]);
@@ -5445,11 +5447,11 @@ app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
   const p=participantId(),approved=a.role==="tutor"||a.role==="admin";
   ps.set(p,{email:a.user.email,role:a.role,approved,joinKey,joinedAt:Date.now()});
   await db.query("UPDATE private_tutor_rooms SET status='active',started_at=COALESCE(started_at,$1) WHERE id=$2",[Date.now(),id]);
-  if(a.role==="tutor"){
+  if(a.role==="tutor"&&!Number(a.room.started_at)){
     const notificationText=`المعلم ${a.tutor?.name||"المعلم"} بانتظارك الآن في المحاضرة المباشرة.`;
     db.query(
-      "INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)",
-      [randomBytes(12).toString("hex"),String(a.room.student_email||"").toLowerCase(),notificationText,"tutor_live_invitation",Date.now()]
+      "INSERT INTO notifications (id,user_email,message,type,action_url,created_at) VALUES ($1,$2,$3,$4,$5,$6)",
+      [randomBytes(12).toString("hex"),String(a.room.student_email||"").toLowerCase(),notificationText,"tutor_live_invitation",`tutor-live:${a.room.tutor_id}:${a.room.booking_id}`,Date.now()]
     ).catch(error=>console.error("private tutor invitation notification:",error.message));
     const tutorName=tutorEmailHtmlText(a.tutor?.name||"المعلم");
     notifyTutorByEmail(String(a.room.student_email||"").toLowerCase(),"المعلم بانتظارك في المحاضرة","محاضرتك المباشرة جاهزة",`المعلم ${tutorName} بانتظارك الآن. سجّل الدخول إلى حسابك لفتح صفحة المعلمين والانضمام.`)
