@@ -4140,28 +4140,26 @@ app.post("/api/private-tutor-applications", async (req, res) => {
     const whatsapp = String(b.whatsapp || "").trim().slice(0, 40), subject = String(b.subject || "").trim().slice(0, 120);
     const bio = String(b.bio || "").trim().slice(0, 3000), experience = String(b.experience || "").trim().slice(0, 2000);
     const certificate = String(b.certificateData || ""), certificateName = String(b.certificateName || "").slice(0, 180);
-    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || password.length < 6 || !subject || whatsapp.replace(/\D/g, "").length < 8 || !certificate) {
-      return res.status(400).json({ ok: false, msg: "الاسم والإيميل وكلمة المرور والتخصص ورقم الواتساب والشهادة مطلوبة" });
+    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || password.length < 6 || !subject) {
+      return res.status(400).json({ ok: false, msg: "الاسم والتخصص والإيميل وكلمة المرور (6 أحرف على الأقل) مطلوبة" });
     }
     const existingUser = await db.query("SELECT 1 FROM users WHERE lower(email)=lower($1) LIMIT 1", [email]);
     if (existingUser.rows.length) return res.status(409).json({ ok: false, msg: "الإيميل مستخدم مسبقاً. استخدم إيميلاً آخر." });
     const previous = await db.query("SELECT status FROM private_tutor_applications WHERE email=$1 AND status='pending' LIMIT 1", [email]);
     if (previous.rows.length) return res.status(409).json({ ok: false, msg: "لديك طلب قيد المراجعة مسبقاً" });
-    const match = certificate.match(/^data:([a-zA-Z0-9.+-]+);base64,(.+)$/);
     const allowedCertificateTypes = ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "image/gif", "image/bmp", "image/tiff"];
-    if (!match || !allowedCertificateTypes.includes(match[1].toLowerCase()) || Buffer.byteLength(match[2], "base64") > 16 * 1024 * 1024) {
+    const match = certificate ? certificate.match(/^data:([a-zA-Z0-9.+-]+);base64,(.+)$/) : null;
+    if (certificate && (!match || !allowedCertificateTypes.includes(match[1].toLowerCase()) || Buffer.byteLength(match[2], "base64") > 16 * 1024 * 1024)) {
       return res.status(400).json({ ok: false, msg: "ارفع PDF أو Word أو صورة حتى 16MB" });
     }
-    const certificateBuffer = Buffer.from(match[2], "base64");
-    if (!certificateBuffer.length || certificateBuffer.length > 16 * 1024 * 1024) {
-      return res.status(400).json({ ok: false, msg: "الملف غير صالح أو يتجاوز 16MB" });
-    }
+    const certificateBuffer = match ? Buffer.from(match[2], "base64") : null;
+    if (certificateBuffer && (!certificateBuffer.length || certificateBuffer.length > 16 * 1024 * 1024)) return res.status(400).json({ ok: false, msg: "الملف غير صالح أو يتجاوز 16MB" });
     const id = privateTutorApplicationId();
     await db.query(
       `INSERT INTO private_tutor_applications
        (id,full_name,email,password_hash,whatsapp,subject,bio,experience,certificate_path,certificate_name,certificate_mime,certificate_data,status,created_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'',$9,$10,$11,'pending',$12)`,
-      [id, name, email, hashPassword(password), whatsapp, subject, bio, experience, certificateName || `${id}`, match[1], certificateBuffer, Date.now()]
+      [id, name, email, hashPassword(password), whatsapp, subject, bio, experience, certificateName || "", match?.[1] || "", certificateBuffer, Date.now()]
     );
     await db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), email, "تم استلام طلب تسجيلك كمعلم خصوصي وسيتم مراجعته.", "tutor_application", Date.now()]).catch(() => {});
     const administrators = await db.query(
@@ -4703,21 +4701,44 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     const packageSallaUrl = String(body.packageSallaUrl || "").trim().slice(0, 1500);
     const packageLessons = Math.min(100, Math.max(1, Number(body.packageLessons) || 10));
     const freeAccess = body.freeAccess === true || String(body.freeAccess).toLowerCase() === "true";
-    if (!name || !subject || (!freeAccess && lessonPrice < 5 && monthlyPrice < 5)) {
-      return res.status(400).json({ ok: false, msg: freeAccess ? "الاسم والتخصص مطلوبان" : "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
+    if (!name || !subject || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(tutorEmail) || tutorPassword.length < 6) {
+      return res.status(400).json({ ok: false, msg: "أدخل الاسم والتخصص وإيميلاً صحيحاً وكلمة مرور من 6 أحرف على الأقل" });
     }
     if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
     }
-    const result = await db.query(
-      `INSERT INTO private_tutors
-       (id,name,bio,subject,tutor_email,image_url,video_url,lesson_price,monthly_price,
-        daily_salla_url,monthly_salla_url,package_salla_url,package_lessons,salla_url,free_access,active,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE,$16) RETURNING *`,
-      [privateTutorId(), name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
-        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, freeAccess, Date.now()]
-    );
-    await ensurePrivateTutorAccount(tutorEmail, tutorPassword, name);
+    const createdAt = Date.now();
+    let result;
+    try {
+      result = await withDbTransaction(async (client) => {
+        const existing = await client.query("SELECT email,is_admin,is_super_admin FROM users WHERE lower(email)=lower($1) FOR UPDATE", [tutorEmail]);
+        const existingTutor = await client.query("SELECT id FROM private_tutors WHERE lower(tutor_email)=lower($1) LIMIT 1", [tutorEmail]);
+        if (existing.rows.length || existingTutor.rows.length) {
+          const error = new Error("الإيميل مستخدم مسبقاً؛ استخدم إيميلاً آخر للمعلم");
+          error.code = "TUTOR_EMAIL_TAKEN";
+          throw error;
+        }
+        const inserted = await client.query(
+          `INSERT INTO private_tutors
+           (id,name,bio,subject,tutor_email,image_url,video_url,lesson_price,monthly_price,
+            daily_salla_url,monthly_salla_url,package_salla_url,package_lessons,salla_url,free_access,active,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE,$16) RETURNING *`,
+          [privateTutorId(), name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
+            dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, freeAccess || monthlyPrice <= 0, createdAt]
+        );
+        await client.query(
+          "INSERT INTO users (email,full_name,password_hash,email_verified,created_at,last_seen) VALUES ($1,$2,$3,TRUE,$4,$4)",
+          [tutorEmail, name, hashPassword(tutorPassword), createdAt]
+        );
+        return inserted;
+      });
+    } catch (error) {
+      if (error.code === "TUTOR_EMAIL_TAKEN" || error.code === "23505") {
+        return res.status(409).json({ ok: false, msg: "الإيميل مستخدم مسبقاً؛ استخدم إيميلاً آخر للمعلم" });
+      }
+      throw error;
+    }
+    invalidateSessionCache(tutorEmail);
     broadcastEvent({ type: "private_tutors_updated" });
     res.status(201).json({ ok: true, tutor: formatPrivateTutor(result.rows[0]) });
   } catch (e) {
@@ -4755,8 +4776,8 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
       ? !!old.free_access
       : body.freeAccess === true || String(body.freeAccess).toLowerCase() === "true";
     const active = body.active === undefined ? !!old.active : !!body.active;
-    if (!name || !subject || (!freeAccess && lessonPrice < 5 && monthlyPrice < 5)) {
-      return res.status(400).json({ ok: false, msg: freeAccess ? "الاسم والتخصص مطلوبان" : "الاسم والتخصص وسعر شرح أو شهر مطلوبون" });
+    if (!name || !subject) {
+      return res.status(400).json({ ok: false, msg: "الاسم والتخصص مطلوبان" });
     }
     if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
@@ -5024,9 +5045,8 @@ async function updatePrivateTutorBooking(req, res) {
     );
     if (!found.rows.length) return res.status(404).json({ ok: false, msg: "الحجز غير موجود" });
     const booking = found.rows[0];
-    const admin = await isAdminRequest(req);
     const tutorEmail = String(booking.tutor_email || "").toLowerCase();
-    if (!admin && tutorEmail !== String(user.email || "").toLowerCase()) {
+    if (tutorEmail !== String(user.email || "").toLowerCase()) {
       return res.status(403).json({ ok: false, msg: "غير مصرح" });
     }
     const action = String(req.body?.action || "").toLowerCase();
@@ -5209,7 +5229,7 @@ app.get("/api/private-tutors/:id/manage-bookings",async(req,res)=>{
   try{
     const a=await tutorAccess(req,String(req.params.id||""));
     if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
-    if(a.role!=="tutor"&&a.role!=="admin")return res.status(403).json({ok:false,msg:"هذه الصفحة للمعلم فقط"});
+     if(a.role!=="tutor")return res.status(403).json({ok:false,msg:"هذه الصفحة للمعلم فقط"});
     const q=await db.query(
       `SELECT b.*,u.full_name, r.id AS room_id
        FROM private_tutor_bookings b
