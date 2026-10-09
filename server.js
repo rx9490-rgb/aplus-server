@@ -304,6 +304,18 @@ async function initDB() {
       id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
       viewer_email TEXT DEFAULT '', created_at BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS private_tutor_profile_change_requests (
+      id TEXT PRIMARY KEY,
+      tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
+      requested_data JSONB NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      review_note TEXT DEFAULT '',
+      reviewed_by TEXT DEFAULT '',
+      created_at BIGINT NOT NULL,
+      reviewed_at BIGINT DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS private_tutor_profile_change_pending_unique
+      ON private_tutor_profile_change_requests(tutor_id) WHERE status='pending';
     CREATE TABLE IF NOT EXISTS community_messages (
       id TEXT PRIMARY KEY,
       author_email TEXT NOT NULL,
@@ -4164,7 +4176,7 @@ app.post("/api/private-tutor-applications", async (req, res) => {
     await db.query("INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)", [randomBytes(12).toString("hex"), email, "تم استلام طلب تسجيلك كمعلم خصوصي وسيتم مراجعته.", "tutor_application", Date.now()]).catch(() => {});
     const administrators = await db.query(
       "SELECT email FROM users WHERE is_admin=TRUE OR is_super_admin=TRUE OR is_moderator=TRUE UNION SELECT $1::text WHERE $1<>''",
-      [String(ADMIN_EMAIL || "").trim().toLowerCase()]
+      [String(process.env.ADMIN_EMAIL || "").trim().toLowerCase()]
     ).catch(() => ({ rows: [] }));
     await Promise.all(administrators.rows.map((admin) =>
       db.query(
@@ -4186,14 +4198,144 @@ app.get("/api/private-tutor/me", async (req, res) => {
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
     const t = await db.query("SELECT * FROM private_tutors WHERE lower(tutor_email)=lower($1) AND active=TRUE LIMIT 1", [user.email]);
     if (!t.rows.length) return res.status(403).json({ ok: false, msg: "لا توجد لوحة معلم مفعلة لهذا الحساب" });
-    const tutor = t.rows[0], [bookings, rooms, recordings, views] = await Promise.all([
+    const tutor = t.rows[0], [bookings, rooms, recordings, views, profileChangeRequest] = await Promise.all([
       db.query(`SELECT b.*,u.full_name AS student_name FROM private_tutor_bookings b LEFT JOIN users u ON lower(u.email)=lower(b.student_email) WHERE b.tutor_id=$1 ORDER BY b.created_at DESC LIMIT 100`, [tutor.id]),
       db.query(`SELECT r.*,b.requested_date,b.requested_time FROM private_tutor_rooms r LEFT JOIN private_tutor_bookings b ON b.id=r.booking_id WHERE r.tutor_id=$1 AND r.status IN ('waiting','active') ORDER BY r.created_at DESC`, [tutor.id]),
       db.query(`SELECT rec.id,rec.room_id,rec.uploaded_by,rec.recording_url,rec.duration_sec,rec.mime_type,rec.file_size,rec.created_at,r.student_email FROM private_tutor_recordings rec JOIN private_tutor_rooms r ON r.id=rec.room_id WHERE r.tutor_id=$1 ORDER BY rec.created_at DESC LIMIT 100`, [tutor.id]),
-      db.query("SELECT COUNT(*)::int AS count FROM private_tutor_profile_views WHERE tutor_id=$1", [tutor.id])
+      db.query("SELECT COUNT(*)::int AS count FROM private_tutor_profile_views WHERE tutor_id=$1", [tutor.id]),
+      db.query("SELECT id,requested_data,status,review_note,created_at,reviewed_at FROM private_tutor_profile_change_requests WHERE tutor_id=$1 ORDER BY created_at DESC LIMIT 1", [tutor.id])
     ]);
-    res.json({ ok: true, tutor: formatPrivateTutor(tutor), stats: { views: Number(views.rows[0]?.count) || 0, bookings: bookings.rows.length, live: rooms.rows.length, recordings: recordings.rows.length }, bookings: bookings.rows, currentLectures: rooms.rows, recordings: recordings.rows });
+    res.json({ ok: true, tutor: formatPrivateTutor(tutor), stats: { views: Number(views.rows[0]?.count) || 0, bookings: bookings.rows.length, pendingBookings: bookings.rows.filter((b) => b.status === "pending" || b.status === "proposed").length, confirmedBookings: bookings.rows.filter((b) => b.status === "confirmed").length, live: rooms.rows.length, recordings: recordings.rows.length }, bookings: bookings.rows, currentLectures: rooms.rows, recordings: recordings.rows, profileChangeRequest: profileChangeRequest.rows[0] || null });
   } catch (e) { res.status(500).json({ ok: false, msg: "تعذر تحميل لوحة المعلم" }); }
+});
+
+app.post("/api/private-tutor/profile-change-requests", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const tutorResult = await db.query(
+      "SELECT id,tutor_email FROM private_tutors WHERE lower(tutor_email)=lower($1) AND active=TRUE LIMIT 1",
+      [user.email]
+    );
+    if (!tutorResult.rows.length) return res.status(403).json({ ok: false, msg: "هذه الخدمة للمعلم فقط" });
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const clean = (value, max) => String(value == null ? "" : value).trim().slice(0, max);
+    const requestedData = {
+      name: clean(body.name, 120),
+      subject: clean(body.subject, 120),
+      whatsapp: clean(body.whatsapp, 40),
+      bio: clean(body.bio, 2000),
+      experience: clean(body.experience, 2000),
+      imageUrl: clean(body.imageUrl, 1000),
+      videoUrl: clean(body.videoUrl, 2000)
+    };
+    if (!requestedData.name || !requestedData.subject) {
+      return res.status(400).json({ ok: false, msg: "الاسم والتخصص مطلوبان" });
+    }
+    for (const key of ["imageUrl", "videoUrl"]) {
+      if (requestedData[key] && !/^https?:\/\/\S+$/i.test(requestedData[key])) {
+        return res.status(400).json({ ok: false, msg: "روابط الصورة والفيديو يجب أن تبدأ بـ https:// أو http://" });
+      }
+    }
+    const tutor = tutorResult.rows[0], now = Date.now();
+    const inserted = await db.query(
+      `INSERT INTO private_tutor_profile_change_requests
+       (id,tutor_id,requested_data,status,created_at)
+       VALUES ($1,$2,$3::jsonb,'pending',$4) RETURNING id,status,created_at`,
+      ["PTCR-" + randomBytes(12).toString("hex"), tutor.id, JSON.stringify(requestedData), now]
+    );
+    const admins = await db.query(
+      "SELECT email FROM users WHERE is_admin=TRUE OR is_super_admin=TRUE OR is_moderator=TRUE UNION SELECT $1::text WHERE $1<>''",
+      [String(process.env.ADMIN_EMAIL || "").trim().toLowerCase()]
+    ).catch(() => ({ rows: [] }));
+    await Promise.all(admins.rows.map((admin) =>
+      db.query(
+        "INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)",
+        [randomBytes(12).toString("hex"), String(admin.email || "").toLowerCase(), `طلب تعديل بيانات معلم: ${requestedData.name}`, "tutor_profile_change_review", now]
+      ).catch(() => {})
+    ));
+    res.status(201).json({ ok: true, request: inserted.rows[0], msg: "تم إرسال طلب التعديل إلى الإدارة للمراجعة." });
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ ok: false, msg: "لديك طلب تعديل قيد المراجعة بالفعل" });
+    console.error("private tutor profile change request:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر إرسال طلب تعديل البيانات" });
+  }
+});
+
+app.get("/api/admin/private-tutor-profile-change-requests", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const q = await db.query(
+      `SELECT r.id,r.tutor_id,r.requested_data,r.status,r.review_note,r.created_at,
+              t.name AS current_name,t.tutor_email
+       FROM private_tutor_profile_change_requests r
+       JOIN private_tutors t ON t.id=r.tutor_id
+       WHERE r.status='pending'
+       ORDER BY r.created_at ASC LIMIT 200`
+    );
+    res.json({ ok: true, requests: q.rows });
+  } catch (e) {
+    console.error("private tutor profile change list:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر تحميل طلبات تعديل بيانات المعلمين" });
+  }
+});
+
+app.patch("/api/admin/private-tutor-profile-change-requests/:id", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const id = String(req.params.id || "").slice(0, 100);
+    const action = String(req.body?.action || "").toLowerCase();
+    const note = String(req.body?.note || "").trim().slice(0, 1000);
+    if (!["approve", "reject"].includes(action)) return res.status(400).json({ ok: false, msg: "الإجراء غير صالح" });
+    const adminUser = await privateTutorUser(req);
+    const reviewedBy = String(adminUser?.email || "").toLowerCase();
+    const result = await withDbTransaction(async (client) => {
+      const request = await client.query(
+        `SELECT r.*,t.tutor_email FROM private_tutor_profile_change_requests r
+         JOIN private_tutors t ON t.id=r.tutor_id
+         WHERE r.id=$1 FOR UPDATE OF r`,
+        [id]
+      );
+      if (!request.rows.length) {
+        const error = new Error("طلب التعديل غير موجود"); error.statusCode = 404; throw error;
+      }
+      const row = request.rows[0];
+      if (row.status !== "pending") {
+        const error = new Error("تمت معالجة هذا الطلب مسبقاً"); error.statusCode = 409; throw error;
+      }
+      if (action === "approve") {
+        const d = typeof row.requested_data === "string" ? JSON.parse(row.requested_data) : row.requested_data;
+        await client.query(
+          `UPDATE private_tutors SET name=$1,subject=$2,whatsapp=$3,bio=$4,experience=$5,image_url=$6,video_url=$7 WHERE id=$8`,
+          [String(d.name || ""), String(d.subject || ""), String(d.whatsapp || ""), String(d.bio || ""),
+            String(d.experience || ""), String(d.imageUrl || ""), String(d.videoUrl || ""), row.tutor_id]
+        );
+      }
+      const updated = await client.query(
+        `UPDATE private_tutor_profile_change_requests
+         SET status=$1,review_note=$2,reviewed_by=$3,reviewed_at=$4
+         WHERE id=$5 AND status='pending' RETURNING id,status`,
+        [action === "approve" ? "approved" : "rejected", note, reviewedBy, Date.now(), id]
+      );
+      if (!updated.rows.length) {
+        const error = new Error("تمت معالجة هذا الطلب في جلسة أخرى"); error.statusCode = 409; throw error;
+      }
+      return { request: updated.rows[0], tutorEmail: row.tutor_email };
+    });
+    const approved = action === "approve";
+    const message = approved
+      ? "وافقت الإدارة على طلب تعديل بيانات ملفك كمعلم."
+      : `رفضت الإدارة طلب تعديل بيانات ملفك كمعلم.${note ? " الملاحظة: " + note : ""}`;
+    await db.query(
+      "INSERT INTO notifications (id,user_email,message,type,created_at) VALUES ($1,$2,$3,$4,$5)",
+      [randomBytes(12).toString("hex"), String(result.tutorEmail || "").toLowerCase(), message, "tutor_profile_change", Date.now()]
+    ).catch(() => {});
+    res.json({ ok: true, status: result.request.status });
+  } catch (e) {
+    if (e.statusCode) return res.status(e.statusCode).json({ ok: false, msg: e.message });
+    console.error("private tutor profile change review:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر معالجة طلب تعديل البيانات" });
+  }
 });
 
 async function ensurePrivateTutorAccount(email, password, fullName) {
@@ -5048,6 +5190,9 @@ async function updatePrivateTutorBooking(req, res) {
     const tutorEmail = String(booking.tutor_email || "").toLowerCase();
     if (tutorEmail !== String(user.email || "").toLowerCase()) {
       return res.status(403).json({ ok: false, msg: "غير مصرح" });
+    }
+    if (!["pending", "proposed"].includes(String(booking.status || ""))) {
+      return res.status(409).json({ ok: false, msg: "تمت معالجة هذا الحجز مسبقاً" });
     }
     const action = String(req.body?.action || "").toLowerCase();
     const status = action === "approve" ? "confirmed" :
