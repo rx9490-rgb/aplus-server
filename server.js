@@ -489,10 +489,14 @@ async function isAdminRequest(req) {
   const token = req.headers["x-session-token"] || req.query.token;
   if (!token) return false;
   const user = await getSessionUser(token);
-  return !!(user && (
+  if (!user) return false;
+  const email = String(user.email || "").trim().toLowerCase();
+  const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  return !!(
     user.is_admin || user.isAdmin ||
-    user.is_super_admin || user.isSuperAdmin
-  ));
+    user.is_super_admin || user.isSuperAdmin ||
+    (configuredAdminEmail && email === configuredAdminEmail)
+  );
 }
 
 // حماية استخدام الذكاء الاصطناعي — لا تسمح لأي شخص باستنزاف مفتاح OpenRouter
@@ -4144,12 +4148,13 @@ app.post("/api/private-tutor-applications", async (req, res) => {
     const previous = await db.query("SELECT status FROM private_tutor_applications WHERE email=$1 AND status='pending' LIMIT 1", [email]);
     if (previous.rows.length) return res.status(409).json({ ok: false, msg: "لديك طلب قيد المراجعة مسبقاً" });
     const match = certificate.match(/^data:([a-zA-Z0-9.+-]+);base64,(.+)$/);
-    if (!match || !["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(match[1]) || Buffer.byteLength(match[2], "base64") > 8 * 1024 * 1024) {
-      return res.status(400).json({ ok: false, msg: "الشهادة يجب أن تكون PDF أو صورة وأقل من 8MB" });
+    const allowedCertificateTypes = ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "image/gif", "image/bmp", "image/tiff"];
+    if (!match || !allowedCertificateTypes.includes(match[1].toLowerCase()) || Buffer.byteLength(match[2], "base64") > 16 * 1024 * 1024) {
+      return res.status(400).json({ ok: false, msg: "ارفع PDF أو Word أو صورة حتى 16MB" });
     }
     const certificateBuffer = Buffer.from(match[2], "base64");
-    if (!certificateBuffer.length || certificateBuffer.length > 8 * 1024 * 1024) {
-      return res.status(400).json({ ok: false, msg: "الشهادة يجب أن تكون ملفاً صالحاً وأقل من 8MB" });
+    if (!certificateBuffer.length || certificateBuffer.length > 16 * 1024 * 1024) {
+      return res.status(400).json({ ok: false, msg: "الملف غير صالح أو يتجاوز 16MB" });
     }
     const id = privateTutorApplicationId();
     await db.query(
