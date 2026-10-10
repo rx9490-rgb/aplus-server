@@ -1166,6 +1166,26 @@ app.get("/api/academic/archive", async (req, res) => {
   }
 });
 
+app.get("/api/academic/archive/:id", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    const id = String(req.params.id || "").slice(0, 64);
+    const result = await db.query(
+      `SELECT id,item_type,title,content,metadata,created_at
+       FROM academic_archive
+       WHERE id=$1 AND user_email=$2
+       LIMIT 1`,
+      [id, user.email]
+    );
+    if (!result.rows.length) return res.status(404).json({ ok: false, error: "archive_item_not_found" });
+    res.json({ ok: true, item: result.rows[0] });
+  } catch (error) {
+    console.error("academic archive item error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر استعادة العنصر من السجل الأكاديمي" });
+  }
+});
+
 app.post("/api/academic/archive", async (req, res) => {
   try {
     const user = await getSessionUser(req.headers["x-session-token"]);
