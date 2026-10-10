@@ -5935,7 +5935,7 @@ async function updatePrivateTutorBooking(req, res) {
           throw error;
         }
       }
-      return client.query(
+      const bookingUpdate = await client.query(
         `UPDATE private_tutor_bookings
          SET status=$1,
              day_of_week=CASE WHEN $1='confirmed' THEN $2 ELSE day_of_week END,
@@ -5948,6 +5948,27 @@ async function updatePrivateTutorBooking(req, res) {
          WHERE id=$7 RETURNING *`,
         [status, selectedDay, selectedDate, selectedTime, responseNote, Date.now(), bookingId]
       );
+      let room = null;
+      let roomCreated = false;
+      if (status === "confirmed" && bookingUpdate.rows.length) {
+        const existingRoom = await client.query(
+          "SELECT * FROM private_tutor_rooms WHERE booking_id=$1 AND status IN ('waiting','active') ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
+          [bookingId]
+        );
+        if (existingRoom.rows.length) {
+          room = existingRoom.rows[0];
+        } else {
+          const createdRoom = await client.query(
+            `INSERT INTO private_tutor_rooms
+             (id,tutor_id,booking_id,student_email,tutor_email,status,created_at)
+             VALUES ($1,$2,$3,$4,$5,'waiting',$6) RETURNING *`,
+            [tutorId(),booking.tutor_id,bookingId,String(booking.student_email||"").toLowerCase(),tutorEmail,Date.now()]
+          );
+          room = createdRoom.rows[0] || null;
+          roomCreated = !!room;
+        }
+      }
+      return { booking: bookingUpdate.rows[0], room, roomCreated };
     });
     const bookingDate = status === "proposed" ? selectedDate : status === "confirmed" ? selectedDate : booking.requested_date;
     const bookingTime = status === "proposed" ? selectedTime : status === "confirmed" ? selectedTime : booking.requested_time;
@@ -5965,6 +5986,10 @@ async function updatePrivateTutorBooking(req, res) {
         ? `اقترح المعلم ${safeTutorName} موعداً جديداً بتاريخ ${safeBookingDate} الساعة ${safeBookingTime}.`
         : `اعتذر المعلم ${safeTutorName} عن الموعد ${tutorEmailHtmlText(booking.requested_date)} الساعة ${tutorEmailHtmlText(booking.requested_time)}.`;
     const notificationAt = Date.now();
+    if (result.roomCreated && result.room) {
+      await notifyPrivateTutorRoom(result.room, { name: booking.tutor_name || "المعلم" }, false)
+        .catch((error) => console.error("private tutor booking room notification:", error.message));
+    }
     await Promise.all([
       db.query("INSERT INTO notifications (id,user_email,message,type,action_url,created_at) VALUES ($1,$2,$3,$4,$5,$6)", [randomBytes(12).toString("hex"), booking.student_email, updateMessage, "tutor_booking", status === "confirmed" ? `tutor-booking:${booking.tutor_id}:${bookingId}` : "", notificationAt]).catch(() => {}),
       notifyTutorByEmail(booking.student_email, "تحديث موعد الدرس", "تحديث الحجز", emailUpdateMessage),
@@ -5973,10 +5998,11 @@ async function updatePrivateTutorBooking(req, res) {
     res.json({
       ok: true,
       booking: {
-        id: result.rows[0].id, status: result.rows[0].status,
-        proposedDate: result.rows[0].proposed_date || "",
-        proposedTime: result.rows[0].proposed_time || "",
-        responseNote: result.rows[0].response_note || ""
+        id: result.booking.id, status: result.booking.status,
+        proposedDate: result.booking.proposed_date || "",
+        proposedTime: result.booking.proposed_time || "",
+        responseNote: result.booking.response_note || "",
+        roomId: result.room?.id || ""
       }
     });
   } catch (e) {
@@ -6451,12 +6477,28 @@ app.get("/api/private-tutor-rooms/:roomId",async(req,res)=>{try{const a=await ro
 app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
   const id=String(req.params.roomId),a=await roomAccess(req,id);if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room)return res.status(404).json({ok:false,msg:"الغرفة غير موجودة"});if(!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
   if(a.room.status==="ended")return res.status(410).json({ok:false,msg:"انتهت المحاضرة"});
+  let scheduledDate="",scheduledTime="";
+  if(a.room.booking_id){
+    const schedule=await db.query(
+      "SELECT COALESCE(NULLIF(proposed_date,''),requested_date,'') AS date,COALESCE(NULLIF(proposed_time,''),requested_time,'') AS time FROM private_tutor_bookings WHERE id=$1 LIMIT 1",
+      [a.room.booking_id]
+    );
+    scheduledDate=String(schedule.rows[0]?.date||"");
+    scheduledTime=String(schedule.rows[0]?.time||"").slice(0,5);
+  }else if(a.room.group_slot_id){
+    const schedule=await db.query(
+      "SELECT session_date AS date,start_time AS time FROM private_tutor_group_slots WHERE id=$1 LIMIT 1",
+      [a.room.group_slot_id]
+    );
+    scheduledDate=String(schedule.rows[0]?.date||"");
+    scheduledTime=String(schedule.rows[0]?.time||"").slice(0,5);
+  }
   if(!tutorRoomParticipants.has(id))tutorRoomParticipants.set(id,new Map());const ps=tutorRoomParticipants.get(id);
   const joinKey=String(req.body?.joinKey||"").slice(0,80);
   const existing=[...ps].find(([,v])=>String(v.email).toLowerCase()===String(a.user.email).toLowerCase());
   if(existing){
     const [existingId,existingParticipant]=existing;
-    if(joinKey&&existingParticipant.joinKey===joinKey)return res.json({ok:true,roomId:id,participantId:existingId,role:existingParticipant.role,waiting:!existingParticipant.approved,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
+    if(joinKey&&existingParticipant.joinKey===joinKey)return res.json({ok:true,roomId:id,participantId:existingId,role:existingParticipant.role,waiting:!existingParticipant.approved,scheduledDate,scheduledTime,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
     return res.status(409).json({ok:false,msg:"أنت داخل المحاضرة من نافذة أخرى"});
   }
    if(a.room.group_slot_id){
@@ -6472,7 +6514,7 @@ app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
     notifyPrivateTutorRoom(a.room,a.tutor,true).catch(error=>console.error("private tutor invitation:",error.message));
   }
   emitRoom(id,"participant-joined",{participantId:p,role:a.role,email:a.user.email});
-  res.json({ok:true,roomId:id,participantId:p,role:a.role,waiting:!approved,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
+  res.json({ok:true,roomId:id,participantId:p,role:a.role,waiting:!approved,scheduledDate,scheduledTime,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
 }catch(e){res.status(500).json({ok:false,msg:"تعذر دخول الغرفة"});}});
 
 // اتصال STUN الأساسي يعمل دون إعداد إضافي. للاتصال الموثوق خلف شبكات NAT أضف
