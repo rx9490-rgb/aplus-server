@@ -5341,6 +5341,33 @@ function tutorAdmin(u){return !!(u&&(u.is_admin||u.is_super_admin||u.is_moderato
 function sseRoom(res,event,data){try{res.write("event: "+event+"\ndata: "+JSON.stringify(data)+"\n\n");return true;}catch{return false;}}
 function emitRoom(room,event,data,except){const m=tutorRoomClients.get(room);if(!m)return;for(const [id,res] of m){if(id!==except&&!sseRoom(res,event,data))m.delete(id);}}
 function roomView(r){return {id:r.id,tutorId:r.tutor_id,bookingId:r.booking_id||null,studentEmail:r.student_email,tutorEmail:r.tutor_email||"",status:r.status,startedAt:Number(r.started_at)||0,endedAt:Number(r.ended_at)||0,createdAt:Number(r.created_at)||0};}
+async function notifyPrivateTutorRoom(room,tutor,waiting){
+  if(!room?.student_email||!room?.booking_id)return false;
+  const state=waiting?"waiting":"ready";
+  const actionUrl=`tutor-live:${room.tutor_id}:${room.booking_id}:${room.id}:${state}`;
+  const tutorName=String(tutor?.name||"المعلم");
+  const message=waiting
+    ? `المعلم ${tutorName} بانتظارك الآن في المحاضرة المباشرة.`
+    : `أنشأ المعلم ${tutorName} محاضرة مباشرة وأرسل لك دعوة للانضمام.`;
+  const inserted=await db.query(
+    `INSERT INTO notifications (id,user_email,message,type,action_url,created_at)
+     SELECT $1,$2,$3,$4,$5,$6
+     WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE action_url=$5)
+     RETURNING id`,
+    [randomBytes(12).toString("hex"),String(room.student_email).toLowerCase(),message,waiting?"tutor_live_waiting":"tutor_live_invitation",actionUrl,Date.now()]
+  );
+  if(inserted.rows.length&&waiting){
+    const siteUrl=tutorEmailHtmlText(String(process.env.PUBLIC_SITE_URL||process.env.FRONTEND_URL||"https://aplus.blog").replace(/\/$/,""));
+    const safeTutorName=tutorEmailHtmlText(tutorName);
+    notifyTutorByEmail(
+      String(room.student_email).toLowerCase(),
+      "المعلم بانتظارك في المحاضرة",
+      "محاضرتك المباشرة جاهزة",
+      `المعلم ${safeTutorName} بانتظارك الآن. افتح منصة A+ على ${siteUrl} وسجّل الدخول للانضمام إلى المحاضرة.`
+    ).catch(error=>console.error("private tutor invitation email:",error.message));
+  }
+  return inserted.rows.length>0;
+}
 async function tutorAccess(req,tutor){
   const user=await privateTutorUser(req);if(!user)return {user:null,role:null,tutor:null};
   const q=await db.query("SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE LIMIT 1",[tutor]);const row=q.rows[0]||null;
@@ -5384,17 +5411,16 @@ app.get("/api/private-tutor/student-invitations",async(req,res)=>{
     );
     const invitations=q.rows.map(row=>{
       const participants=tutorRoomParticipants.get(String(row.room_id))||new Map();
-      const teacherWaiting=[...participants.values()].some(participant=>
+      const teacherOnline=[...participants.values()].some(participant=>
         participant.approved&&participant.role==="tutor"&&
         String(participant.email||"").toLowerCase()===String(row.tutor_email||"").toLowerCase()
       );
-      if(!teacherWaiting)return null;
       return {
         roomId:row.room_id,tutorId:row.tutor_id,bookingId:row.booking_id,
         tutorName:row.tutor_name||"المعلم",subject:row.subject||"",
         requestedDate:row.proposed_date||row.requested_date||"",
         requestedTime:row.proposed_time||row.requested_time||"",
-        teacherWaiting:true,createdAt:Number(row.created_at)||0
+        teacherWaiting:true,teacherOnline,createdAt:Number(row.created_at)||0
       };
     }).filter(Boolean);
     res.json({ok:true,invitations});
@@ -5418,11 +5444,25 @@ app.post("/api/private-tutors/:id/rooms",async(req,res)=>{
     if(b.rows[0].status!=="confirmed")return res.status(403).json({ok:false,msg:"الحجز لم يتم تأكيده بعد"});
     const bookingStudent=String(b.rows[0].student_email||"").toLowerCase();
     if(bookingStudent!==student)return res.status(403).json({ok:false,msg:"الطالب غير مطابق للحجز"});
-    const existing=await db.query("SELECT * FROM private_tutor_rooms WHERE booking_id=$1 ORDER BY created_at DESC LIMIT 1",[booking]);
-    if(existing.rows.length)return res.status(200).json({ok:true,room:roomView(existing.rows[0]),eventsUrl:"/api/private-tutor-rooms/"+existing.rows[0].id+"/events"});
-    const id=tutorId(),now=Date.now();
-    const r=await db.query("INSERT INTO private_tutor_rooms (id,tutor_id,booking_id,student_email,tutor_email,status,created_at) VALUES ($1,$2,$3,$4,$5,'waiting',$6) RETURNING *",[id,a.tutor.id,booking,student,a.tutor.tutor_email||"",now]);
-    res.status(201).json({ok:true,room:roomView(r.rows[0]),eventsUrl:"/api/private-tutor-rooms/"+id+"/events"});
+    const now=Date.now();
+    const result=await withDbTransaction(async client=>{
+      const locked=await client.query("SELECT id FROM private_tutor_bookings WHERE id=$1 AND tutor_id=$2 FOR UPDATE",[booking,a.tutor.id]);
+      if(!locked.rows.length)return null;
+      const existing=await client.query("SELECT * FROM private_tutor_rooms WHERE booking_id=$1 AND status IN ('waiting','active') ORDER BY created_at DESC LIMIT 1",[booking]);
+      if(existing.rows.length)return {room:existing.rows[0],created:false};
+      const id=tutorId();
+      const created=await client.query(
+        "INSERT INTO private_tutor_rooms (id,tutor_id,booking_id,student_email,tutor_email,status,created_at) VALUES ($1,$2,$3,$4,$5,'waiting',$6) RETURNING *",
+        [id,a.tutor.id,booking,student,a.tutor.tutor_email||"",now]
+      );
+      return {room:created.rows[0],created:true};
+    });
+    if(!result)return res.status(404).json({ok:false,msg:"الحجز غير موجود"});
+    if(a.role==="tutor"||a.role==="admin"){
+      await notifyPrivateTutorRoom(result.room,a.tutor,false).catch(error=>console.error("private tutor room notification:",error.message));
+    }
+    const roomId=result.room.id;
+    res.status(result.created?201:200).json({ok:true,room:roomView(result.room),eventsUrl:"/api/private-tutor-rooms/"+roomId+"/events"});
   }catch(e){console.error("room create",e.message);res.status(500).json({ok:false,msg:"تعذر إنشاء الغرفة"});}
 });
 
@@ -5468,14 +5508,7 @@ app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
   ps.set(p,{email:a.user.email,role:a.role,approved,joinKey,joinedAt:Date.now()});
   await db.query("UPDATE private_tutor_rooms SET status='active',started_at=COALESCE(started_at,$1) WHERE id=$2",[Date.now(),id]);
   if(a.role==="tutor"&&!Number(a.room.started_at)){
-    const notificationText=`المعلم ${a.tutor?.name||"المعلم"} بانتظارك الآن في المحاضرة المباشرة.`;
-    db.query(
-      "INSERT INTO notifications (id,user_email,message,type,action_url,created_at) VALUES ($1,$2,$3,$4,$5,$6)",
-      [randomBytes(12).toString("hex"),String(a.room.student_email||"").toLowerCase(),notificationText,"tutor_live_invitation",`tutor-live:${a.room.tutor_id}:${a.room.booking_id}`,Date.now()]
-    ).catch(error=>console.error("private tutor invitation notification:",error.message));
-    const tutorName=tutorEmailHtmlText(a.tutor?.name||"المعلم");
-    notifyTutorByEmail(String(a.room.student_email||"").toLowerCase(),"المعلم بانتظارك في المحاضرة","محاضرتك المباشرة جاهزة",`المعلم ${tutorName} بانتظارك الآن. سجّل الدخول إلى حسابك لفتح صفحة المعلمين والانضمام.`)
-      .catch(error=>console.error("private tutor invitation email:",error.message));
+    notifyPrivateTutorRoom(a.room,a.tutor,true).catch(error=>console.error("private tutor invitation:",error.message));
   }
   emitRoom(id,"participant-joined",{participantId:p,role:a.role,email:a.user.email});
   res.json({ok:true,roomId:id,participantId:p,role:a.role,waiting:!approved,participants:[...ps].map(([participantId,v])=>({participantId,role:v.role,email:v.email,approved:!!v.approved}))});
