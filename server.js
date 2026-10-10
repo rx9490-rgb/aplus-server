@@ -40,6 +40,14 @@ const pool = new Pool({
 
 pool.on("error", (err) => {
   console.error("❌ خطأ في pool قاعدة البيانات:", err.message);
+  void recordApplicationError({
+    category: "database",
+    message: err?.message || "database pool error",
+    stack: err?.stack || "",
+    source: "server",
+    path: "/api/healthz",
+    statusCode: 503,
+  });
 });
 
 // DB wrapper مع retry تلقائي — إغلاق الاتصال مرة واحدة فقط
@@ -202,6 +210,7 @@ async function initDB() {
       name           TEXT NOT NULL,
       bio            TEXT DEFAULT '',
       subject        TEXT DEFAULT '',
+      zoom_url       TEXT DEFAULT '',
       whatsapp       TEXT DEFAULT '',
       experience     TEXT DEFAULT '',
       verification_status TEXT DEFAULT 'approved',
@@ -243,6 +252,7 @@ async function initDB() {
       proposed_date  TEXT DEFAULT '',
       proposed_time  TEXT DEFAULT '',
       response_note  TEXT DEFAULT '',
+      zoom_url       TEXT DEFAULT '',
       responded_at   BIGINT DEFAULT 0,
       notes          TEXT DEFAULT '',
       status         TEXT DEFAULT 'pending',
@@ -401,6 +411,29 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS community_direct_messages_thread_created_idx
       ON community_direct_messages(thread_id, created_at DESC) WHERE deleted_at = 0;
+    CREATE TABLE IF NOT EXISTS app_errors (
+      id BIGSERIAL PRIMARY KEY,
+      fingerprint TEXT NOT NULL UNIQUE,
+      error_number INTEGER NOT NULL,
+      category TEXT NOT NULL DEFAULT 'unknown',
+      message TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT 'server',
+      user_email TEXT NOT NULL DEFAULT '',
+      request_path TEXT NOT NULL DEFAULT '',
+      http_method TEXT NOT NULL DEFAULT '',
+      status_code INTEGER NOT NULL DEFAULT 0,
+      stack TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL,
+      last_seen BIGINT NOT NULL,
+      occurrences INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'open'
+    );
+    CREATE INDEX IF NOT EXISTS app_errors_created_idx
+      ON app_errors(created_at DESC);
+    CREATE INDEX IF NOT EXISTS app_errors_code_created_idx
+      ON app_errors(error_number, created_at DESC);
+    CREATE INDEX IF NOT EXISTS app_errors_status_created_idx
+      ON app_errors(status, created_at DESC);
   `);
 
   try {
@@ -430,6 +463,7 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
     `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS tutor_email TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS zoom_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS whatsapp TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS experience TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'approved'`,
@@ -451,6 +485,7 @@ async function initDB() {
     `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS proposed_date TEXT DEFAULT ''`,
     `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS proposed_time TEXT DEFAULT ''`,
     `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS response_note TEXT DEFAULT ''`,
+    `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS zoom_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutor_bookings ADD COLUMN IF NOT EXISTS responded_at BIGINT DEFAULT 0`,
     `ALTER TABLE private_tutor_rooms ADD COLUMN IF NOT EXISTS group_slot_id TEXT`,
     `ALTER TABLE private_tutor_recordings ADD COLUMN IF NOT EXISTS file_path TEXT DEFAULT ''`,
@@ -537,6 +572,19 @@ async function isAdminRequest(req) {
     user.is_super_admin || user.isSuperAdmin ||
     (configuredAdminEmail && email === configuredAdminEmail)
   );
+}
+
+// سجل الأخطاء وإجراءات المعالجة تتطلب جلسة مدير صالحة؛ لا تقبل مفتاح الإدارة وحده.
+async function getMonitoringAdmin(req) {
+  const token = String(req.headers["x-session-token"] || "");
+  if (!token) return null;
+  const user = await getSessionUser(token);
+  if (!user || user.banned) return null;
+  const email = String(user.email || "").trim().toLowerCase();
+  const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  return user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)
+    ? user
+    : null;
 }
 
 // حماية استخدام الذكاء الاصطناعي — لا تسمح لأي شخص باستنزاف مفتاح OpenRouter
@@ -1038,6 +1086,223 @@ function formatUser(u) {
 // ══════════════════════════════════════════════
 const sseClients = new Map(); // id → res
 let sseIdCounter = 0;
+const streamTickets = new Map();
+const pendingApplicationErrors = [];
+const errorNotificationCooldown = new Map();
+
+const SUPPORT_ERROR_NUMBERS = Object.freeze({
+  connection: 394,
+  database: 395,
+  service: 396,
+  timeout: 397,
+  access: 398,
+  unexpected: 399,
+});
+
+function sanitizeMonitorText(value, maxLength = 700) {
+  return String(value || "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .replace(/\b(authorization|password|secret|token|api[_-]?key)\s*[:=]\s*[^\s,&]+/gi, "$1=[redacted]")
+    .replace(/([?&](?:authorization|password|secret|token|api[_-]?key)=)[^&\s]*/gi, "$1[redacted]")
+    .slice(0, maxLength);
+}
+
+function classifySupportError(details = {}) {
+  const category = String(details.category || "").toLowerCase();
+  const message = String(details.message || "").toLowerCase();
+  const status = Number(details.statusCode) || 0;
+  if (/network|connection|fetch|connect|econn|ehostunreach|enotfound|socket|اتصال|شبك/.test(category + " " + message)) {
+    return SUPPORT_ERROR_NUMBERS.connection;
+  }
+  if (/database|postgres|pool|قاعدة البيانات/.test(category + " " + message)) {
+    return SUPPORT_ERROR_NUMBERS.database;
+  }
+  if (/timeout|timed ?out|etimedout|esockettimedout|deadline|مهلة|انتهت المهلة/.test(category + " " + message)) {
+    return SUPPORT_ERROR_NUMBERS.timeout;
+  }
+  if (status === 401 || status === 403 || /permission|forbidden|unauthorized|صلاحية|مصرح/.test(category + " " + message)) {
+    return SUPPORT_ERROR_NUMBERS.access;
+  }
+  if (status >= 500 || /server|service|الخادم|الخدمة/.test(category + " " + message)) {
+    return SUPPORT_ERROR_NUMBERS.service;
+  }
+  return SUPPORT_ERROR_NUMBERS.unexpected;
+}
+
+function supportErrorCategory(errorNumber) {
+  return Object.keys(SUPPORT_ERROR_NUMBERS).find((key) => SUPPORT_ERROR_NUMBERS[key] === errorNumber) || "unexpected";
+}
+
+function broadcastAdminEvent(data) {
+  const eventType = data.type || "message";
+  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  const dead = [];
+  for (const [id, client] of sseClients) {
+    if (!client._isAdmin) continue;
+    try { client.write(payload); } catch { dead.push(id); }
+  }
+  dead.forEach((id) => sseClients.delete(id));
+}
+
+async function persistApplicationError(item) {
+  const result = await db.query(
+    `INSERT INTO app_errors
+       (fingerprint, error_number, category, message, source, user_email, request_path,
+        http_method, status_code, stack, created_at, last_seen, occurrences, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,1,'open')
+     ON CONFLICT (fingerprint) DO UPDATE
+       SET occurrences = app_errors.occurrences + 1,
+            last_seen = EXCLUDED.last_seen,
+            status = 'open'
+     RETURNING id, error_number AS "errorNumber", category, message, source,
+               user_email AS "userEmail", request_path AS path, http_method AS method,
+               status_code AS "statusCode", stack, created_at AS "createdAt",
+               last_seen AS "lastSeen", occurrences, status`,
+    [
+      item.fingerprint, item.errorNumber, item.category, item.message, item.source,
+      item.userEmail, item.path, item.method, item.statusCode, item.stack, item.createdAt,
+    ]
+  );
+  return result.rows[0];
+}
+
+async function notifyMonitoringAdmins(item, row) {
+  const admins = await db.query(
+    "SELECT email FROM users WHERE (is_admin=TRUE OR is_super_admin=TRUE OR LOWER(email)=LOWER($1)) AND deleted_at IS NULL",
+    [String(process.env.ADMIN_EMAIL || "")]
+  );
+  const message = `خطأ جديد ${item.errorNumber}${row?.id ? ` · سجل ${row.id}` : ""}: ${item.message.slice(0, 180)}`;
+  await Promise.all(admins.rows.map((admin) => db.query(
+    "INSERT INTO notifications (id, user_email, message, type, action_url, read, created_at) VALUES ($1,$2,$3,'error',$4,FALSE,$5)",
+    [randomBytes(16).toString("hex"), admin.email, message, `aplus-errors:${item.errorNumber}`, Date.now()]
+  )));
+}
+
+async function recordApplicationError(details = {}) {
+  const createdAt = Number(details.createdAt) || Date.now();
+  const message = sanitizeMonitorText(details.message || "حدث خطأ غير محدد", 700);
+  const errorNumber = classifySupportError({ ...details, message });
+  let userEmail = String(details.userEmail || "").trim().toLowerCase().slice(0, 255);
+  if (!userEmail && details.req) {
+    try {
+      const authHeader = String(details.req.headers.authorization || "");
+      const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+      const token = String(details.req.headers["x-session-token"] || bearer);
+      const user = token ? await getSessionUser(token) : null;
+      userEmail = String(user?.email || "").trim().toLowerCase().slice(0, 255);
+    } catch {}
+  }
+  const path = sanitizeMonitorText(String(details.path || "").split("?")[0], 300);
+  const category = supportErrorCategory(errorNumber);
+  const source = sanitizeMonitorText(details.source || "server", 40);
+  const method = sanitizeMonitorText(details.method || "", 12).toUpperCase();
+  const stack = sanitizeMonitorText(details.stack || "", 3000);
+  const fingerprintBase = [errorNumber, category, source, userEmail, path, method, message].join("|").slice(0, 900);
+  const fingerprint = `${fingerprintBase}|${Math.floor(createdAt / 300000)}`;
+  const cooldownKey = fingerprintBase;
+  const lastNotified = errorNotificationCooldown.get(cooldownKey) || 0;
+  const shouldNotify = createdAt - lastNotified >= 60_000;
+  if (shouldNotify) errorNotificationCooldown.set(cooldownKey, createdAt);
+
+  const item = {
+    fingerprint, errorNumber, category, message, source, userEmail, path, method, stack,
+    statusCode: Math.max(0, Number(details.statusCode) || 0), createdAt, shouldNotify,
+  };
+
+  if (shouldNotify) {
+    broadcastAdminEvent({
+      type: "application_error",
+      errorNumber,
+      category,
+      message,
+      userEmail,
+      path,
+      source,
+      createdAt,
+    });
+  }
+
+  try {
+    if (!dbReady) throw new Error("database_not_ready");
+    const row = await persistApplicationError(item);
+    if (shouldNotify) await notifyMonitoringAdmins(item, row).catch((error) => {
+      console.warn("application error notification skipped:", error?.message || error);
+    });
+    return { persisted: true, errorNumber, id: Number(row?.id) || null };
+  } catch (error) {
+    if (pendingApplicationErrors.length >= 250) pendingApplicationErrors.shift();
+    pendingApplicationErrors.push(item);
+    console.error("application error stored in memory until database recovery:", error?.message || error);
+    return { persisted: false, errorNumber, id: null };
+  }
+}
+
+async function flushPendingApplicationErrors() {
+  for (let count = 0; count < 20 && pendingApplicationErrors.length; count++) {
+    const item = pendingApplicationErrors[0];
+    try {
+      if (!dbReady) return;
+      const row = await persistApplicationError(item);
+      pendingApplicationErrors.shift();
+      if (item.shouldNotify) await notifyMonitoringAdmins(item, row).catch(() => {});
+    } catch {
+      return;
+    }
+  }
+}
+
+let watchdogRunning = false;
+let databaseWatchdogState = "starting";
+let databaseWatchdogLastCheck = 0;
+function startErrorWatchdog() {
+  const check = async () => {
+    if (watchdogRunning) return;
+    watchdogRunning = true;
+    databaseWatchdogLastCheck = Date.now();
+    try {
+      if (!dbReady) {
+        await initDB();
+        dbReady = true;
+        dbInitError = null;
+      } else {
+        await db.query("SELECT 1");
+      }
+      if (databaseWatchdogState === "offline") {
+        databaseWatchdogState = "online";
+        broadcastAdminEvent({ type: "monitor_status", status: "online", checkedAt: databaseWatchdogLastCheck });
+      } else {
+        databaseWatchdogState = "online";
+      }
+      await flushPendingApplicationErrors();
+    } catch (error) {
+      if (databaseWatchdogState !== "offline") {
+        databaseWatchdogState = "offline";
+        await recordApplicationError({
+          category: "database",
+          message: `فشل فحص اتصال قاعدة البيانات: ${error?.message || "unknown"}`,
+          source: "monitor",
+          path: "/api/healthz",
+          statusCode: 503,
+        });
+      }
+    } finally {
+      watchdogRunning = false;
+    }
+  };
+  void check();
+  const timer = setInterval(check, 30_000);
+  timer.unref?.();
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ticket, item] of streamTickets) {
+    if (item.expiresAt <= now) streamTickets.delete(ticket);
+  }
+  for (const [key, timestamp] of errorNotificationCooldown) {
+    if (now - timestamp > 60 * 60_000) errorNotificationCooldown.delete(key);
+  }
+}, 60_000).unref?.();
 
 function broadcastEvent(data, targetEmail = null) {
   const eventType = data.type || "message";
@@ -1090,6 +1355,29 @@ app.use(cors({
   credentials: true,
 }));
 
+// أضف أرقام الدعم أيضاً لردود محدد المعدل التي قد تنتهي قبل معالج الأخطاء الرئيسي.
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    if (
+      res.statusCode >= 400 &&
+      body &&
+      typeof body === "object" &&
+      !Array.isArray(body)
+    ) {
+      body = {
+        ...body,
+        errorNumber: Number(body.errorNumber) || classifySupportError({
+          message: body.msg || body.message || body.error || "",
+          statusCode: res.statusCode,
+        }),
+      };
+    }
+    return originalJson(body);
+  };
+  next();
+});
+
 // Rate limiting مرن — auth له حد منفصل، API العام لا يعيد احتساب auth
 // حد تسجيل الدخول: 10 محاولات فقط في الدقيقة لكل IP
 app.use("/api/auth", rateLimit({
@@ -1113,6 +1401,54 @@ app.use("/api/openrouter", rateLimit({
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
+// يضيف رقم دعم ثابتاً لكل استجابة خطأ، ويسجل استجابات الخادم 5xx تلقائياً.
+app.use((req, res, next) => {
+  const captureResponseError = (body) => {
+    if (req.path === "/api/errors/report") return;
+    if (res.statusCode >= 500 && !res.locals.applicationErrorCaptured) {
+      res.locals.applicationErrorCaptured = true;
+      const rawMessage = body && typeof body === "object"
+        ? (body.msg || body.message || body.error || `HTTP ${res.statusCode}`)
+        : `HTTP ${res.statusCode}`;
+      void recordApplicationError({
+        req,
+        category: supportErrorCategory(classifySupportError({ message: rawMessage, statusCode: res.statusCode })),
+        message: rawMessage,
+        source: "server",
+        path: req.originalUrl || req.path,
+        method: req.method,
+        statusCode: res.statusCode,
+      });
+    }
+  };
+
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    let responseBody = body;
+    if (
+      res.statusCode >= 400 &&
+      body &&
+      typeof body === "object" &&
+      !Array.isArray(body)
+    ) {
+      const errorNumber = Number(body.errorNumber) || classifySupportError({
+        message: body.msg || body.message || body.error || "",
+        statusCode: res.statusCode,
+      });
+      responseBody = { ...body, errorNumber };
+    }
+    captureResponseError(responseBody);
+    return originalJson(responseBody);
+  };
+
+  res.once("finish", () => {
+    if (res.statusCode >= 500 && !res.locals.applicationErrorCaptured) {
+      captureResponseError(null);
+    }
+  });
+  next();
+});
+
 // ══════════════════════════════════════════════
 // 6. Health & Ping
 // ══════════════════════════════════════════════
@@ -1121,6 +1457,160 @@ app.get("/api/healthz", (_req, res) => {
     return res.status(503).json({ status: "starting", message: "قاعدة البيانات قيد التشغيل" });
   }
   res.json({ status: "ok", time: Date.now(), clients: sseClients.size });
+});
+
+// يسجل أخطاء المتصفح لجميع المستخدمين، مع حد للحجم والمعدل ومن دون قبول هوية يرسلها العميل.
+app.post("/api/errors/report", rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+}), async (req, res) => {
+  const body = req.body || {};
+  const allowedCategories = new Set(["connection", "database", "service", "timeout", "access", "unexpected"]);
+  const category = allowedCategories.has(String(body.category || "")) ? String(body.category) : "unexpected";
+  const outcome = await recordApplicationError({
+    req,
+    category,
+    message: String(body.message || "خطأ في واجهة الموقع").slice(0, 700),
+    source: "client",
+    stack: String(body.stack || "").slice(0, 3000),
+    path: String(body.pagePath || "").slice(0, 300),
+    method: "",
+  });
+  res.status(202).json({
+    ok: true,
+    errorNumber: outcome.errorNumber,
+    incidentId: outcome.id,
+    persisted: outcome.persisted,
+  });
+});
+
+app.get("/api/admin/errors", async (req, res) => {
+  try {
+    const admin = await getMonitoringAdmin(req);
+    if (!admin) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+
+    const conditions = [];
+    const values = [];
+    const requestedCode = String(req.query.code || "").trim();
+    if (requestedCode) {
+      if (!/^\d{1,6}$/.test(requestedCode)) {
+        return res.status(400).json({ ok: false, msg: "رقم الخطأ غير صحيح" });
+      }
+      values.push(Number(requestedCode));
+      conditions.push(`error_number = $${values.length}`);
+    }
+    const requestedStatus = String(req.query.status || "").trim();
+    if (requestedStatus === "open" || requestedStatus === "resolved") {
+      values.push(requestedStatus);
+      conditions.push(`status = $${values.length}`);
+    }
+    const search = String(req.query.q || "").trim().slice(0, 100);
+    if (search) {
+      values.push(`%${search.replace(/[%_]/g, "\\$&")}%`);
+      conditions.push(`(user_email ILIKE $${values.length} OR message ILIKE $${values.length} OR request_path ILIKE $${values.length})`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const requestedLimit = Number.parseInt(String(req.query.limit || "100"), 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, requestedLimit)) : 100;
+    values.push(limit);
+    const result = await db.query(
+      `SELECT id, error_number AS "errorNumber", category, message, source,
+              user_email AS "userEmail", request_path AS path, http_method AS method,
+              status_code AS "statusCode", stack, created_at AS "createdAt",
+              last_seen AS "lastSeen", occurrences, status
+       FROM app_errors ${where}
+       ORDER BY last_seen DESC LIMIT $${values.length}`,
+      values
+    );
+    const counts = await db.query(
+      "SELECT COUNT(*)::INTEGER AS total, COUNT(*) FILTER (WHERE status='open')::INTEGER AS open FROM app_errors"
+    );
+    res.json({
+      ok: true,
+      errors: result.rows,
+      total: Number(counts.rows[0]?.total) || 0,
+      openCount: Number(counts.rows[0]?.open) || 0,
+      monitor: {
+        status: databaseWatchdogState,
+        lastCheckAt: databaseWatchdogLastCheck,
+        intervalSeconds: 30,
+        connectedUsers: sseClients.size,
+        queuedErrors: pendingApplicationErrors.length,
+      },
+    });
+  } catch (error) {
+    console.error("admin error monitor list failed:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر تحميل سجل الأخطاء" });
+  }
+});
+
+app.patch("/api/admin/errors/:id/resolve", async (req, res) => {
+  try {
+    const admin = await getMonitoringAdmin(req);
+    if (!admin) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const id = String(req.params.id || "");
+    if (!/^\d{1,18}$/.test(id)) return res.status(400).json({ ok: false, msg: "رقم السجل غير صحيح" });
+    const updated = await db.query(
+      "UPDATE app_errors SET status='resolved' WHERE id=$1 RETURNING id, error_number AS \"errorNumber\", status",
+      [id]
+    );
+    if (!updated.rowCount) return res.status(404).json({ ok: false, msg: "سجل الخطأ غير موجود" });
+    await auditLog("application_error_resolved", admin.email, { errorId: id });
+    res.json({ ok: true, error: updated.rows[0] });
+  } catch (error) {
+    console.error("admin error resolve failed:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر تحديث حالة الخطأ" });
+  }
+});
+
+app.post("/api/admin/errors/users/:email/reset-service", async (req, res) => {
+  try {
+    const admin = await getMonitoringAdmin(req);
+    if (!admin) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const email = String(req.params.email || "").trim().toLowerCase();
+    if (email.length > 255 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ ok: false, msg: "البريد الإلكتروني غير صحيح" });
+    }
+
+    const reset = await db.query(
+      `UPDATE users
+       SET login_attempts=0, locked_until=0
+       WHERE email=$1 AND deleted_at IS NULL AND banned=FALSE
+         AND is_admin=FALSE AND is_super_admin=FALSE AND is_moderator=FALSE
+       RETURNING email, full_name`,
+      [email]
+    );
+    if (!reset.rowCount) {
+      return res.status(404).json({ ok: false, msg: "لم يتم العثور على حساب طالب نشط بهذا البريد" });
+    }
+
+    for (const key of aiUsage.keys()) {
+      if (String(key).toLowerCase() === email) aiUsage.delete(key);
+    }
+    invalidateSessionCache(email);
+    const user = reset.rows[0];
+    const resetMessage = "أعاد المشرف تهيئة الخدمات المؤقتة لحسابك. أُعيد تحميل الموقع لتطبيق الإصلاح.";
+    await db.query(
+      "INSERT INTO notifications (id, user_email, message, type, action_url, read, created_at) VALUES ($1,$2,$3,'success','',FALSE,$4)",
+      [randomBytes(16).toString("hex"), email, resetMessage, Date.now()]
+    );
+    broadcastEvent({
+      type: "service_reset",
+      email,
+      message: resetMessage,
+      at: Date.now(),
+    }, email);
+    await auditLog("application_user_service_reset", admin.email, {
+      userEmail: email,
+      ip: getClientIp(req),
+    });
+    res.json({ ok: true, user: { email: user.email, fullName: user.full_name || "" } });
+  } catch (error) {
+    console.error("admin service reset failed:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر إعادة تهيئة خدمات الطالب" });
+  }
 });
 
 app.get("/api/notifications", async (req, res) => {
@@ -1277,15 +1767,52 @@ app.get("/ping", (_req, res) => res.send("pong"));
 // ══════════════════════════════════════════════
 // 7. SSE Stream — بث مباشر
 // ══════════════════════════════════════════════
+app.post("/api/stream-ticket", async (req, res) => {
+  try {
+    const token = String(req.headers["x-session-token"] || "");
+    const user = token ? await getSessionUser(token) : null;
+    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    const ticket = randomBytes(24).toString("hex");
+    const email = String(user.email || "").trim().toLowerCase();
+    const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+    streamTickets.set(ticket, {
+      email,
+      isAdmin: !!(user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)),
+      expiresAt: Date.now() + 60_000,
+    });
+    res.json({ ok: true, ticket, expiresIn: 60 });
+  } catch (error) {
+    console.error("SSE ticket creation failed:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر فتح الاتصال المباشر" });
+  }
+});
+
 app.get("/api/stream", async (req, res) => {
   const id = ++sseIdCounter;
-  const token = req.headers["x-session-token"] || req.query.token;
   let userEmail = null;
+  let isAdmin = false;
 
-  if (token) {
+  const ticket = String(req.query.ticket || "");
+  const ticketData = ticket ? streamTickets.get(ticket) : null;
+  if (ticketData && ticketData.expiresAt > Date.now()) {
+    streamTickets.delete(ticket);
+    userEmail = ticketData.email;
+    isAdmin = ticketData.isAdmin;
+  } else {
+    const token = req.headers["x-session-token"] || req.query.token;
+    if (token) {
+      try {
+        const u = await getSessionUser(token);
+        userEmail = u?.email || null;
+        isAdmin = !!(u && (u.is_admin || u.is_super_admin));
+      } catch {}
+    }
+  }
+
+  if (userEmail && !isAdmin) {
     try {
-      const u = await getSessionUser(token);
-      userEmail = u?.email || null;
+      const matchingUser = await db.query("SELECT is_admin,is_super_admin FROM users WHERE email=$1", [userEmail]);
+      isAdmin = !!(matchingUser.rows[0]?.is_admin || matchingUser.rows[0]?.is_super_admin);
     } catch {}
   }
 
@@ -1302,6 +1829,7 @@ app.get("/api/stream", async (req, res) => {
   res.write(`event: connected\ndata: ${JSON.stringify({ type: "connected", id, clients: sseClients.size + 1 })}\n\n`);
 
   res._email = userEmail;
+  res._isAdmin = isAdmin;
   sseClients.set(id, res);
 
   req.on("close", () => {
@@ -4146,6 +4674,21 @@ function privateTutorUser(req) {
   return token ? getSessionUser(token) : null;
 }
 
+function normalizePrivateTutorZoomUrl(value) {
+  const raw = String(value == null ? "" : value).trim().slice(0, 1200);
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || !(host === "zoom.us" || host.endsWith(".zoom.us"))) return null;
+    url.username = "";
+    url.password = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function tutorEmailHtmlText(value) {
   return String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
@@ -4253,8 +4796,26 @@ app.get("/api/private-tutor/me", async (req, res) => {
       db.query("SELECT COUNT(*)::int AS count FROM private_tutor_profile_views WHERE tutor_id=$1", [tutor.id]),
       db.query("SELECT id,requested_data,status,review_note,created_at,reviewed_at FROM private_tutor_profile_change_requests WHERE tutor_id=$1 ORDER BY created_at DESC LIMIT 1", [tutor.id])
     ]);
-    res.json({ ok: true, tutor: formatPrivateTutor(tutor), stats: { views: Number(views.rows[0]?.count) || 0, bookings: bookings.rows.length, pendingBookings: bookings.rows.filter((b) => b.status === "pending" || b.status === "proposed").length, confirmedBookings: bookings.rows.filter((b) => b.status === "confirmed").length, live: rooms.rows.length, recordings: recordings.rows.length }, bookings: bookings.rows, currentLectures: rooms.rows, recordings: recordings.rows, profileChangeRequest: profileChangeRequest.rows[0] || null });
+    res.json({ ok: true, tutor: { ...formatPrivateTutor(tutor), zoomUrl: tutor.zoom_url || "" }, stats: { views: Number(views.rows[0]?.count) || 0, bookings: bookings.rows.length, pendingBookings: bookings.rows.filter((b) => b.status === "pending" || b.status === "proposed").length, confirmedBookings: bookings.rows.filter((b) => b.status === "confirmed").length, live: rooms.rows.length, recordings: recordings.rows.length }, bookings: bookings.rows, currentLectures: rooms.rows, recordings: recordings.rows, profileChangeRequest: profileChangeRequest.rows[0] || null });
   } catch (e) { res.status(500).json({ ok: false, msg: "تعذر تحميل لوحة المعلم" }); }
+});
+
+app.patch("/api/private-tutor/zoom-link", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const zoomUrl = normalizePrivateTutorZoomUrl(req.body?.zoomUrl);
+    if (zoomUrl === null) return res.status(400).json({ ok: false, msg: "أدخل رابط Zoom آمنًا يبدأ بـ https:// ومن نطاق zoom.us" });
+    const result = await db.query(
+      "UPDATE private_tutors SET zoom_url=$1 WHERE lower(tutor_email)=lower($2) AND active=TRUE RETURNING id",
+      [zoomUrl, String(user.email || "").toLowerCase()]
+    );
+    if (!result.rows.length) return res.status(403).json({ ok: false, msg: "هذه الصفحة للمعلم فقط" });
+    res.json({ ok: true, zoomUrl });
+  } catch (e) {
+    console.error("private tutor zoom link:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر حفظ رابط Zoom" });
+  }
 });
 
 app.post("/api/private-tutor/profile-change-requests", async (req, res) => {
@@ -4840,15 +5401,31 @@ app.get("/api/admin/private-tutors", async (req, res) => {
     const tutors = await db.query("SELECT * FROM private_tutors ORDER BY created_at DESC");
     const codes = await db.query("SELECT * FROM private_tutor_codes ORDER BY created_at DESC");
     const bookings = await db.query(
-      `SELECT b.*, t.name AS tutor_name
+      `SELECT b.*, t.name AS tutor_name, t.zoom_url AS tutor_zoom_url, u.full_name AS student_name
        FROM private_tutor_bookings b
        JOIN private_tutors t ON t.id=b.tutor_id
-       WHERE b.status='pending'
-       ORDER BY b.created_at DESC`
+       LEFT JOIN users u ON lower(u.email)=lower(b.student_email)
+       ORDER BY COALESCE(NULLIF(b.proposed_date,''),b.requested_date) DESC,
+                COALESCE(NULLIF(b.proposed_time,''),b.requested_time) DESC,
+                b.created_at DESC
+       LIMIT 500`
+    );
+    const groupSessions = await db.query(
+      `SELECT s.id,s.tutor_id,s.session_date,s.start_time,s.duration_minutes,s.status,
+              t.name AS tutor_name,t.zoom_url AS tutor_zoom_url,
+              COUNT(g.id)::int AS student_count,
+              COALESCE(STRING_AGG(DISTINCT COALESCE(NULLIF(u.full_name,''),g.student_email) || ' (' || g.student_email || ')', ', '),'') AS students
+       FROM private_tutor_group_slots s
+       JOIN private_tutors t ON t.id=s.tutor_id
+       JOIN private_tutor_group_bookings g ON g.slot_id=s.id AND g.status='confirmed'
+       LEFT JOIN users u ON lower(u.email)=lower(g.student_email)
+       GROUP BY s.id,t.name,t.zoom_url
+       ORDER BY s.session_date DESC,s.start_time DESC
+       LIMIT 300`
     );
     res.json({
       ok: true,
-      tutors: tutors.rows.map(formatPrivateTutor),
+      tutors: tutors.rows.map((t) => ({ ...formatPrivateTutor(t), zoomUrl: t.zoom_url || "" })),
       codes: codes.rows.map((c) => ({
         id: c.id, tutorId: c.tutor_id, code: c.code,
         studentEmail: c.student_email || "", plan: c.plan || "month",
@@ -4857,11 +5434,21 @@ app.get("/api/admin/private-tutors", async (req, res) => {
       })),
       bookings: bookings.rows.map((b) => ({
         id: b.id, tutorId: b.tutor_id, tutorName: b.tutor_name,
-        studentEmail: b.student_email, dayOfWeek: b.day_of_week,
+        studentEmail: b.student_email, studentName: b.student_name || "",
+        dayOfWeek: b.day_of_week,
         timeText: b.time_text, requestedDate: b.requested_date || "",
         requestedTime: b.requested_time || "", proposedDate: b.proposed_date || "",
         proposedTime: b.proposed_time || "", responseNote: b.response_note || "",
-        notes: b.notes || "", status: b.status, createdAt: Number(b.created_at) || 0
+        notes: b.notes || "", status: b.status,
+        zoomUrl: b.zoom_url || b.tutor_zoom_url || "",
+        createdAt: Number(b.created_at) || 0
+      })),
+      groupSessions: groupSessions.rows.map((s) => ({
+        id: s.id, tutorId: s.tutor_id, tutorName: s.tutor_name,
+        date: s.session_date || "", time: String(s.start_time || "").slice(0, 5),
+        durationMinutes: Number(s.duration_minutes) || 60,
+        status: s.status || "", studentCount: Number(s.student_count) || 0,
+        students: s.students || "", zoomUrl: s.tutor_zoom_url || ""
       }))
     });
   } catch (e) {
@@ -4881,6 +5468,7 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     const subject = String(body.subject || "").trim().slice(0, 120);
     const tutorEmail = String(body.tutorEmail || "").trim().toLowerCase().slice(0, 255);
     const tutorPassword = String(body.tutorPassword || "");
+    const zoomUrl = normalizePrivateTutorZoomUrl(body.zoomUrl);
     const imageUrl = String(body.imageUrl || "").trim().slice(0, 1000);
     const videoUrl = String(body.videoUrl || "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl || "").trim().slice(0, 1500);
@@ -4894,6 +5482,7 @@ app.post("/api/admin/private-tutors", async (req, res) => {
     if (!name || !subject || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(tutorEmail) || tutorPassword.length < 6) {
       return res.status(400).json({ ok: false, msg: "أدخل الاسم والتخصص وإيميلاً صحيحاً وكلمة مرور من 6 أحرف على الأقل" });
     }
+    if (zoomUrl === null) return res.status(400).json({ ok: false, msg: "أدخل رابط Zoom آمنًا يبدأ بـ https:// ومن نطاق zoom.us" });
     if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
     }
@@ -4910,10 +5499,10 @@ app.post("/api/admin/private-tutors", async (req, res) => {
         }
         const inserted = await client.query(
           `INSERT INTO private_tutors
-           (id,name,bio,subject,tutor_email,image_url,video_url,lesson_price,monthly_price,
+           (id,name,bio,subject,tutor_email,zoom_url,image_url,video_url,lesson_price,monthly_price,
             daily_salla_url,monthly_salla_url,package_salla_url,package_lessons,salla_url,free_access,active,created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE,$16) RETURNING *`,
-          [privateTutorId(), name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,TRUE,$17) RETURNING *`,
+          [privateTutorId(), name, bio, subject, tutorEmail, zoomUrl, imageUrl, videoUrl, lessonPrice, monthlyPrice,
             dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, freeAccess || monthlyPrice <= 0, createdAt]
         );
         await client.query(
@@ -4953,6 +5542,7 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
     const subject = String(body.subject ?? old.subject ?? "").trim().slice(0, 120);
     const tutorEmail = String(body.tutorEmail ?? old.tutor_email ?? "").trim().toLowerCase().slice(0, 255);
     const tutorPassword = String(body.tutorPassword || "");
+    const zoomUrl = normalizePrivateTutorZoomUrl(body.zoomUrl ?? old.zoom_url ?? "");
     const imageUrl = String(body.imageUrl ?? old.image_url ?? "").trim().slice(0, 1000);
     const videoUrl = String(body.videoUrl ?? old.video_url ?? "").trim().slice(0, 12000000);
     const sallaUrl = String(body.sallaUrl ?? old.salla_url).trim().slice(0, 1500);
@@ -4969,6 +5559,7 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
     if (!name || !subject) {
       return res.status(400).json({ ok: false, msg: "الاسم والتخصص مطلوبان" });
     }
+    if (zoomUrl === null) return res.status(400).json({ ok: false, msg: "أدخل رابط Zoom آمنًا يبدأ بـ https:// ومن نطاق zoom.us" });
     if ([sallaUrl, dailySallaUrl, monthlySallaUrl, packageSallaUrl].some((url) => url && !/^https?:\/\//i.test(url))) {
       return res.status(400).json({ ok: false, msg: "رابط سلة غير صحيح" });
     }
@@ -4976,9 +5567,9 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
       `UPDATE private_tutors SET name=$1,bio=$2,subject=$3,tutor_email=$4,image_url=$5,
        video_url=$6,lesson_price=$7,monthly_price=$8,daily_salla_url=$9,
        monthly_salla_url=$10,package_salla_url=$11,package_lessons=$12,
-       salla_url=$13,free_access=$14,active=$15 WHERE id=$16 RETURNING *`,
+        salla_url=$13,free_access=$14,active=$15,zoom_url=$16 WHERE id=$17 RETURNING *`,
       [name, bio, subject, tutorEmail, imageUrl, videoUrl, lessonPrice, monthlyPrice,
-        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, freeAccess, active, id]
+        dailySallaUrl, monthlySallaUrl, packageSallaUrl, packageLessons, sallaUrl, freeAccess, active, zoomUrl, id]
     );
     await ensurePrivateTutorAccount(tutorEmail, tutorPassword, name);
     broadcastEvent({ type: "private_tutors_updated" });
@@ -4986,6 +5577,21 @@ app.patch("/api/admin/private-tutors/:id", async (req, res) => {
   } catch (e) {
     console.error("private tutor update:", e.message);
     res.status(500).json({ ok: false, msg: "تعذر تعديل المعلم" });
+  }
+});
+
+app.patch("/api/admin/private-tutors/:id/zoom-link", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const zoomUrl = normalizePrivateTutorZoomUrl(req.body?.zoomUrl);
+    if (zoomUrl === null) return res.status(400).json({ ok: false, msg: "أدخل رابط Zoom آمنًا يبدأ بـ https:// ومن نطاق zoom.us" });
+    const result = await db.query("UPDATE private_tutors SET zoom_url=$1 WHERE id=$2 RETURNING id", [zoomUrl, String(req.params.id || "")]);
+    if (!result.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
+    broadcastEvent({ type: "private_tutors_updated" });
+    res.json({ ok: true, zoomUrl });
+  } catch (e) {
+    console.error("admin tutor zoom link:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر حفظ رابط Zoom للمعلم" });
   }
 });
 
@@ -5197,8 +5803,10 @@ app.get("/api/private-tutors/:id/bookings", async (req, res) => {
     const rows = await db.query(
       `SELECT b.id,b.day_of_week,b.time_text,b.requested_date,b.requested_time,
               b.proposed_date,b.proposed_time,b.response_note,b.notes,b.status,b.created_at,
-              r.rating AS student_rating,r.review AS student_review
+               r.rating AS student_rating,r.review AS student_review,
+               CASE WHEN b.status='confirmed' THEN COALESCE(NULLIF(b.zoom_url,''),t.zoom_url,'') ELSE '' END AS zoom_url
        FROM private_tutor_bookings b
+        JOIN private_tutors t ON t.id=b.tutor_id
        LEFT JOIN private_tutor_ratings r ON r.booking_id=b.id
        WHERE b.tutor_id=$1 AND b.student_email=$2
        ORDER BY b.created_at DESC LIMIT 50`,
@@ -5212,12 +5820,42 @@ app.get("/api/private-tutors/:id/bookings", async (req, res) => {
         proposedDate: b.proposed_date || "", proposedTime: b.proposed_time || "",
         responseNote: b.response_note || "", notes: b.notes || "",
         status: b.status, rating: Number(b.student_rating) || 0,
-        review: b.student_review || "", createdAt: Number(b.created_at) || 0
+        review: b.student_review || "", zoomUrl: b.zoom_url || "",
+        createdAt: Number(b.created_at) || 0
       }))
     });
   } catch (e) {
     console.error("private tutor student bookings:", e.message);
     res.status(500).json({ ok: false, bookings: [] });
+  }
+});
+
+app.patch("/api/private-tutor-bookings/:bookingId/zoom-link", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const zoomUrl = normalizePrivateTutorZoomUrl(req.body?.zoomUrl);
+    if (zoomUrl === null) return res.status(400).json({ ok: false, msg: "أدخل رابط Zoom آمنًا يبدأ بـ https:// ومن نطاق zoom.us" });
+    const bookingId = String(req.params.bookingId || "");
+    const booking = await db.query(
+      `SELECT b.id,b.status,t.tutor_email
+       FROM private_tutor_bookings b
+       JOIN private_tutors t ON t.id=b.tutor_id
+       WHERE b.id=$1 LIMIT 1`,
+      [bookingId]
+    );
+    if (!booking.rows.length) return res.status(404).json({ ok: false, msg: "الحجز غير موجود" });
+    if (String(booking.rows[0].tutor_email || "").toLowerCase() !== String(user.email || "").toLowerCase()) {
+      return res.status(403).json({ ok: false, msg: "غير مصرح" });
+    }
+    if (booking.rows[0].status !== "confirmed") {
+      return res.status(409).json({ ok: false, msg: "يمكن إضافة رابط Zoom بعد تأكيد الموعد فقط" });
+    }
+    await db.query("UPDATE private_tutor_bookings SET zoom_url=$1 WHERE id=$2", [zoomUrl, bookingId]);
+    res.json({ ok: true, zoomUrl });
+  } catch (e) {
+    console.error("private tutor booking zoom link:", e.message);
+    res.status(500).json({ ok: false, msg: "تعذر حفظ رابط Zoom للحصة" });
   }
 });
 
@@ -5788,8 +6426,9 @@ app.get("/api/private-tutors/:id/manage-bookings",async(req,res)=>{
     if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
      if(a.role!=="tutor")return res.status(403).json({ok:false,msg:"هذه الصفحة للمعلم فقط"});
     const q=await db.query(
-      `SELECT b.*,u.full_name, r.id AS room_id
+       `SELECT b.*,u.full_name, r.id AS room_id,t.zoom_url AS tutor_zoom_url
        FROM private_tutor_bookings b
+        JOIN private_tutors t ON t.id=b.tutor_id
        LEFT JOIN users u ON lower(u.email)=lower(b.student_email)
        LEFT JOIN private_tutor_rooms r ON r.booking_id=b.id
        WHERE b.tutor_id=$1 AND b.status IN ('pending','confirmed','proposed')
@@ -5801,7 +6440,8 @@ app.get("/api/private-tutors/:id/manage-bookings",async(req,res)=>{
       requestedDate:b.requested_date||"",requestedTime:b.requested_time||"",
       dayOfWeek:b.day_of_week,timeText:b.time_text,proposedDate:b.proposed_date||"",
       proposedTime:b.proposed_time||"",responseNote:b.response_note||"",
-      notes:b.notes||"",status:b.status,roomId:b.room_id||""
+       notes:b.notes||"",status:b.status,roomId:b.room_id||"",
+       zoomUrl:b.zoom_url||b.tutor_zoom_url||""
     }))});
   }catch(e){res.status(500).json({ok:false,msg:"تعذر تحميل حجوزات المعلم"});}
 });
@@ -6031,6 +6671,31 @@ function startCleanup() {
 // ══════════════════════════════════════════════
 // 21. التشغيل
 // ══════════════════════════════════════════════
+// معالجة أخطاء Express غير المعالجة دون كشف التفاصيل للمستخدم.
+app.use((error, req, res, next) => {
+  const errorNumber = classifySupportError({
+    message: error?.message || "",
+    statusCode: Number(error?.status) || 500,
+  });
+  if (res.headersSent) return next(error);
+  res.locals.applicationErrorCaptured = true;
+  void recordApplicationError({
+    req,
+    category: supportErrorCategory(errorNumber),
+    message: error?.message || "Unhandled server error",
+    stack: error?.stack || "",
+    source: "server",
+    path: req.originalUrl || req.path,
+    method: req.method,
+    statusCode: Number(error?.status) || 500,
+  });
+  return res.status(500).json({
+    ok: false,
+    msg: "حدث خطأ غير متوقع في الخادم",
+    errorNumber,
+  });
+});
+
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
 // افتح المنفذ أولاً حتى يستجيب Render للفحص، ثم جهّز قاعدة البيانات
@@ -6053,7 +6718,16 @@ dbInitPromise = initDB()
   .catch((err) => {
     console.error("❌ فشل تشغيل قاعدة البيانات:", err?.message || err);
     dbInitError = err;
-  });
+    void recordApplicationError({
+      category: "database",
+      message: `فشل تهيئة قاعدة البيانات: ${err?.message || "unknown"}`,
+      stack: err?.stack || "",
+      source: "monitor",
+      path: "/api/healthz",
+      statusCode: 503,
+    });
+  })
+  .finally(() => startErrorWatchdog());
 
 // إغلاق نظيف
 process.on("SIGTERM", () => {
