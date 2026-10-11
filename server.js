@@ -2559,7 +2559,7 @@ app.delete("/api/feedback/:id", async (req, res) => {
 // إعدادات آمنة للواجهة العامة فقط — لا تُرجع مفاتيح API أو بيانات الإدارة.
 const PUBLIC_SETTING_KEYS = new Set([
   "systemName", "primaryColor", "social_links", "sala_store_url",
-  "adsEnabled", "servicesOrder", "screenBanners", "socialFooterText",
+  "adsEnabled", "servicesOrder", "deletedServices", "screenBanners", "socialFooterText",
   "svcSettings", "subscriptionPrice", "allowRegistration",
   "welcomeMessage", "allFree", "allFreeStamp"
 ]);
