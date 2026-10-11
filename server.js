@@ -6404,7 +6404,7 @@ app.get("/api/private-tutor/student-invitations",async(req,res)=>{
         requestedTime:row.proposed_time||row.requested_time||"",
         teacherWaiting:true,teacherOnline,createdAt:Number(row.created_at)||0
       };
-    }).filter(Boolean);
+    }).filter(invitation=>invitation&&invitation.teacherOnline);
     res.json({ok:true,invitations});
   }catch(e){console.error("private tutor student invitations:",e.message);res.status(500).json({ok:false,invitations:[]});}
 });
@@ -6426,6 +6426,20 @@ app.post("/api/private-tutors/:id/rooms",async(req,res)=>{
     if(b.rows[0].status!=="confirmed")return res.status(403).json({ok:false,msg:"الحجز لم يتم تأكيده بعد"});
     const bookingStudent=String(b.rows[0].student_email||"").toLowerCase();
     if(bookingStudent!==student)return res.status(403).json({ok:false,msg:"الطالب غير مطابق للحجز"});
+    if(a.role==="student"){
+      const existing=await db.query(
+        "SELECT * FROM private_tutor_rooms WHERE booking_id=$1 AND status IN ('waiting','active') ORDER BY created_at DESC LIMIT 1",
+        [booking]
+      );
+      const room=existing.rows[0];
+      const participants=room?tutorRoomParticipants.get(String(room.id))||new Map():new Map();
+      const tutorOnline=room&&[...participants.values()].some(participant=>
+        participant.approved&&participant.role==="tutor"&&
+        String(participant.email||"").toLowerCase()===String(room.tutor_email||"").toLowerCase()
+      );
+      if(!room||!tutorOnline)return res.status(409).json({ok:false,msg:"لا توجد محاضرة مباشرة الآن."});
+      return res.json({ok:true,room:roomView(room),eventsUrl:"/api/private-tutor-rooms/"+room.id+"/events"});
+    }
     const now=Date.now();
     const result=await withDbTransaction(async client=>{
       const locked=await client.query("SELECT id FROM private_tutor_bookings WHERE id=$1 AND tutor_id=$2 FOR UPDATE",[booking,a.tutor.id]);
@@ -6479,6 +6493,14 @@ app.get("/api/private-tutor-rooms/:roomId",async(req,res)=>{try{const a=await ro
 app.post("/api/private-tutor-rooms/:roomId/join",async(req,res)=>{try{
   const id=String(req.params.roomId),a=await roomAccess(req,id);if(!a.user)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});if(!a.room)return res.status(404).json({ok:false,msg:"الغرفة غير موجودة"});if(!a.role)return res.status(403).json({ok:false,msg:"غير مصرح"});
   if(a.room.status==="ended")return res.status(410).json({ok:false,msg:"انتهت المحاضرة"});
+  if(a.role==="student"){
+    const tutorEmail=String(a.room.tutor_email||a.tutor?.tutor_email||"").toLowerCase();
+    const tutorOnline=[...(tutorRoomParticipants.get(id)||new Map()).values()].some(participant=>
+      participant.approved&&participant.role==="tutor"&&
+      (!tutorEmail||String(participant.email||"").toLowerCase()===tutorEmail)
+    );
+    if(!tutorOnline)return res.status(409).json({ok:false,msg:"لا توجد محاضرة مباشرة الآن."});
+  }
   let scheduledDate="",scheduledTime="";
   if(a.room.booking_id){
     const schedule=await db.query(
