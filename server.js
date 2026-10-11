@@ -6363,12 +6363,14 @@ app.post("/api/private-tutor/group-slots/:slotId/room",async(req,res)=>{
       return {room:room.rows[0],created:true};
     });
     if(result.created){
-      const members=await db.query("SELECT student_email FROM private_tutor_group_bookings WHERE slot_id=$1 AND status='confirmed'",[slotId]);
-      await Promise.all(members.rows.map(member=>db.query(
-        `INSERT INTO notifications(id,user_email,message,type,action_url,created_at)
-         VALUES($1,$2,$3,'tutor_group_live',$4,$5)`,
-        [randomBytes(12).toString("hex"),member.student_email,`بدأ المعلم ${access.tutor.name||"المعلم"} الحصة الجماعية.`, `tutor-group-live:${slotId}:${result.room.id}`,Date.now()]
-      ).catch(()=>{})));
+      void (async()=>{
+        const members=await db.query("SELECT student_email FROM private_tutor_group_bookings WHERE slot_id=$1 AND status='confirmed'",[slotId]);
+        await Promise.all(members.rows.map(member=>db.query(
+          `INSERT INTO notifications(id,user_email,message,type,action_url,created_at)
+           VALUES($1,$2,$3,'tutor_group_live',$4,$5)`,
+          [randomBytes(12).toString("hex"),member.student_email,`بدأ المعلم ${access.tutor.name||"المعلم"} الحصة الجماعية.`, `tutor-group-live:${slotId}:${result.room.id}`,Date.now()]
+        ).catch(()=>{})));
+      })().catch(error=>console.error("group room invitations:",error.message));
     }
     res.status(result.created?201:200).json({ok:true,room:roomView(result.room)});
   }catch(e){console.error("group room start:",e.message);res.status(500).json({ok:false,msg:"تعذر بدء الحصة الجماعية"});}
@@ -6439,7 +6441,7 @@ app.post("/api/private-tutors/:id/rooms",async(req,res)=>{
     });
     if(!result)return res.status(404).json({ok:false,msg:"الحجز غير موجود"});
     if(a.role==="tutor"||a.role==="admin"){
-      await notifyPrivateTutorRoom(result.room,a.tutor,false).catch(error=>console.error("private tutor room notification:",error.message));
+      void notifyPrivateTutorRoom(result.room,a.tutor,false).catch(error=>console.error("private tutor room notification:",error.message));
     }
     const roomId=result.room.id;
     res.status(result.created?201:200).json({ok:true,room:roomView(result.room),eventsUrl:"/api/private-tutor-rooms/"+roomId+"/events"});
