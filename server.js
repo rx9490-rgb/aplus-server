@@ -1111,14 +1111,14 @@ function classifySupportError(details = {}) {
   const category = String(details.category || "").toLowerCase();
   const message = String(details.message || "").toLowerCase();
   const status = Number(details.statusCode) || 0;
+  if ([408, 499, 504].includes(status) || /http\s*499|client closed request|request closed|timeout|timed ?out|etimedout|esockettimedout|deadline|مهلة|انتهت المهلة|انقطع الاتصال/.test(category + " " + message)) {
+    return SUPPORT_ERROR_NUMBERS.timeout;
+  }
   if (/network|connection|fetch|connect|econn|ehostunreach|enotfound|socket|اتصال|شبك/.test(category + " " + message)) {
     return SUPPORT_ERROR_NUMBERS.connection;
   }
   if (/database|postgres|pool|قاعدة البيانات/.test(category + " " + message)) {
     return SUPPORT_ERROR_NUMBERS.database;
-  }
-  if (/timeout|timed ?out|etimedout|esockettimedout|deadline|مهلة|انتهت المهلة/.test(category + " " + message)) {
-    return SUPPORT_ERROR_NUMBERS.timeout;
   }
   if (status === 401 || status === 403 || /permission|forbidden|unauthorized|صلاحية|مصرح/.test(category + " " + message)) {
     return SUPPORT_ERROR_NUMBERS.access;
@@ -1171,7 +1171,17 @@ async function notifyMonitoringAdmins(item, row) {
     "SELECT email FROM users WHERE (is_admin=TRUE OR is_super_admin=TRUE OR LOWER(email)=LOWER($1)) AND deleted_at IS NULL",
     [String(process.env.ADMIN_EMAIL || "")]
   );
-  const message = `خطأ جديد ${item.errorNumber}${row?.id ? ` · سجل ${row.id}` : ""}: ${item.message.slice(0, 180)}`;
+  const arabicSummaries = {
+    394: "تعذر الاتصال بالخدمة",
+    395: "تعذر الوصول إلى قاعدة البيانات",
+    396: "حدث عطل في الخدمة",
+    397: item.statusCode === 499
+      ? "أُغلق الاتصال قبل اكتمال الطلب (499)، غالباً بسبب انقطاع الشبكة أو انتهاء الانتظار"
+      : "انتهت مهلة الطلب أو انقطع الاتصال",
+    398: "لا توجد صلاحية كافية لتنفيذ الطلب",
+    399: "حدث خطأ غير متوقع",
+  };
+  const message = `خطأ جديد ${item.errorNumber}${row?.id ? ` · سجل ${row.id}` : ""}: ${arabicSummaries[item.errorNumber] || arabicSummaries[399]}`;
   await Promise.all(admins.rows.map((admin) => db.query(
     "INSERT INTO notifications (id, user_email, message, type, action_url, read, created_at) VALUES ($1,$2,$3,'error',$4,FALSE,$5)",
     [randomBytes(16).toString("hex"), admin.email, message, `aplus-errors:${item.errorNumber}`, Date.now()]
@@ -1475,8 +1485,9 @@ app.post("/api/errors/report", rateLimit({
     message: String(body.message || "خطأ في واجهة الموقع").slice(0, 700),
     source: "client",
     stack: String(body.stack || "").slice(0, 3000),
-    path: String(body.pagePath || "").slice(0, 300),
-    method: "",
+    path: String(body.requestPath || body.pagePath || "").split("?")[0].slice(0, 300),
+    method: String(body.method || "").slice(0, 12),
+    statusCode: Math.max(0, Number(body.statusCode) || 0),
   });
   res.status(202).json({
     ok: true,
@@ -5676,6 +5687,29 @@ app.post("/api/private-tutors/:id/activate", async (req, res) => {
   }
 });
 
+async function hasActiveIndividualBookingAt(client, tutorId, date, time) {
+  const result = await client.query(
+    `SELECT 1 FROM private_tutor_bookings
+     WHERE tutor_id=$1
+       AND COALESCE(NULLIF(proposed_date,''),requested_date)=$2
+       AND COALESCE(NULLIF(proposed_time,''),requested_time)=$3
+       AND status IN ('pending','confirmed','proposed')
+     LIMIT 1`,
+    [tutorId, date, time]
+  );
+  return result.rows.length > 0;
+}
+
+async function hasOpenGroupSlotAt(client, tutorId, date, time) {
+  const result = await client.query(
+    `SELECT 1 FROM private_tutor_group_slots
+     WHERE tutor_id=$1 AND session_date=$2 AND start_time=$3 AND status='open'
+     LIMIT 1`,
+    [tutorId, date, time]
+  );
+  return result.rows.length > 0;
+}
+
 app.get("/api/private-tutors/:id/availability", async (req, res) => {
   try {
     const tutorId = String(req.params.id || "");
@@ -5756,6 +5790,11 @@ app.post("/api/private-tutors/:id/bookings", async (req, res) => {
         [tutorId, requestedDate, requestedTime]
       );
       if (occupied.rows.length) {
+        const error = new Error("slot_taken");
+        error.code = "TUTOR_SLOT_TAKEN";
+        throw error;
+      }
+      if (await hasOpenGroupSlotAt(client, tutorId, requestedDate, requestedTime)) {
         const error = new Error("slot_taken");
         error.code = "TUTOR_SLOT_TAKEN";
         throw error;
@@ -5919,7 +5958,21 @@ async function updatePrivateTutorBooking(req, res) {
       : booking.day_of_week;
     const result = await withDbTransaction(async (client) => {
       await client.query("SELECT id FROM private_tutors WHERE id=$1 FOR UPDATE", [booking.tutor_id]);
+      const current = await client.query(
+        "SELECT status FROM private_tutor_bookings WHERE id=$1 FOR UPDATE",
+        [bookingId]
+      );
+      if (!current.rows.length || !["pending", "proposed"].includes(current.rows[0].status)) {
+        const error = new Error("booking_already_processed");
+        error.code = "TUTOR_BOOKING_PROCESSED";
+        throw error;
+      }
       if (status === "proposed" || status === "confirmed") {
+        if (await hasOpenGroupSlotAt(client, booking.tutor_id, selectedDate, selectedTime)) {
+          const error = new Error("slot_taken");
+          error.code = "TUTOR_SLOT_TAKEN";
+          throw error;
+        }
         const occupied = await client.query(
           `SELECT id FROM private_tutor_bookings
            WHERE tutor_id=$1 AND id<>$2
@@ -5962,7 +6015,7 @@ async function updatePrivateTutorBooking(req, res) {
             `INSERT INTO private_tutor_rooms
              (id,tutor_id,booking_id,student_email,tutor_email,status,created_at)
              VALUES ($1,$2,$3,$4,$5,'waiting',$6) RETURNING *`,
-            [tutorId(),booking.tutor_id,bookingId,String(booking.student_email||"").toLowerCase(),tutorEmail,Date.now()]
+            [privateTutorId(),booking.tutor_id,bookingId,String(booking.student_email||"").toLowerCase(),tutorEmail,Date.now()]
           );
           room = createdRoom.rows[0] || null;
           roomCreated = !!room;
@@ -6007,6 +6060,7 @@ async function updatePrivateTutorBooking(req, res) {
     });
   } catch (e) {
     if (e.code === "TUTOR_SLOT_TAKEN") return res.status(409).json({ ok: false, msg: "الموعد المقترح محجوز مسبقاً. اختر وقتاً آخر." });
+    if (e.code === "TUTOR_BOOKING_PROCESSED") return res.status(409).json({ ok: false, msg: "تمت معالجة هذا الحجز من قبل. حدّث الصفحة." });
     console.error("private tutor booking response:", e.message);
     res.status(500).json({ ok: false, msg: "تعذر تحديث الحجز" });
   }
@@ -6188,15 +6242,21 @@ app.post("/api/private-tutors/:id/group-slots",async(req,res)=>{
     const duration=Number(req.body?.durationMinutes)||60,capacity=Number(req.body?.capacity)||5;
     if(!validTutorGroupSlot(date,time,duration,capacity))return res.status(400).json({ok:false,msg:"تحقق من التاريخ والوقت والسعة (طالبان إلى 6 طلاب)"});
     if(!tutorGroupSlotIsFuture(date,time,5))return res.status(400).json({ok:false,msg:"اختر موعداً يبدأ بعد خمس دقائق"});
-    const id=privateTutorId(),now=Date.now();
-    const q=await db.query(
-      `INSERT INTO private_tutor_group_slots
-       (id,tutor_id,session_date,start_time,duration_minutes,capacity,status,created_at,updated_at)
-       VALUES($1,$2,$3,$4,$5,$6,'open',$7,$7) RETURNING *`,
-      [id,String(req.params.id||""),date,time,duration,capacity,now]
-    );
+    const id=privateTutorId(),now=Date.now(),tutorId=String(req.params.id||"");
+    const q=await withDbTransaction(async client=>{
+      await client.query("SELECT id FROM private_tutors WHERE id=$1 FOR UPDATE",[tutorId]);
+      if(await hasActiveIndividualBookingAt(client,tutorId,date,time))
+        throw Object.assign(new Error("appointment_conflict"),{code:"GROUP_BOOKING_CONFLICT"});
+      return client.query(
+        `INSERT INTO private_tutor_group_slots
+         (id,tutor_id,session_date,start_time,duration_minutes,capacity,status,created_at,updated_at)
+         VALUES($1,$2,$3,$4,$5,$6,'open',$7,$7) RETURNING *`,
+        [id,tutorId,date,time,duration,capacity,now]
+      );
+    });
     res.status(201).json({ok:true,slot:{id:q.rows[0].id,date:q.rows[0].session_date,time:String(q.rows[0].start_time).slice(0,5),durationMinutes:duration,capacity}});
   }catch(e){
+    if(e.code==="GROUP_BOOKING_CONFLICT")return res.status(409).json({ok:false,msg:"يوجد حجز فردي بهذا الوقت؛ اختر وقتاً آخر"});
     if(e.code==="23505")return res.status(409).json({ok:false,msg:"لديك حصة أخرى بهذا الموعد"});
     console.error("group slot create:",e.message);res.status(500).json({ok:false,msg:"تعذر إضافة الموعد"});
   }
@@ -6217,9 +6277,12 @@ app.patch("/api/private-tutor/group-slots/:slotId",async(req,res)=>{
     if(!validTutorGroupSlot(date,time,duration,capacity))return res.status(400).json({ok:false,msg:"تحقق من التاريخ والوقت والسعة (طالبان إلى 6 طلاب)"});
     if(!tutorGroupSlotIsFuture(date,time,5))return res.status(400).json({ok:false,msg:"اختر موعداً يبدأ بعد خمس دقائق"});
     const result=await withDbTransaction(async client=>{
+      await client.query("SELECT id FROM private_tutors WHERE id=$1 FOR UPDATE",[slot.tutor_id]);
       const locked=await client.query("SELECT * FROM private_tutor_group_slots WHERE id=$1 FOR UPDATE",[slotId]);
       if(!locked.rows.length)return null;
       const current=locked.rows[0];
+      if(await hasActiveIndividualBookingAt(client,slot.tutor_id,date,time))
+        throw Object.assign(new Error("appointment_conflict"),{code:"GROUP_BOOKING_CONFLICT"});
       const room=await client.query("SELECT status FROM private_tutor_rooms WHERE group_slot_id=$1 AND status IN ('waiting','active') LIMIT 1",[slotId]);
       if(room.rows.length)throw Object.assign(new Error("room_active"),{code:"GROUP_ROOM_ACTIVE"});
       const count=await client.query("SELECT COUNT(*)::int AS n FROM private_tutor_group_bookings WHERE slot_id=$1 AND status='confirmed'",[slotId]);
@@ -6236,6 +6299,7 @@ app.patch("/api/private-tutor/group-slots/:slotId",async(req,res)=>{
     }
     res.json({ok:true,slot:{id:slotId,date,time,durationMinutes:duration,capacity}});
   }catch(e){
+    if(e.code==="GROUP_BOOKING_CONFLICT")return res.status(409).json({ok:false,msg:"يوجد حجز فردي بهذا الوقت؛ اختر وقتاً آخر"});
     if(e.code==="GROUP_ROOM_ACTIVE")return res.status(409).json({ok:false,msg:"لا يمكن تعديل الموعد أثناء وجود محاضرة مباشرة"});
     if(e.code==="GROUP_CAPACITY_LOW")return res.status(409).json({ok:false,msg:"السعة أقل من عدد الطلاب المسجلين"});
     if(e.code==="GROUP_SLOT_DUPLICATE"||e.code==="23505")return res.status(409).json({ok:false,msg:"لديك حصة أخرى بهذا الموعد"});
@@ -6361,10 +6425,11 @@ app.post("/api/private-tutor/group-slots/:slotId/room",async(req,res)=>{
     const seats=await db.query("SELECT COUNT(*)::int AS n FROM private_tutor_group_bookings WHERE slot_id=$1 AND status='confirmed'",[slotId]);
     if(!Number(seats.rows[0]?.n))return res.status(409).json({ok:false,msg:"لا يوجد طلاب حجزوا هذه الحصة"});
     const result=await withDbTransaction(async client=>{
+      await client.query("SELECT id FROM private_tutors WHERE id=$1 FOR UPDATE",[slot.tutor_id]);
       await client.query("SELECT id FROM private_tutor_group_slots WHERE id=$1 FOR UPDATE",[slotId]);
       const existing=await client.query("SELECT * FROM private_tutor_rooms WHERE group_slot_id=$1 AND status IN ('waiting','active') ORDER BY created_at DESC LIMIT 1",[slotId]);
       if(existing.rows.length)return {room:existing.rows[0],created:false};
-      const roomId=tutorId();
+      const roomId=privateTutorId();
       const room=await client.query(
         `INSERT INTO private_tutor_rooms(id,tutor_id,booking_id,group_slot_id,student_email,tutor_email,status,created_at)
          VALUES($1,$2,NULL,$3,'',$4,'waiting',$5) RETURNING *`,
@@ -6456,7 +6521,7 @@ app.post("/api/private-tutors/:id/rooms",async(req,res)=>{
       if(!locked.rows.length)return null;
       const existing=await client.query("SELECT * FROM private_tutor_rooms WHERE booking_id=$1 AND status IN ('waiting','active') ORDER BY created_at DESC LIMIT 1",[booking]);
       if(existing.rows.length)return {room:existing.rows[0],created:false};
-      const id=tutorId();
+      const id=privateTutorId();
       const created=await client.query(
         "INSERT INTO private_tutor_rooms (id,tutor_id,booking_id,student_email,tutor_email,status,created_at) VALUES ($1,$2,$3,$4,$5,'waiting',$6) RETURNING *",
         [id,a.tutor.id,booking,student,a.tutor.tutor_email||"",now]
