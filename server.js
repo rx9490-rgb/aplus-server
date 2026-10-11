@@ -6739,9 +6739,10 @@ function startCleanup() {
 // ══════════════════════════════════════════════
 // معالجة أخطاء Express غير المعالجة دون كشف التفاصيل للمستخدم.
 app.use((error, req, res, next) => {
+  const statusCode = Number(error?.status) || 500;
   const errorNumber = classifySupportError({
     message: error?.message || "",
-    statusCode: Number(error?.status) || 500,
+    statusCode,
   });
   if (res.headersSent) return next(error);
   res.locals.applicationErrorCaptured = true;
@@ -6753,11 +6754,14 @@ app.use((error, req, res, next) => {
     source: "server",
     path: req.originalUrl || req.path,
     method: req.method,
-    statusCode: Number(error?.status) || 500,
+    statusCode,
   });
-  return res.status(500).json({
+  const clientError = statusCode >= 400 && statusCode < 500;
+  return res.status(clientError ? statusCode : 500).json({
     ok: false,
-    msg: "حدث خطأ غير متوقع في الخادم",
+    msg: clientError
+      ? "بيانات الطلب غير صالحة. حدّث الصفحة ثم أعد المحاولة."
+      : "حدث خطأ غير متوقع في الخادم",
     errorNumber,
   });
 });
