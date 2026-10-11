@@ -6268,10 +6268,20 @@ app.post("/api/private-tutor/group-slots/:slotId/bookings",async(req,res)=>{
     const user=await privateTutorUser(req);
     if(!user||user.banned)return res.status(401).json({ok:false,msg:"سجل الدخول أولاً"});
     const slotId=String(req.params.slotId||""),studentEmail=String(user.email||"").toLowerCase();
-    const initial=await db.query("SELECT tutor_id FROM private_tutor_group_slots WHERE id=$1 AND status='open' LIMIT 1",[slotId]);
+    const initial=await db.query(
+      `SELECT s.tutor_id,COALESCE(t.free_access,FALSE) AS free_access
+       FROM private_tutor_group_slots s
+       JOIN private_tutors t ON t.id=s.tutor_id
+       WHERE s.id=$1 AND s.status='open' AND t.active=TRUE
+         AND COALESCE(t.verification_status,'approved')='approved'
+       LIMIT 1`,
+      [slotId]
+    );
     if(!initial.rows.length)return res.status(404).json({ok:false,msg:"الموعد غير متاح"});
-    const entitlement=await tutorPaymentPlan(initial.rows[0].tutor_id,studentEmail);
-    if(!entitlement.active)return res.status(403).json({ok:false,msg:"فعّل اشتراكك مع المعلم قبل الحجز"});
+    if(!initial.rows[0].free_access){
+      const entitlement=await tutorPaymentPlan(initial.rows[0].tutor_id,studentEmail);
+      if(!entitlement.active)return res.status(403).json({ok:false,msg:"فعّل اشتراكك مع المعلم قبل الحجز"});
+    }
     const result=await withDbTransaction(async client=>{
       const q=await client.query("SELECT * FROM private_tutor_group_slots WHERE id=$1 AND status='open' FOR UPDATE",[slotId]);
       if(!q.rows.length)throw Object.assign(new Error("unavailable"),{code:"GROUP_SLOT_UNAVAILABLE"});
