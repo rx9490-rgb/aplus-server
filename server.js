@@ -1088,7 +1088,6 @@ const sseClients = new Map(); // id → res
 let sseIdCounter = 0;
 const streamTickets = new Map();
 const pendingApplicationErrors = [];
-const errorNotificationCooldown = new Map();
 
 const SUPPORT_ERROR_NUMBERS = Object.freeze({
   connection: 394,
@@ -1166,47 +1165,6 @@ async function persistApplicationError(item) {
   return result.rows[0];
 }
 
-async function notifyMonitoringAdmins(item, row) {
-  const admins = await db.query(
-    "SELECT email FROM users WHERE (is_admin=TRUE OR is_super_admin=TRUE OR LOWER(email)=LOWER($1)) AND deleted_at IS NULL",
-    [String(process.env.ADMIN_EMAIL || "")]
-  );
-  const arabicSummaries = {
-    394: "تعذر الاتصال بالخدمة",
-    395: "تعذر الوصول إلى قاعدة البيانات",
-    396: "حدث عطل في الخدمة",
-    397: item.statusCode === 499
-      ? "أُغلق الاتصال قبل اكتمال الطلب (499)، غالباً بسبب انقطاع الشبكة أو انتهاء الانتظار"
-      : "انتهت مهلة الطلب أو انقطع الاتصال",
-    398: "لا توجد صلاحية كافية لتنفيذ الطلب",
-    399: "حدث خطأ غير متوقع",
-  };
-  const message = `خطأ جديد ${item.errorNumber}${row?.id ? ` · سجل ${row.id}` : ""}: ${arabicSummaries[item.errorNumber] || arabicSummaries[399]}`;
-  await Promise.all(admins.rows.map((admin) => db.query(
-    "INSERT INTO notifications (id, user_email, message, type, action_url, read, created_at) VALUES ($1,$2,$3,'error',$4,FALSE,$5)",
-    [randomBytes(16).toString("hex"), admin.email, message, `aplus-errors:${item.errorNumber}`, Date.now()]
-  )));
-}
-
-function isActionableAdminAlert(item) {
-  const statusCode = Math.max(0, Number(item.statusCode) || 0);
-  const source = String(item.source || "");
-  const category = String(item.category || "");
-  const message = String(item.message || "");
-  if (source === "server" || source === "monitor") {
-    return statusCode >= 500 || category === "database";
-  }
-  if (source === "client-request") {
-    return statusCode >= 500 && ["service", "database"].includes(category);
-  }
-  if (source === "client-runtime" || source === "client-rejection") {
-    return category === "unexpected" &&
-      Boolean(String(item.stack || "").trim()) &&
-      !/^script error\.?$/i.test(message.trim());
-  }
-  return false;
-}
-
 async function recordApplicationError(details = {}) {
   const createdAt = Number(details.createdAt) || Date.now();
   const message = sanitizeMonitorText(details.message || "حدث خطأ غير محدد", 700);
@@ -1228,20 +1186,14 @@ async function recordApplicationError(details = {}) {
   const stack = sanitizeMonitorText(details.stack || "", 3000);
   const fingerprintBase = [errorNumber, category, source, userEmail, path, method, message].join("|").slice(0, 900);
   const fingerprint = `${fingerprintBase}|${Math.floor(createdAt / 300000)}`;
-  const cooldownKey = [errorNumber, category, source, path, method, message].join("|").slice(0, 900);
-  const lastNotified = errorNotificationCooldown.get(cooldownKey) || 0;
-  const shouldNotify = isActionableAdminAlert({
-    errorNumber, category, source, message, stack,
-    statusCode: Math.max(0, Number(details.statusCode) || 0),
-  }) && createdAt - lastNotified >= 5 * 60_000;
-  if (shouldNotify) errorNotificationCooldown.set(cooldownKey, createdAt);
-
   const item = {
     fingerprint, errorNumber, category, message, source, userEmail, path, method, stack,
-    statusCode: Math.max(0, Number(details.statusCode) || 0), createdAt, shouldNotify,
+    statusCode: Math.max(0, Number(details.statusCode) || 0), createdAt,
   };
 
-  if (shouldNotify) {
+  try {
+    if (!dbReady) throw new Error("database_not_ready");
+    const row = await persistApplicationError(item);
     broadcastAdminEvent({
       type: "application_error",
       errorNumber,
@@ -1250,15 +1202,8 @@ async function recordApplicationError(details = {}) {
       userEmail,
       path,
       source,
+      errorId: Number(row?.id) || null,
       createdAt,
-    });
-  }
-
-  try {
-    if (!dbReady) throw new Error("database_not_ready");
-    const row = await persistApplicationError(item);
-    if (shouldNotify) await notifyMonitoringAdmins(item, row).catch((error) => {
-      console.warn("application error notification skipped:", error?.message || error);
     });
     return { persisted: true, errorNumber, id: Number(row?.id) || null };
   } catch (error) {
@@ -1276,7 +1221,17 @@ async function flushPendingApplicationErrors() {
       if (!dbReady) return;
       const row = await persistApplicationError(item);
       pendingApplicationErrors.shift();
-      if (item.shouldNotify) await notifyMonitoringAdmins(item, row).catch(() => {});
+      broadcastAdminEvent({
+        type: "application_error",
+        errorNumber: item.errorNumber,
+        category: item.category,
+        message: item.message,
+        userEmail: item.userEmail,
+        path: item.path,
+        source: item.source,
+        errorId: Number(row?.id) || null,
+        createdAt: item.createdAt,
+      });
     } catch {
       return;
     }
@@ -1330,9 +1285,6 @@ setInterval(() => {
   const now = Date.now();
   for (const [ticket, item] of streamTickets) {
     if (item.expiresAt <= now) streamTickets.delete(ticket);
-  }
-  for (const [key, timestamp] of errorNotificationCooldown) {
-    if (now - timestamp > 60 * 60_000) errorNotificationCooldown.delete(key);
   }
 }, 60_000).unref?.();
 
@@ -1656,7 +1608,13 @@ app.get("/api/notifications", async (req, res) => {
     const requested = Number.parseInt(req.query.limit, 10);
     const limit = Number.isFinite(requested) ? Math.min(50, Math.max(1, requested)) : 20;
     const result = await db.query(
-      "SELECT id, message, type, action_url, read, created_at FROM notifications WHERE user_email = $1 ORDER BY created_at DESC LIMIT $2",
+      `SELECT id, message, type, action_url, read, created_at
+       FROM notifications
+       WHERE user_email = $1
+         AND COALESCE(type, '') <> 'error'
+         AND COALESCE(action_url, '') NOT LIKE 'aplus-errors:%'
+       ORDER BY created_at DESC
+       LIMIT $2`,
       [user.email, limit]
     );
     res.json({ ok: true, notifications: result.rows });
