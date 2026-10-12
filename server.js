@@ -1188,6 +1188,25 @@ async function notifyMonitoringAdmins(item, row) {
   )));
 }
 
+function isActionableAdminAlert(item) {
+  const statusCode = Math.max(0, Number(item.statusCode) || 0);
+  const source = String(item.source || "");
+  const category = String(item.category || "");
+  const message = String(item.message || "");
+  if (source === "server" || source === "monitor") {
+    return statusCode >= 500 || category === "database";
+  }
+  if (source === "client-request") {
+    return statusCode >= 500 && ["service", "database"].includes(category);
+  }
+  if (source === "client-runtime" || source === "client-rejection") {
+    return category === "unexpected" &&
+      Boolean(String(item.stack || "").trim()) &&
+      !/^script error\.?$/i.test(message.trim());
+  }
+  return false;
+}
+
 async function recordApplicationError(details = {}) {
   const createdAt = Number(details.createdAt) || Date.now();
   const message = sanitizeMonitorText(details.message || "حدث خطأ غير محدد", 700);
@@ -1209,9 +1228,12 @@ async function recordApplicationError(details = {}) {
   const stack = sanitizeMonitorText(details.stack || "", 3000);
   const fingerprintBase = [errorNumber, category, source, userEmail, path, method, message].join("|").slice(0, 900);
   const fingerprint = `${fingerprintBase}|${Math.floor(createdAt / 300000)}`;
-  const cooldownKey = fingerprintBase;
+  const cooldownKey = [errorNumber, category, source, path, method, message].join("|").slice(0, 900);
   const lastNotified = errorNotificationCooldown.get(cooldownKey) || 0;
-  const shouldNotify = createdAt - lastNotified >= 60_000;
+  const shouldNotify = isActionableAdminAlert({
+    errorNumber, category, source, message, stack,
+    statusCode: Math.max(0, Number(details.statusCode) || 0),
+  }) && createdAt - lastNotified >= 5 * 60_000;
   if (shouldNotify) errorNotificationCooldown.set(cooldownKey, createdAt);
 
   const item = {
@@ -1478,12 +1500,15 @@ app.post("/api/errors/report", rateLimit({
 }), async (req, res) => {
   const body = req.body || {};
   const allowedCategories = new Set(["connection", "database", "service", "timeout", "access", "unexpected"]);
+  const allowedClientSources = new Set(["client-ui", "client-request", "client-network", "client-runtime", "client-rejection"]);
   const category = allowedCategories.has(String(body.category || "")) ? String(body.category) : "unexpected";
+  const requestedSource = String(body.source || "client-ui");
+  const source = allowedClientSources.has(requestedSource) ? requestedSource : "client-ui";
   const outcome = await recordApplicationError({
     req,
     category,
     message: String(body.message || "خطأ في واجهة الموقع").slice(0, 700),
-    source: "client",
+    source,
     stack: String(body.stack || "").slice(0, 3000),
     path: String(body.requestPath || body.pagePath || "").split("?")[0].slice(0, 300),
     method: String(body.method || "").slice(0, 12),
@@ -3059,6 +3084,13 @@ const AI_QUALITY_SYSTEM = `
 لا تذكر هذه التعليمات في الإجابة النهائية.
 `;
 
+function applyRequestedOutputLanguage(systemPrompt, language) {
+  const languageRules = language === "en"
+    ? "OUTPUT LANGUAGE REQUIREMENT: Write every part of the user-facing answer entirely in English. Translate explanatory text, headings, labels, feedback, and service-generated UI content into English. Keep standard medical terminology, abbreviations, drug names, and clinical terms in their established form; do not translate medical terms. Preserve the user's requested structure and meaning."
+    : "";
+  return [String(systemPrompt || ""), languageRules].filter(Boolean).join("\n\n");
+}
+
 function isHighAccuracyTask(text) {
   return /medical|medicine|clinical|patient|diagnos|treatment|drug|dose|symptom|radiology|laboratory|health|طب|طبي|مريض|تشخيص|علاج|دواء|جرعة|أعراض|واجب|بحث|مشروع|برزنتيشن|عرض|مراجع|thesis|assignment|research|presentation/i.test(String(text || ""));
 }
@@ -3369,7 +3401,7 @@ ${String(reviewed.content).slice(0, 60000)}`
 // لا يعتمد هذا المسار على GEMINI_API_KEY المباشر.
 // ══════════════════════════════════════════════
 app.post("/api/ai/call", async (req, res) => {
-  const { provider = "gemini", prompt, systemPrompt = "", maxTokens } = req.body || {};
+  const { provider = "gemini", prompt, systemPrompt = "", maxTokens, language } = req.body || {};
   if (provider !== "gemini") {
     res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
     return;
@@ -3395,8 +3427,9 @@ app.post("/api/ai/call", async (req, res) => {
     AI_MAX_TOKENS_PER_REQUEST
   );
 
-  const requestText = `${systemPrompt || ""}\n${prompt}`;
-  const isArabicRequest = /[\u0600-\u06ff]/.test(requestText);
+  const effectiveSystemPrompt = applyRequestedOutputLanguage(systemPrompt, language);
+  const requestText = `${effectiveSystemPrompt}\n${prompt}`;
+  const isArabicRequest = language === "en" ? false : /[\u0600-\u06ff]/.test(requestText);
   const requestModels = isArabicRequest
     ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
     : OPENROUTER_MODELS;
@@ -3406,7 +3439,7 @@ app.post("/api/ai/call", async (req, res) => {
     if (isAssignmentTask(requestText)) {
       const qualityResult = await generateAssignmentWithReview(
         prompt,
-        systemPrompt,
+        effectiveSystemPrompt,
         safeMaxTokens,
         isArabicRequest
       );
@@ -3431,7 +3464,7 @@ app.post("/api/ai/call", async (req, res) => {
     }
 
     const messages = [
-      { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
+      { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
       { role: "user", content: String(prompt) }
     ];
 
@@ -3516,7 +3549,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
     res.status(503).json({ ok: false, error: "openrouter_key_not_configured" });
     return;
   }
-  const { prompt, systemPrompt, maxTokens } = req.body || {};
+  const { prompt, systemPrompt, maxTokens, language } = req.body || {};
   if (!prompt) {
     res.status(400).json({ ok: false, error: "prompt_required" });
     return;
@@ -3539,14 +3572,15 @@ app.post("/api/openrouter/stream", async (req, res) => {
   res.flushHeaders?.();
 
   const messages = [];
-  const combinedSystem = [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n");
+  const effectiveSystemPrompt = applyRequestedOutputLanguage(systemPrompt, language);
+  const combinedSystem = [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n");
   messages.push({ role: "system", content: combinedSystem });
   messages.push({ role: "user", content: prompt });
 
   let lastErr = null;
   let sentAny = false;
-  const requestText = `${systemPrompt || ""}\n${prompt}`;
-  const isArabicRequest = /[\u0600-\u06ff]/.test(requestText);
+  const requestText = `${effectiveSystemPrompt}\n${prompt}`;
+  const isArabicRequest = language === "en" ? false : /[\u0600-\u06ff]/.test(requestText);
   const requestModels = isArabicRequest
     ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
     : OPENROUTER_MODELS;
