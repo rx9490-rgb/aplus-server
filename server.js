@@ -37,6 +37,11 @@ const pool = new Pool({
   connectionTimeoutMillis: 8000,
   allowExitOnIdle: false,
 });
+let shuttingDown = false;
+let shutdownStarted = false;
+let watchdogTimer = null;
+let cleanupTimer = null;
+let antiSleepTimer = null;
 
 pool.on("error", (err) => {
   console.error("❌ خطأ في pool قاعدة البيانات:", err.message);
@@ -53,8 +58,9 @@ pool.on("error", (err) => {
 // DB wrapper مع retry تلقائي — إغلاق الاتصال مرة واحدة فقط
 const db = {
   async query(text, params, retries = 3) {
+    if (shuttingDown) throw new Error("server_shutting_down");
     let lastError;
-    for (let i = 0; i < retries; i++) {
+    for (let i = 0; i < retries && !shuttingDown; i++) {
       let client = null;
       try {
         client = await pool.connect();
@@ -67,11 +73,12 @@ const db = {
         if (i < retries - 1) await sleep(300 * (i + 1));
       }
     }
-    throw lastError;
+    throw lastError || new Error("server_shutting_down");
   }
 };
 
 async function withDbTransaction(work) {
+  if (shuttingDown) throw new Error("server_shutting_down");
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -1197,6 +1204,7 @@ async function recordApplicationError(details = {}) {
     statusCode: Math.max(0, Number(details.statusCode) || 0), createdAt,
   };
 
+  if (shuttingDown) return { persisted: false, errorNumber, id: null };
   try {
     if (!dbReady) throw new Error("database_not_ready");
     const row = await persistApplicationError(item);
@@ -1221,6 +1229,7 @@ async function recordApplicationError(details = {}) {
 }
 
 async function flushPendingApplicationErrors() {
+  if (shuttingDown) return;
   for (let count = 0; count < 20 && pendingApplicationErrors.length; count++) {
     const item = pendingApplicationErrors[0];
     try {
@@ -1249,7 +1258,7 @@ let databaseWatchdogState = "starting";
 let databaseWatchdogLastCheck = 0;
 function startErrorWatchdog() {
   const check = async () => {
-    if (watchdogRunning) return;
+    if (shuttingDown || watchdogRunning) return;
     watchdogRunning = true;
     databaseWatchdogLastCheck = Date.now();
     try {
@@ -1268,6 +1277,7 @@ function startErrorWatchdog() {
       }
       await flushPendingApplicationErrors();
     } catch (error) {
+      if (shuttingDown) return;
       if (databaseWatchdogState !== "offline") {
         databaseWatchdogState = "offline";
         await recordApplicationError({
@@ -1282,9 +1292,10 @@ function startErrorWatchdog() {
       watchdogRunning = false;
     }
   };
+  if (shuttingDown) return;
   void check();
-  const timer = setInterval(check, 30_000);
-  timer.unref?.();
+  watchdogTimer = setInterval(check, 30_000);
+  watchdogTimer.unref?.();
 }
 
 setInterval(() => {
@@ -6961,8 +6972,9 @@ app.use((_req, res) => {
 // ══════════════════════════════════════════════
 function startAntiSleep() {
   const selfUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
-  if (!selfUrl) return;
-  setInterval(async () => {
+  if (!selfUrl || shuttingDown) return;
+  antiSleepTimer = setInterval(async () => {
+    if (shuttingDown) return;
     try {
       const url = selfUrl.replace(/\/$/, "") + "/ping";
       const ctrl = new AbortController();
@@ -6971,6 +6983,7 @@ function startAntiSleep() {
       clearTimeout(t);
     } catch {}
   }, 4 * 60 * 1000); // كل 4 دقائق
+  antiSleepTimer.unref?.();
   console.log("🔄 Anti-sleep مفعّل →", selfUrl);
 }
 
@@ -6978,12 +6991,15 @@ function startAntiSleep() {
 // 20. Cleanup تلقائي — يُنظّف الجلسات القديمة
 // ══════════════════════════════════════════════
 function startCleanup() {
-  setInterval(async () => {
+  if (shuttingDown) return;
+  cleanupTimer = setInterval(async () => {
+    if (shuttingDown) return;
     try {
       const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 يوم
       await db.query("DELETE FROM sessions WHERE created_at < $1", [cutoff]);
     } catch {}
   }, 6 * 60 * 60 * 1000); // كل 6 ساعات
+  cleanupTimer.unref?.();
 }
 
 // ══════════════════════════════════════════════
@@ -7051,11 +7067,23 @@ dbInitPromise = initDB()
   })
   .finally(() => startErrorWatchdog());
 
-// إغلاق نظيف
-process.on("SIGTERM", () => {
-  console.log("⏹ إغلاق نظيف...");
-  server.close(() => pool.end());
-});
-process.on("SIGINT", () => {
-  server.close(() => pool.end());
-});
+// إغلاق نظيف وآمن: أوقف المؤقتات والطلبات الجديدة قبل إنهاء اتصال قاعدة البيانات.
+function shutdownServer(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  shuttingDown = true;
+  console.log(`⏹ إغلاق نظيف (${signal})...`);
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  if (cleanupTimer) clearInterval(cleanupTimer);
+  if (antiSleepTimer) clearInterval(antiSleepTimer);
+
+  const closePool = () => {
+    void pool.end().catch((error) => {
+      console.error("❌ تعذر إغلاق اتصال قاعدة البيانات:", error?.message || error);
+    });
+  };
+  if (server.listening) server.close(closePool);
+  else closePool();
+}
+process.once("SIGTERM", () => shutdownServer("SIGTERM"));
+process.once("SIGINT", () => shutdownServer("SIGINT"));
