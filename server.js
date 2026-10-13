@@ -1661,15 +1661,22 @@ app.get("/api/academic/archive", async (req, res) => {
     if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
     const type = String(req.query.type || "").trim().slice(0, 40) || null;
     const requested = Number.parseInt(req.query.limit, 10);
-    const limit = Number.isFinite(requested) ? Math.min(50, Math.max(1, requested)) : 30;
+    const limit = Number.isFinite(requested) ? Math.min(100, Math.max(1, requested)) : 50;
+    const requestedOffset = Number.parseInt(req.query.offset, 10);
+    const offset = Number.isFinite(requestedOffset) ? Math.min(10000000, Math.max(0, requestedOffset)) : 0;
     const result = await db.query(
       `SELECT id,item_type,title,content,metadata,created_at
        FROM academic_archive
        WHERE user_email=$1 AND ($2::text IS NULL OR item_type=$2)
-       ORDER BY created_at DESC LIMIT $3`,
-      [user.email, type, limit]
+       ORDER BY created_at DESC,id DESC LIMIT $3 OFFSET $4`,
+      [user.email, type, limit, offset]
     );
-    res.json({ ok: true, items: result.rows });
+    res.json({
+      ok: true,
+      items: result.rows,
+      hasMore: result.rows.length === limit,
+      nextOffset: offset + result.rows.length
+    });
   } catch (error) {
     console.error("academic archive list error:", error?.message || error);
     res.status(500).json({ ok: false, msg: "تعذر تحميل السجل الأكاديمي" });
@@ -1704,12 +1711,12 @@ app.post("/api/academic/archive", async (req, res) => {
     const allowedTypes = new Set([
       "summary","explain","quiz","termquiz","flashcards","quickrev","assignment",
       "presentation","project","research","thesis","osce","image","patient",
-      "compare","translate","assistant","diagnosis","dosage","tutor","testme",
+      "compare","translate","assistant","diagnosis","dosage","tutor","testme","study",
       "mindmap","nanda"
     ]);
     const itemType = String(body.type || "").trim().toLowerCase();
     const title = String(body.title || itemType).replace(/\u0000/g, "").trim().slice(0, 200);
-    const content = String(body.content || "").replace(/\u0000/g, "").slice(0, 60000);
+    const content = String(body.content || "").replace(/\u0000/g, "").slice(0, 250000);
     const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
       ? body.metadata : {};
     if (!allowedTypes.has(itemType) || !title || (!content && !Object.keys(metadata).length)) {
@@ -1725,14 +1732,6 @@ app.post("/api/academic/archive", async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
       [id, user.email, itemType, title, content, JSON.stringify(metadata), createdAt]
     );
-    await db.query(
-      `DELETE FROM academic_archive
-       WHERE user_email=$1 AND id IN (
-         SELECT id FROM academic_archive WHERE user_email=$1
-         ORDER BY created_at DESC OFFSET 200
-       )`,
-      [user.email]
-    ).catch((error) => console.warn("academic archive retention warning:", error?.message || error));
     res.status(201).json({ ok: true, item: { id, type: itemType, title, createdAt } });
   } catch (error) {
     console.error("academic archive save error:", error?.message || error);
