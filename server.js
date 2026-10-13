@@ -187,7 +187,8 @@ async function initDB() {
       title      TEXT NOT NULL DEFAULT '',
       content    TEXT NOT NULL DEFAULT '',
       metadata   JSONB NOT NULL DEFAULT '{}',
-      created_at BIGINT NOT NULL
+      created_at BIGINT NOT NULL,
+      deleted_at BIGINT
     );
     CREATE INDEX IF NOT EXISTS academic_archive_user_created_idx
       ON academic_archive(user_email, created_at DESC);
@@ -495,6 +496,11 @@ async function initDB() {
   for (const sql of safeCols) {
     try { await db.query(sql); } catch {}
   }
+  await db.query("ALTER TABLE academic_archive ADD COLUMN IF NOT EXISTS deleted_at BIGINT");
+  await db.query(
+    "CREATE INDEX IF NOT EXISTS academic_archive_user_deleted_created_idx " +
+    "ON academic_archive(user_email, deleted_at, created_at DESC)"
+  );
   try {
     await db.query("CREATE UNIQUE INDEX IF NOT EXISTS users_employee_code_unique ON users(employee_code) WHERE employee_code IS NOT NULL");
     await ensureEmployeeCodes();
@@ -1658,17 +1664,36 @@ app.patch("/api/notifications/:id/read", async (req, res) => {
 app.get("/api/academic/archive", async (req, res) => {
   try {
     const user = await getSessionUser(req.headers["x-session-token"]);
-    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
+
     const type = String(req.query.type || "").trim().slice(0, 40) || null;
-    const requested = Number.parseInt(req.query.limit, 10);
-    const limit = Number.isFinite(requested) ? Math.min(100, Math.max(1, requested)) : 50;
+    const status = String(req.query.status || "active").trim().toLowerCase();
+    if (status !== "active" && status !== "trash") {
+      return res.status(400).json({ ok: false, error: "archive_status_invalid" });
+    }
+
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(100, Math.max(1, requestedLimit))
+      : 50;
     const requestedOffset = Number.parseInt(req.query.offset, 10);
-    const offset = Number.isFinite(requestedOffset) ? Math.min(10000000, Math.max(0, requestedOffset)) : 0;
+    const offset = Number.isFinite(requestedOffset)
+      ? Math.min(10000000, Math.max(0, requestedOffset))
+      : 0;
+    const deletedCondition = status === "trash"
+      ? "deleted_at IS NOT NULL"
+      : "deleted_at IS NULL";
+
     const result = await db.query(
-      `SELECT id,item_type,title,content,metadata,created_at
+      `SELECT id,item_type,title,content,metadata,created_at,deleted_at
        FROM academic_archive
-       WHERE user_email=$1 AND ($2::text IS NULL OR item_type=$2)
-       ORDER BY created_at DESC,id DESC LIMIT $3 OFFSET $4`,
+       WHERE user_email=$1
+         AND ${deletedCondition}
+         AND ($2::text IS NULL OR item_type=$2)
+       ORDER BY created_at DESC,id DESC
+       LIMIT $3 OFFSET $4`,
       [user.email, type, limit, offset]
     );
     res.json({
@@ -1686,72 +1711,227 @@ app.get("/api/academic/archive", async (req, res) => {
 app.get("/api/academic/archive/:id", async (req, res) => {
   try {
     const user = await getSessionUser(req.headers["x-session-token"]);
-    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
     const id = String(req.params.id || "").slice(0, 64);
     const result = await db.query(
-      `SELECT id,item_type,title,content,metadata,created_at
+      `SELECT id,item_type,title,content,metadata,created_at,deleted_at
        FROM academic_archive
        WHERE id=$1 AND user_email=$2
        LIMIT 1`,
       [id, user.email]
     );
-    if (!result.rows.length) return res.status(404).json({ ok: false, error: "archive_item_not_found" });
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, error: "archive_item_not_found" });
+    }
     res.json({ ok: true, item: result.rows[0] });
   } catch (error) {
     console.error("academic archive item error:", error?.message || error);
-    res.status(500).json({ ok: false, msg: "تعذر استعادة العنصر من السجل الأكاديمي" });
+    res.status(500).json({ ok: false, msg: "تعذر تحميل العنصر من السجل الأكاديمي" });
   }
 });
 
 app.post("/api/academic/archive", async (req, res) => {
   try {
     const user = await getSessionUser(req.headers["x-session-token"]);
-    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
     const body = req.body || {};
     const allowedTypes = new Set([
-      "summary","explain","quiz","termquiz","flashcards","quickrev","assignment",
-      "presentation","project","research","thesis","osce","image","patient",
-      "compare","translate","assistant","diagnosis","dosage","tutor","testme","study",
-      "mindmap","nanda"
+      "summary", "explain", "quiz", "termquiz", "flashcards", "quickrev", "assignment",
+      "presentation", "project", "research", "thesis", "osce", "image", "patient",
+      "compare", "translate", "assistant", "diagnosis", "dosage", "tutor", "testme",
+      "study", "mindmap", "nanda"
     ]);
     const itemType = String(body.type || "").trim().toLowerCase();
-    const title = String(body.title || itemType).replace(/\u0000/g, "").trim().slice(0, 200);
-    const content = String(body.content || "").replace(/\u0000/g, "").slice(0, 250000);
+    const title = String(body.title || itemType)
+      .replace(/\u0000/g, "")
+      .trim()
+      .slice(0, 200);
+    const content = String(body.content || "")
+      .replace(/\u0000/g, "")
+      .slice(0, 250000);
     const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
-      ? body.metadata : {};
+      ? body.metadata
+      : {};
+
     if (!allowedTypes.has(itemType) || !title || (!content && !Object.keys(metadata).length)) {
       return res.status(400).json({ ok: false, error: "archive_item_invalid" });
     }
     if (Buffer.byteLength(JSON.stringify(metadata), "utf8") > 12000) {
       return res.status(413).json({ ok: false, error: "archive_metadata_too_large" });
     }
+
     const id = randomBytes(16).toString("hex");
     const createdAt = Date.now();
     await db.query(
-      `INSERT INTO academic_archive (id,user_email,item_type,title,content,metadata,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
+      `INSERT INTO academic_archive
+         (id,user_email,item_type,title,content,metadata,created_at,deleted_at)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,NULL)`,
       [id, user.email, itemType, title, content, JSON.stringify(metadata), createdAt]
     );
-    res.status(201).json({ ok: true, item: { id, type: itemType, title, createdAt } });
+    res.status(201).json({
+      ok: true,
+      item: { id, type: itemType, title, createdAt, deleted_at: null }
+    });
   } catch (error) {
     console.error("academic archive save error:", error?.message || error);
     res.status(500).json({ ok: false, msg: "تعذر حفظ العنصر في السجل الأكاديمي" });
   }
 });
 
+app.post("/api/academic/archive/bulk", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
+
+    const body = req.body || {};
+    const action = String(body.action || "");
+    const ids = Array.isArray(body.ids)
+      ? Array.from(new Set(body.ids.map((id) => String(id || "").slice(0, 64)).filter(Boolean))).slice(0, 500)
+      : [];
+    let result;
+
+    if (action === "trash_all") {
+      result = await db.query(
+        `UPDATE academic_archive
+         SET deleted_at=$2
+         WHERE user_email=$1 AND deleted_at IS NULL
+         RETURNING id`,
+        [user.email, Date.now()]
+      );
+    } else if (action === "purge_trash") {
+      result = await db.query(
+        `DELETE FROM academic_archive
+         WHERE user_email=$1 AND deleted_at IS NOT NULL
+         RETURNING id`,
+        [user.email]
+      );
+    } else if (action === "purge_active") {
+      result = await db.query(
+        `DELETE FROM academic_archive
+         WHERE user_email=$1 AND deleted_at IS NULL
+         RETURNING id`,
+        [user.email]
+      );
+    } else {
+      if (!ids.length) {
+        return res.status(400).json({ ok: false, error: "archive_ids_required" });
+      }
+      if (action === "trash") {
+        result = await db.query(
+          `UPDATE academic_archive
+           SET deleted_at=COALESCE(deleted_at,$3)
+           WHERE user_email=$1 AND id=ANY($2::text[]) AND deleted_at IS NULL
+           RETURNING id`,
+          [user.email, ids, Date.now()]
+        );
+      } else if (action === "restore") {
+        result = await db.query(
+          `UPDATE academic_archive
+           SET deleted_at=NULL
+           WHERE user_email=$1 AND id=ANY($2::text[]) AND deleted_at IS NOT NULL
+           RETURNING id`,
+          [user.email, ids]
+        );
+      } else if (action === "permanent") {
+        result = await db.query(
+          `DELETE FROM academic_archive
+           WHERE user_email=$1 AND id=ANY($2::text[]) AND deleted_at IS NOT NULL
+           RETURNING id`,
+          [user.email, ids]
+        );
+      } else if (action === "permanent_active") {
+        result = await db.query(
+          `DELETE FROM academic_archive
+           WHERE user_email=$1 AND id=ANY($2::text[]) AND deleted_at IS NULL
+           RETURNING id`,
+          [user.email, ids]
+        );
+      } else {
+        return res.status(400).json({ ok: false, error: "archive_action_invalid" });
+      }
+    }
+
+    res.json({ ok: true, affected: result.rowCount || 0 });
+  } catch (error) {
+    console.error("academic archive bulk action error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر تنفيذ العملية على السجل الأكاديمي" });
+  }
+});
+
+app.patch("/api/academic/archive/:id/restore", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
+    const id = String(req.params.id || "").slice(0, 64);
+    const result = await db.query(
+      `UPDATE academic_archive
+       SET deleted_at=NULL
+       WHERE id=$1 AND user_email=$2
+       RETURNING id`,
+      [id, user.email]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: "archive_item_not_found" });
+    }
+    res.json({ ok: true, restored: true });
+  } catch (error) {
+    console.error("academic archive restore error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر استعادة العنصر إلى الأرشيف الأكاديمي" });
+  }
+});
+
+app.delete("/api/academic/archive/:id/permanent", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
+    const id = String(req.params.id || "").slice(0, 64);
+    const result = await db.query(
+      `DELETE FROM academic_archive
+       WHERE id=$1 AND user_email=$2 AND deleted_at IS NOT NULL
+       RETURNING id`,
+      [id, user.email]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: "archive_item_not_found_or_not_deleted" });
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("academic archive permanent delete error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر حذف العنصر نهائيًا" });
+  }
+});
+
 app.delete("/api/academic/archive/:id", async (req, res) => {
   try {
     const user = await getSessionUser(req.headers["x-session-token"]);
-    if (!user || user.banned) return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
+    const id = String(req.params.id || "").slice(0, 64);
     const result = await db.query(
-      "DELETE FROM academic_archive WHERE id=$1 AND user_email=$2 RETURNING id",
-      [String(req.params.id || "").slice(0, 64), user.email]
+      `UPDATE academic_archive
+       SET deleted_at=COALESCE(deleted_at,$3)
+       WHERE id=$1 AND user_email=$2
+       RETURNING id`,
+      [id, user.email, Date.now()]
     );
-    if (!result.rowCount) return res.status(404).json({ ok: false, error: "archive_item_not_found" });
-    res.json({ ok: true });
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: "archive_item_not_found" });
+    }
+    res.json({ ok: true, deleted: true });
   } catch (error) {
-    console.error("academic archive delete error:", error?.message || error);
-    res.status(500).json({ ok: false, msg: "تعذر حذف العنصر من السجل الأكاديمي" });
+    console.error("academic archive trash error:", error?.message || error);
+    res.status(500).json({ ok: false, msg: "تعذر نقل العنصر إلى المحذوفات" });
   }
 });
 
@@ -3358,7 +3538,7 @@ ${String(reviewed.content).slice(0, 60000)}`
 // لا يعتمد هذا المسار على GEMINI_API_KEY المباشر.
 // ══════════════════════════════════════════════
 app.post("/api/ai/call", async (req, res) => {
-  const { provider = "gemini", prompt, systemPrompt = "", maxTokens, language } = req.body || {};
+  const { provider = "gemini", prompt, systemPrompt = "", maxTokens, language, task = "" } = req.body || {};
   if (provider !== "gemini") {
     res.status(400).json({ ok: false, error: "unsupported_ai_provider" });
     return;
@@ -3379,21 +3559,27 @@ app.post("/api/ai/call", async (req, res) => {
   const aiUser = await requireAiUser(req, res, maxTokens);
   if (!aiUser) return;
 
-  const safeMaxTokens = Math.min(
-    Math.max(Number(maxTokens) || 12000, 1000),
-    AI_MAX_TOKENS_PER_REQUEST
-  );
+  const isDosageTask = task === "dosage";
+  const dosageModel = safeOpenRouterModel(process.env.AI_DOSAGE_MODEL, "openai/gpt-4.1-mini");
+  const safeMaxTokens = isDosageTask
+    ? Math.min(Math.max(Number(maxTokens) || 700, 300), 1000)
+    : Math.min(
+        Math.max(Number(maxTokens) || 12000, 1000),
+        AI_MAX_TOKENS_PER_REQUEST
+      );
 
   const effectiveSystemPrompt = applyRequestedOutputLanguage(systemPrompt, language);
   const requestText = `${effectiveSystemPrompt}\n${prompt}`;
   const isArabicRequest = language === "en" ? false : /[\u0600-\u06ff]/.test(requestText);
-  const requestModels = isArabicRequest
-    ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
-    : OPENROUTER_MODELS;
+  const requestModels = isDosageTask
+    ? [dosageModel]
+    : isArabicRequest
+      ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
+      : OPENROUTER_MODELS;
   let lastError = null;
 
   try {
-    if (isAssignmentTask(requestText)) {
+    if (!isDosageTask && isAssignmentTask(requestText)) {
       const qualityResult = await generateAssignmentWithReview(
         prompt,
         effectiveSystemPrompt,
@@ -3427,7 +3613,7 @@ app.post("/api/ai/call", async (req, res) => {
 
     for (const model of requestModels) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 120000);
+      const timeout = setTimeout(() => controller.abort(), isDosageTask ? 20000 : 120000);
       try {
         const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
