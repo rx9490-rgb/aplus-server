@@ -396,6 +396,7 @@ async function initDB() {
       owner_email TEXT NOT NULL,
       blocked_email TEXT NOT NULL,
       display_name TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL DEFAULT '',
       created_at BIGINT NOT NULL,
       UNIQUE(owner_email, blocked_email)
     );
@@ -504,6 +505,7 @@ async function initDB() {
     try { await db.query(sql); } catch {}
   }
   await db.query("ALTER TABLE academic_archive ADD COLUMN IF NOT EXISTS deleted_at BIGINT");
+  await db.query("ALTER TABLE community_blocks ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT ''");
   await db.query(
     "CREATE INDEX IF NOT EXISTS academic_archive_user_deleted_created_idx " +
     "ON academic_archive(user_email, deleted_at, created_at DESC)"
@@ -572,6 +574,64 @@ async function checkAdminStrict(req) {
 // مصادقة الإدارة بالطريقة الصحيحة للواجهة:
 // لا نضع ADMIN_KEY داخل JavaScript العام؛ نستخدم جلسة المدير، مع إبقاء
 // مفتاح البيئة متاحاً للطلبات الخلفية/التكاملات القديمة.
+function moderatorCanDelegate(actor, requested) {
+  const allowed = sanitizePermissions(actor?.permissions);
+  const grants = sanitizePermissions(requested);
+  return Object.keys(grants).every((key) => allowed[key] === true);
+}
+
+function moderatorPermissionForRequest(req) {
+  const path = String(req.path || req.originalUrl || "").split("?")[0];
+  const method = String(req.method || "GET").toUpperCase();
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  if (path === "/api/auth/admin-create" && method === "POST") return "canManageModerators";
+  if (/^\/api\/codes(?:\/|$)/.test(path)) return "canAddCodes";
+  if (/^\/api\/ads(?:\/|$)/.test(path)) return "canManageAds";
+  if (/^\/api\/feedback\/list$/.test(path) || /^\/api\/feedback\/[^/]+(?:\/read)?$/.test(path)) return "canViewFeedback";
+  if (path === "/api/stats") return "canViewStats";
+  if (path === "/api/broadcast") return "canSendBroadcasts";
+  if (path === "/api/subscriptions/list") return "canManageSubscriptions";
+  if (/^\/api\/admin\/community\//.test(path)) return "canManageBans";
+  if (/^\/api\/admin\/private-tutor(?:s|-)/.test(path)) return "canManageTutors";
+  if (path === "/api/settings") {
+    if (method === "GET") return "canManageSettings";
+    const keys = method === "POST" && typeof body.key === "string"
+      ? [body.key]
+      : Object.keys(body).filter((key) => key !== "adminKey");
+    if (!keys.length) return null;
+    const needed = new Set();
+    for (const key of keys) {
+      if (key === "servicesOrder" || key === "deletedServices") needed.add("canManageServices");
+      else if (key === "svcSettings") needed.add("canManageServiceSettings");
+      else if (key === "screenBanners") needed.add("canManageBanners");
+      else if (key === "social_links" || key === "socialFooterText") needed.add("canManageSocial");
+      else if (key === "sala_store_url") needed.add("canManageStore");
+      else if (key === "motivationalQuotes") needed.add("canManageQuotes");
+      else if (/^(?:dict|dictionary)/i.test(key)) needed.add("canManageDictionary");
+      else if (/api|key/i.test(key)) needed.add("canManageApi");
+      else needed.add("canManageSettings");
+    }
+    return [...needed];
+  }
+  if (path === "/api/users/list" && method === "GET") {
+    return ["canManageUsers", "canManageSubscriptions", "canManageModerators"];
+  }
+  if (/^\/api\/users\/[^/]+\/role$/.test(path)) return "canManageModerators";
+  if (/^\/api\/users\/[^/]+\/premium$/.test(path)) return "canManageSubscriptions";
+  if (/^\/api\/users\/[^/]+\/ban$/.test(path) || /^\/api\/users\/[^/]+\/unlock$/.test(path)) return "canManageUsers";
+  if (/^\/api\/users\/[^/]+$/.test(path)) {
+    const required = [];
+    const roleEdit = ["isModerator", "isAdmin", "permissions", "employeeCode"].some((key) => Object.prototype.hasOwnProperty.call(body, key));
+    if (roleEdit) required.push("canManageModerators");
+    if (["premiumExpiry", "activationCode"].some((key) => Object.prototype.hasOwnProperty.call(body, key))) required.push("canManageSubscriptions");
+    if (["banned", "password"].some((key) => Object.prototype.hasOwnProperty.call(body, key)) ||
+      (["fullName", "emailVerified"].some((key) => Object.prototype.hasOwnProperty.call(body, key)) && !roleEdit)) required.push("canManageUsers");
+    return required.length ? required : "canManageUsers";
+  }
+  if (/^\/api\/users\/[^/]+$/.test(path) && method === "DELETE") return "canManageUsers";
+  return null;
+}
+
 async function isAdminRequest(req) {
   if (checkAdmin(req)) return true;
   const token = req.headers["x-session-token"] || req.query.token;
@@ -580,11 +640,27 @@ async function isAdminRequest(req) {
   if (!user) return false;
   const email = String(user.email || "").trim().toLowerCase();
   const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-  return !!(
+  const isAdmin = !!(
     user.is_admin || user.isAdmin ||
     user.is_super_admin || user.isSuperAdmin ||
     (configuredAdminEmail && email === configuredAdminEmail)
   );
+  if (isAdmin) {
+    req.adminActor = user;
+    req.adminActorIsModerator = false;
+    return true;
+  }
+  if (!user.is_moderator && !user.isModerator) return false;
+  const permission = moderatorPermissionForRequest(req);
+  const granted = sanitizePermissions(user.permissions);
+  const allowed = Array.isArray(permission)
+    ? permission.some((key) => granted[key] === true)
+    : !!permission && granted[permission] === true;
+  if (allowed) {
+    req.adminActor = user;
+    req.adminActorIsModerator = true;
+  }
+  return allowed;
 }
 
 // سجل الأخطاء وإجراءات المعالجة تتطلب جلسة مدير صالحة؛ لا تقبل مفتاح الإدارة وحده.
@@ -595,9 +671,8 @@ async function getMonitoringAdmin(req) {
   if (!user || user.banned) return null;
   const email = String(user.email || "").trim().toLowerCase();
   const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-  return user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)
-    ? user
-    : null;
+  if (user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)) return user;
+  return user.is_moderator && sanitizePermissions(user.permissions).canManageErrors === true ? user : null;
 }
 
 // حماية استخدام الذكاء الاصطناعي — لا تسمح لأي شخص باستنزاف مفتاح OpenRouter
@@ -1058,7 +1133,8 @@ const MODERATOR_PERMISSION_KEYS = new Set([
   "canManageActivations", "canManageSubscriptions", "canViewFeedback",
   "canManageSettings", "canManageModerators", "canViewStats", "canManageServices",
   "canManageStore", "canManageDictionary", "canManageSocial", "canManageBanners",
-  "canManageQuotes", "canManageServiceSettings", "canManageBans", "canManageApi"
+  "canManageQuotes", "canManageServiceSettings", "canManageBans", "canManageApi",
+  "canManageTutors", "canManageErrors", "canSendBroadcasts"
 ]);
 
 function sanitizePermissions(value) {
@@ -1353,7 +1429,7 @@ app.use(cors({
   ],
   exposedHeaders: ["x-session-token"],
   optionsSuccessStatus: 204,
-  credentials: true,
+  credentials: false,
 }));
 
 // أضف أرقام الدعم أيضاً لردود محدد المعدل التي قد تنتهي قبل معالج الأخطاء الرئيسي.
@@ -2055,6 +2131,10 @@ app.post("/api/auth/admin-create", async (req, res) => {
     if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
 
     const body = req.body || {};
+    if (req.adminActorIsModerator &&
+      (body.isModerator === false || !moderatorCanDelegate(req.adminActor, body.permissions))) {
+      return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكنك منح صلاحيات لا تملكها" });
+    }
     const fullName = String(body.fullName || "").trim().slice(0, 120);
     const email = String(body.email || "").toLowerCase().trim();
     const password = String(body.password || "");
@@ -2798,7 +2878,7 @@ const PUBLIC_SETTING_KEYS = new Set([
   "systemName", "primaryColor", "social_links", "sala_store_url",
   "adsEnabled", "servicesOrder", "deletedServices", "screenBanners", "socialFooterText",
   "svcSettings", "subscriptionPrice", "allowRegistration",
-  "welcomeMessage", "allFree", "allFreeStamp"
+  "welcomeMessage", "allFree", "allFreeStamp", "motivationalQuotes"
 ]);
 
 app.get("/api/public/settings", async (_req, res) => {
@@ -3019,6 +3099,15 @@ app.patch("/api/users/:email", async (req, res) => {
     if (!found.rows.length) return res.status(404).json({ ok: false, msg: "المستخدم غير موجود" });
 
     const body = req.body || {};
+    if (req.adminActorIsModerator) {
+      const target = found.rows[0];
+      if (target.is_admin || target.is_super_admin || body.isAdmin === true) {
+        return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكن تعديل حساب مدير" });
+      }
+      if (body.permissions !== undefined && !moderatorCanDelegate(req.adminActor, body.permissions)) {
+        return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكنك منح صلاحيات لا تملكها" });
+      }
+    }
     const setParts = [];
     const values = [];
     const add = (column, value) => {
@@ -3132,6 +3221,13 @@ app.patch("/api/users/:email/role", async (req, res) => {
     if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const { isAdmin, isModerator } = req.body;
     const email = decodeURIComponent(req.params.email);
+    if (req.adminActorIsModerator) {
+      const target = await db.query("SELECT is_admin,is_super_admin FROM users WHERE email=$1 AND deleted_at IS NULL", [email]);
+      if (!target.rows.length) return res.status(404).json({ error: "user_not_found" });
+      if (isAdmin === true || target.rows[0].is_admin || target.rows[0].is_super_admin) {
+        return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكن منح أو تعديل صلاحية مدير" });
+      }
+    }
     await db.query(
       "UPDATE users SET is_admin=$1, is_moderator=$2 WHERE email=$3",
       [!!isAdmin, !!isModerator, email]
@@ -3231,6 +3327,13 @@ app.delete("/api/users/:email", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const email = decodeURIComponent(req.params.email);
+    if (req.adminActorIsModerator) {
+      const target = await db.query("SELECT is_admin,is_super_admin,is_moderator FROM users WHERE email=$1 AND deleted_at IS NULL", [email]);
+      if (!target.rows.length) return res.status(404).json({ error: "user_not_found" });
+      if (target.rows[0].is_admin || target.rows[0].is_super_admin || target.rows[0].is_moderator) {
+        return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكن حذف حساب مدير أو مشرف" });
+      }
+    }
     await db.query("UPDATE users SET deleted_at=$1 WHERE email=$2", [Date.now(), email]);
     await db.query("DELETE FROM sessions WHERE user_id=$1", [email]);
     invalidateSessionCache(email);
@@ -4664,7 +4767,7 @@ app.get("/api/admin/community/blocks", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
     const result = await db.query(
-      `SELECT b.id,b.blocked_email,b.display_name,b.created_at
+      `SELECT b.id,b.blocked_email,b.display_name,b.reason,b.created_at
        FROM community_blocks b
        WHERE b.owner_email='__admin__'
        ORDER BY b.created_at DESC LIMIT 200`
@@ -4680,6 +4783,7 @@ app.post("/api/admin/community/blocks", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "admin_required" });
     const email = String(req.body?.email || "").trim().toLowerCase().slice(0, 254);
+    const reason = String(req.body?.reason || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 500);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
       return res.status(400).json({ ok: false, error: "valid_email_required" });
     }
@@ -4691,12 +4795,12 @@ app.post("/api/admin/community/blocks", async (req, res) => {
       return res.status(404).json({ ok: false, error: "user_not_found" });
     }
     const result = await db.query(
-      `INSERT INTO community_blocks (id,owner_email,blocked_email,display_name,created_at)
-       VALUES ($1,'__admin__',$2,$3,$4)
+      `INSERT INTO community_blocks (id,owner_email,blocked_email,display_name,reason,created_at)
+       VALUES ($1,'__admin__',$2,$3,$4,$5)
        ON CONFLICT (owner_email,blocked_email) DO UPDATE
-         SET display_name=EXCLUDED.display_name
-       RETURNING id,blocked_email,display_name,created_at`,
-      [randomBytes(16).toString("hex"), account.rows[0].email, communityUserName(account.rows[0]), Date.now()]
+         SET display_name=EXCLUDED.display_name,reason=EXCLUDED.reason
+       RETURNING id,blocked_email,display_name,reason,created_at`,
+      [randomBytes(16).toString("hex"), account.rows[0].email, communityUserName(account.rows[0]), reason, Date.now()]
     );
     await db.query("DELETE FROM community_members WHERE email=$1", [account.rows[0].email]);
     res.status(201).json({ ok: true, block: result.rows[0] });
