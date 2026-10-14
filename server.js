@@ -1656,6 +1656,26 @@ app.patch("/api/notifications/read-all", async (req, res) => {
   }
 });
 
+app.delete("/api/notifications", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user || user.banned) {
+      return res.status(401).json({ ok: false, msg: "تسجيل الدخول مطلوب" });
+    }
+    const result = await db.query(
+      `DELETE FROM notifications
+       WHERE user_email = $1
+         AND COALESCE(type, '') <> 'error'
+         AND COALESCE(action_url, '') NOT LIKE 'aplus-errors:%'`,
+      [user.email]
+    );
+    res.json({ ok: true, deletedCount: Number(result.rowCount) || 0 });
+  } catch (error) {
+    console.error("notifications delete-all error:", error.message);
+    res.status(500).json({ ok: false, msg: "تعذر مسح الإشعارات" });
+  }
+});
+
 app.patch("/api/notifications/:id/read", async (req, res) => {
   try {
     const user = await getSessionUser(req.headers["x-session-token"]);
@@ -2545,41 +2565,85 @@ app.post("/api/codes/generate", async (req, res) => {
 
 app.post("/api/codes/redeem", async (req, res) => {
   try {
-    const user = await getSessionUser(req.headers["x-session-token"]);
-    if (!user) return res.json({ ok: false, msg: "يجب تسجيل الدخول أولاً" });
-
+    const verifiedUser = await getSessionUser(req.headers["x-session-token"]);
+    if (!verifiedUser) return res.json({ ok: false, msg: "يجب تسجيل الدخول أولاً" });
     const { code } = req.body;
     if (!code) return res.json({ ok: false, msg: "أدخل الكود" });
+    const normalizedCode = String(code).trim().toUpperCase();
+    if (!normalizedCode) return res.json({ ok: false, msg: "أدخل الكود" });
 
-    const cRows = await db.query("SELECT * FROM codes WHERE code=$1", [code.trim().toUpperCase()]);
-    if (!cRows.rows.length) return res.json({ ok: false, msg: "الكود غير صحيح" });
+    // قفل سجل المستخدم والكود داخل معاملة واحدة حتى لا يُستهلك الكود
+    // أكثر من مرة بالتزامن، ولا تضيع إضافة مدة اشتراك متزامنة.
+    const redemption = await withDbTransaction(async (client) => {
+      const userResult = await client.query(
+        "SELECT email, premium_expiry FROM users WHERE email=$1 AND deleted_at IS NULL FOR UPDATE",
+        [verifiedUser.email]
+      );
+      if (!userResult.rows.length) {
+        return { ok: false, msg: "يجب تسجيل الدخول أولاً" };
+      }
 
-    const c = cRows.rows[0];
-    if (!c.active)                              return res.json({ ok: false, msg: "الكود معطّل" });
-    if (c.expires_at && c.expires_at < Date.now()) return res.json({ ok: false, msg: "انتهت صلاحية الكود" });
-    if (c.used_count >= c.max_uses)             return res.json({ ok: false, msg: "الكود وصل الحد الأقصى للاستخدام" });
+      const codeResult = await client.query(
+        "SELECT * FROM codes WHERE code=$1 FOR UPDATE",
+        [normalizedCode]
+      );
+      if (!codeResult.rows.length) return { ok: false, msg: "الكود غير صحيح" };
 
-    const usedBy = Array.isArray(c.used_by) ? c.used_by : [];
-    if (usedBy.includes(user.email))            return res.json({ ok: false, msg: "استخدمت هذا الكود من قبل" });
+      const c = codeResult.rows[0];
+      if (!c.active) return { ok: false, msg: "الكود معطّل" };
+      if (c.expires_at && Number(c.expires_at) < Date.now()) {
+        return { ok: false, msg: "انتهت صلاحية الكود" };
+      }
 
-    const base      = Math.max(Number(user.premium_expiry) || 0, Date.now());
-    const newExpiry = base + c.duration_days * 86_400_000;
-    const newUsed   = [...usedBy, user.email];
+      const usedCount = Number(c.used_count) || 0;
+      const maxUses = Number(c.max_uses) || 0;
+      if (usedCount >= maxUses) {
+        return { ok: false, msg: "الكود وصل الحد الأقصى للاستخدام" };
+      }
 
-    await db.query("UPDATE codes SET used_count=used_count+1, used_by=$1 WHERE id=$2",
-      [JSON.stringify(newUsed), c.id]);
-    await db.query("UPDATE users SET premium_expiry=$1, activation_code=$2 WHERE email=$3",
-      [newExpiry, code.trim().toUpperCase(), user.email]);
+      const currentUser = userResult.rows[0];
+      const usedBy = Array.isArray(c.used_by) ? c.used_by : [];
+      if (usedBy.includes(currentUser.email)) {
+        return { ok: false, msg: "استخدمت هذا الكود من قبل" };
+      }
 
-    invalidateSessionCache(user.email);
+      const durationDays = Number(c.duration_days);
+      if (!Number.isFinite(durationDays) || durationDays <= 0) {
+        return { ok: false, msg: "الكود غير صالح" };
+      }
+
+      const now = Date.now();
+      const base = Math.max(Number(currentUser.premium_expiry) || 0, now);
+      const newExpiry = base + durationDays * 86_400_000;
+      const newUsedBy = [...usedBy, currentUser.email];
+
+      await client.query(
+        "UPDATE codes SET used_count=$1, used_by=$2 WHERE id=$3",
+        [usedCount + 1, JSON.stringify(newUsedBy), c.id]
+      );
+      await client.query(
+        "UPDATE users SET premium_expiry=$1, activation_code=$2 WHERE email=$3",
+        [newExpiry, normalizedCode, currentUser.email]
+      );
+
+      return { ok: true, email: currentUser.email, newExpiry };
+    });
+
+    if (!redemption.ok) return res.json(redemption);
+    invalidateSessionCache(redemption.email);
 
     // إشعارات فورية للجميع
-    broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: newExpiry });
+    broadcastEvent({ type: "subscription_updated", email: redemption.email, premiumExpiry: redemption.newExpiry });
     broadcastEvent({ type: "users_updated" });
     broadcastEvent({ type: "codes_updated" });
 
-    const daysLeft = Math.ceil((newExpiry - Date.now()) / 86_400_000);
-    res.json({ ok: true, msg: `🎉 تم تفعيل الاشتراك — ${daysLeft} يوم متبقي`, premiumExpiry: newExpiry, daysLeft });
+    const daysLeft = Math.ceil((redemption.newExpiry - Date.now()) / 86_400_000);
+    res.json({
+      ok: true,
+      msg: `🎉 تم تفعيل الاشتراك — ${daysLeft} يوم متبقي`,
+      premiumExpiry: redemption.newExpiry,
+      daysLeft
+    });
   } catch (e) {
     console.error("redeem error:", e.message);
     res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
@@ -2815,6 +2879,127 @@ app.post("/api/user/settings", async (req, res) => {
     );
     res.json({ ok: true });
   } catch { res.json({ ok: false }); }
+});
+
+// يستهلك استخداماً مجانياً واحداً لكل حساب وخدمة، مع حفظ ذري في قاعدة البيانات.
+app.post("/api/services/use", async (req, res) => {
+  try {
+    const sessionUser = await getSessionUser(req.headers["x-session-token"]);
+    if (!sessionUser || sessionUser.banned) {
+      return res.status(401).json({ ok: false, allowed: false, msg: "تسجيل الدخول مطلوب" });
+    }
+
+    const aliases = { diagnosis: "patient", nanda: "patient", mindmap: "explain", testme: "quiz", dicttest: "dict" };
+    const requestedId = String(req.body?.serviceId || "").trim();
+    const serviceId = aliases[requestedId] || requestedId;
+    if (!/^[a-z0-9-]{1,60}$/i.test(serviceId)) {
+      return res.status(400).json({ ok: false, allowed: false, msg: "معرّف الخدمة غير صالح" });
+    }
+
+    const result = await withDbTransaction(async (client) => {
+      const userResult = await client.query(
+        `SELECT email, premium_expiry, is_admin, is_super_admin, is_moderator,
+                banned, trial_counters
+         FROM users
+         WHERE email=$1 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [sessionUser.email]
+      );
+      if (!userResult.rows.length || userResult.rows[0].banned) {
+        return { httpStatus: 401, ok: false, allowed: false, msg: "تسجيل الدخول مطلوب" };
+      }
+
+      const account = userResult.rows[0];
+      const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+      const isAdmin = !!(
+        account.is_admin ||
+        account.is_super_admin ||
+        account.is_moderator ||
+        (configuredAdminEmail && String(account.email).toLowerCase() === configuredAdminEmail)
+      );
+      if (isAdmin || Number(account.premium_expiry) > Date.now()) {
+        return { ok: true, allowed: true, unlimited: true, used: 0, limit: 0, remaining: null };
+      }
+
+      const settingsResult = await client.query(
+        "SELECT value FROM settings WHERE key=$1 LIMIT 1",
+        ["servicesOrder"]
+      );
+      const order = Array.isArray(settingsResult.rows[0]?.value)
+        ? settingsResult.rows[0].value
+        : [];
+      const service = order.find((item) => item && item.id === serviceId);
+      if (!service) {
+        return { httpStatus: 409, ok: false, allowed: false, msg: "تعذّر تحميل إعدادات الخدمة" };
+      }
+      if (service.locked === true) {
+        return {
+          ok: true,
+          allowed: false,
+          requiresSubscription: true,
+          reason: "locked",
+          used: 0,
+          limit: 0,
+          remaining: 0
+        };
+      }
+
+      const configuredLimit = Number(service.freeUsesPerAccount);
+      const limit = Number.isInteger(configuredLimit)
+        ? Math.max(0, Math.min(1000, configuredLimit))
+        : 0;
+      const rawCounters = account.trial_counters;
+      const counters = rawCounters && typeof rawCounters === "object" && !Array.isArray(rawCounters)
+        ? { ...rawCounters }
+        : {};
+      const used = Math.max(0, Number(counters[serviceId]) || 0);
+
+      if (limit === 0) {
+        return { ok: true, allowed: true, unlimited: true, used, limit: 0, remaining: null };
+      }
+      if (used >= limit) {
+        return {
+          ok: true,
+          allowed: false,
+          requiresSubscription: true,
+          reason: "free_limit_reached",
+          used,
+          limit,
+          remaining: 0
+        };
+      }
+
+      const nextUsed = used + 1;
+      counters[serviceId] = nextUsed;
+      await client.query(
+        "UPDATE users SET trial_counters=$1::jsonb WHERE email=$2",
+        [JSON.stringify(counters), account.email]
+      );
+      return {
+        ok: true,
+        allowed: true,
+        used: nextUsed,
+        limit,
+        remaining: Math.max(0, limit - nextUsed),
+        counted: true
+      };
+    });
+
+    if (result.httpStatus) {
+      const status = result.httpStatus;
+      delete result.httpStatus;
+      return res.status(status).json(result);
+    }
+    if (result.counted) invalidateSessionCache(sessionUser.email);
+    return res.json(result);
+  } catch (error) {
+    console.error("service usage limit error:", error?.message || error);
+    return res.status(500).json({
+      ok: false,
+      allowed: false,
+      msg: "تعذّر التحقق من حد الاستخدام"
+    });
+  }
 });
 
 // ══════════════════════════════════════════════
@@ -3186,9 +3371,8 @@ function safeOpenRouterModel(value, fallback) {
   }
   return model;
 }
-// نماذج OpenRouter المستخدمة بالترتيب:
-// Gemini ثم GPT للمراجعة، وبعدها Claude وDeepSeek وQwen وLlama كبدائل.
-// كل الطلبات تمر من OPENROUTER_API_KEY، ولا نحتاج مفاتيح منفصلة.
+// النماذج مضبوطة كخيارات إدارية، لكن كل طلب يختار نموذجاً واحداً فقط.
+// لا توجد مراجعات أو محاولات احتياطية مدفوعة تلقائية.
 //
 // Blackbox اختياري لأن اسم الموديل يتغير حسب ما هو متاح في OpenRouter.
 // لتفعيله أضف AI_BLACKBOX_MODEL بالمعرّف الظاهر في OpenRouter.
@@ -3208,14 +3392,6 @@ const ARABIC_MODEL = safeOpenRouterModel(
   process.env.AI_ARABIC_MODEL,
   "google/gemini-2.5-pro"
 );
-const REVIEW_MODELS = [
-  safeOpenRouterModel(process.env.AI_REVIEW_MODEL, "openai/gpt-4.1-mini"),
-  safeOpenRouterModel(process.env.AI_CLAUDE_MODEL, "anthropic/claude-sonnet-4"),
-  safeOpenRouterModel(process.env.AI_DEEPSEEK_MODEL, "deepseek/deepseek-chat-v3.1"),
-  safeOpenRouterModel(process.env.AI_QWEN_MODEL, "qwen/qwen-2.5-72b-instruct"),
-  safeOpenRouterModel(process.env.AI_LLAMA_MODEL, "meta-llama/llama-3.3-70b-instruct")
-].filter((model, index, all) => model && all.indexOf(model) === index);
-
 const AI_QUALITY_SYSTEM = `
 أنت المساعد الرئيسي لموقع طبي تعليمي، وتنفذ كل أنواع المهام: الواجبات،
 البحوث، مشاريع التخرج، العروض التقديمية، التلخيص، الترجمة، البطاقات،
@@ -3322,44 +3498,6 @@ function auditAssignmentQuality(text, prompt) {
   };
 }
 
-async function enforceAssignmentQualityGate(content, prompt, systemPrompt, model, maxTokens) {
-  let current = String(content || "").trim();
-  let audit = auditAssignmentQuality(current, prompt);
-  for (let attempt = 0; !audit.ok && attempt < 4; attempt++) {
-    const repairPrompt = `
-هذه بوابة جودة إلزامية لواجب أكاديمي.
-لا تُخرج النسخة الحالية كما هي. أصلح كل الملاحظات ثم أخرج الواجب كاملاً فقط.
-يجب أن تصبح نتيجة الفحص الداخلي 10/10:
-${audit.issues.map((issue) => `- ${issue}`).join("\n")}
-
-تعليمات الدكتور والطلب الأصلي:
-${String(prompt).slice(0, 60000)}
-
-النسخة الحالية:
-${current.slice(0, 60000)}
-
-قواعد الإصلاح:
-- لا تحذف أي قسم أو جدول أو حقل موجود.
-- لا تضف مراجع أو DOI أو أرقاماً غير قابلة للتحقق.
-- حافظ على لغة الواجب وتنسيقه المطلوبين.
-- أخرج النص النهائي فقط، بلا شرح للفحص أو الإصلاح.
-`;
-    const repaired = await openRouterCompletion(
-      model,
-      [
-        { role: "system", content: [AI_QUALITY_SYSTEM, systemPrompt].filter(Boolean).join("\n\n") },
-        { role: "user", content: repairPrompt }
-      ],
-      maxTokens,
-      0.05
-    );
-    if (!repaired.ok || !String(repaired.content || "").trim()) break;
-    current = repaired.content.trim();
-    audit = auditAssignmentQuality(current, prompt);
-  }
-  return { content: current, audit };
-}
-
 const FORM_ASSIGNMENT_RULES = `
 هذا طلب تعبئة نموذج تمريضي، وليس مقالاً أو تقريراً نظرياً.
 إذا كان الطلب يتضمن Nursing Assignment Sheet أو Shift A/B:
@@ -3439,109 +3577,39 @@ async function openRouterCompletion(model, messages, maxTokens, temperature = 0.
   }
 }
 
-async function generateAssignmentWithReview(prompt, systemPrompt, maxTokens, isArabicRequest) {
-  const primaryModel = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
-  const formTask = isFormAssignmentTask(`${systemPrompt || ""}\n${prompt || ""}`);
-  const deliveryComparisonTask = isDeliveryComparisonTask(`${systemPrompt || ""}\n${prompt || ""}`);
+async function generateAssignmentOnce(prompt, systemPrompt, maxTokens, isArabicRequest) {
+  const source = `${systemPrompt || ""}\n${prompt || ""}`;
+  const formTask = isFormAssignmentTask(source);
+  const deliveryComparisonTask = isDeliveryComparisonTask(source);
   const effectiveSystemPrompt = [
     systemPrompt,
     formTask ? FORM_ASSIGNMENT_RULES : "",
-    deliveryComparisonTask && !formTask ? DELIVERY_COMPARISON_RULES : ""
+    deliveryComparisonTask && !formTask ? DELIVERY_COMPARISON_RULES : "",
+    "نفّذ جميع المتطلبات في استدعاء واحد. قبل إخراج الإجابة، راجعها داخلياً مرة واحدة للتأكد من اكتمال البنود والعناوين والجداول المطلوبة، وصحح ما تستطيع ضمن الإجابة نفسها. لا تحذف مطلباً ولا تضف أقساماً غير مطلوبة."
   ].filter(Boolean).join("\n\n");
-  const draftMessages = [
-    { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
-    { role: "user", content: String(prompt) }
-  ];
-  const draft = await openRouterCompletion(primaryModel, draftMessages, maxTokens, 0.1);
-  if (!draft.ok) return draft;
-
-  // مراجعة مستقلة نهائية: لا نستخدم الموديلات بالتوازي حتى لا تختلط أجزاء الواجب.
-  const reviewModel = REVIEW_MODELS.find((model) => OPENROUTER_MODELS.includes(model))
-    || primaryModel;
-  const reviewPrompt = `
-أنت محرر أكاديمي ومراجع جودة نهائي.
-أعد كتابة المسودة التالية كنسخة نهائية جاهزة للتسليم، مع الالتزام الحرفي بطلب المستخدم وتعليمات الدكتور.
-صحح البنية، اكتمال الأقسام، اللغة، التكرار، الترابط، والمعلومات غير الموثوقة.
- حافظ على كل قسم مطلوب وكل جدول وكل حقل موجود في المسودة؛ لا تختصر المحتوى ولا تحذف مطلباً لتقليل الطول.
-لا تضف شرحاً عن المراجعة، ولا تذكر الذكاء الاصطناعي، ولا تضع قائمة تحقق.
-لا تخترع مراجع أو DOI أو أرقاماً علمية. في نموذج التدريب فقط، استخدم أرقام مرضى وأوقاتاً
-وبيانات طاقم افتراضية متسقة إذا لم يقدم المستخدم بيانات فعلية، مع إبقاء وسم "البيانات افتراضية".
-أخرج نص الواجب النهائي فقط.
-${formTask ? `\nهذه تعبئة نموذج وليست كتابة مقال:
-${FORM_ASSIGNMENT_RULES}
-تحقق أن الناتج يحتوي الشفت A وB وجميع الخانات المطلوبة، ولا يحول النموذج إلى تقرير نظري.` : ""}
-${deliveryComparisonTask && !formTask ? `\nهذا تقرير مقارن عن NVD وC-Section:
-${DELIVERY_COMPARISON_RULES}
-تحقق أن المحاور الخمسة كلها موجودة وأن الجدول يقارن العمودين مباشرة.` : ""}
-
-الطلب الأصلي وتعليمات الدكتور:
-${String(prompt).slice(0, 60000)}
-
-المسودة:
-${String(draft.content).slice(0, 50000)}
-`;
-  const reviewed = await openRouterCompletion(
-    reviewModel,
+  const model = isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0];
+  const result = await openRouterCompletion(
+    model,
     [
       { role: "system", content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n") },
-      { role: "user", content: reviewPrompt }
+      { role: "user", content: String(prompt) }
     ],
     maxTokens,
     0.1
   );
-  if (!reviewed.ok) return draft;
-  const draftWordCount = String(draft.content || "").trim().split(/\s+/).filter(Boolean).length;
-  const reviewedWordCount = String(reviewed.content || "").trim().split(/\s+/).filter(Boolean).length;
-  /* لا نستبدل مسودة كاملة بمراجعة قصّرت المحتوى بشكل واضح. */
-  if (draftWordCount >= 500 && reviewedWordCount < Math.floor(draftWordCount * 0.72)) {
-    return draft;
-  }
-  const gated = await enforceAssignmentQualityGate(
-    reviewed.content,
-    prompt,
-    effectiveSystemPrompt,
-    reviewModel,
-    maxTokens
-  );
-  if (!gated.audit.ok) {
+  if (!result.ok) return result;
+
+  // فحص محلي بلا استدعاء مدفوع إضافي؛ لا نرسل ناتجاً ناقصاً بصمت.
+  const audit = auditAssignmentQuality(result.content, prompt);
+  if (!audit.ok) {
     return {
       ok: false,
       qualityGateFailed: true,
       status: 422,
-      message: `assignment_quality_gate_failed:${gated.audit.issues.slice(0, 3).join("|")}`
+      message: `assignment_quality_gate_failed:${audit.issues.slice(0, 3).join("|")}`
     };
   }
-  reviewed.content = gated.content;
-
-  // إصلاح بنيوي أخير: إذا طلب الدكتور جدول مقارنة فلا نسمح بخروج الواجب بدونه.
-  if (requiresComparisonTable(prompt) && !containsMarkdownTable(reviewed.content)) {
-    const repaired = await openRouterCompletion(
-      reviewModel,
-      [
-        {
-          role: "system",
-          content: [AI_QUALITY_SYSTEM, effectiveSystemPrompt].filter(Boolean).join("\n\n")
-        },
-        {
-          role: "user",
-          content: `أصلح هذه النسخة النهائية فقط.
-الطلب الأصلي يشترط جدول مقارنة واضحاً، لكنه غير موجود.
-أضف جدول Markdown حقيقياً متعدد الصفوف في القسم الأنسب، مع إبقاء بقية النص كما هو.
-لا تحذف أي قسم، ولا تضف شرحاً عن التعديل، وأخرج الواجب كاملاً فقط.
-
-الطلب:
-${String(prompt).slice(0, 60000)}
-
-النسخة الحالية:
-${String(reviewed.content).slice(0, 60000)}`
-        }
-      ],
-      maxTokens,
-      0.05
-    );
-    return repaired.ok ? repaired : reviewed;
-  }
-  return reviewed;
+  return { ...result, audit };
 }
 
 // ══════════════════════════════════════════════
@@ -3582,16 +3650,17 @@ app.post("/api/ai/call", async (req, res) => {
   const effectiveSystemPrompt = applyRequestedOutputLanguage(systemPrompt, language);
   const requestText = `${effectiveSystemPrompt}\n${prompt}`;
   const isArabicRequest = language === "en" ? false : /[\u0600-\u06ff]/.test(requestText);
-  const requestModels = isDosageTask
-    ? [dosageModel]
-    : isArabicRequest
-      ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
-      : OPENROUTER_MODELS;
+  // اختيار نموذج واحد فقط لكل طلب؛ لا توجد محاولات احتياطية مدفوعة.
+  const requestModels = [
+    isDosageTask
+      ? dosageModel
+      : (isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0])
+  ];
   let lastError = null;
 
   try {
     if (!isDosageTask && isAssignmentTask(requestText)) {
-      const qualityResult = await generateAssignmentWithReview(
+      const qualityResult = await generateAssignmentOnce(
         prompt,
         effectiveSystemPrompt,
         safeMaxTokens,
@@ -3601,8 +3670,8 @@ app.post("/api/ai/call", async (req, res) => {
         res.json({
           ok: true,
           content: qualityResult.content,
-          provider: "openrouter-quality-pipeline",
-          models: [isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0], qualityResult.model]
+          provider: "openrouter-single-request",
+          model: qualityResult.model
         });
         return;
       }
@@ -3614,7 +3683,13 @@ app.post("/api/ai/call", async (req, res) => {
         });
         return;
       }
-      lastError = qualityResult;
+      const failedStatus = qualityResult.status === 429 || qualityResult.status >= 500 ? 503 : 502;
+      res.status(failedStatus).json({
+        ok: false,
+        error: failedStatus === 503 ? "openrouter_temporarily_unavailable" : "openrouter_request_failed",
+        detail: qualityResult.message || undefined
+      });
+      return;
     }
 
     const messages = [
@@ -3651,13 +3726,13 @@ app.post("/api/ai/call", async (req, res) => {
             message: String(data?.error?.message || "").slice(0, 240)
           };
           console.error("[OpenRouter] model failed", model, response.status, lastError.message);
-          if (response.status === 401 || response.status === 403 || response.status === 402) break;
-          continue;
+          // لا نعيد المحاولة على نموذج آخر بعد أي فشل؛ قد يكون المزود احتسب الطلب.
+          break;
         }
         const content = String(data?.choices?.[0]?.message?.content || "").trim();
         if (!content) {
           lastError = { status: 502, message: "empty_response" };
-          continue;
+          break;
         }
         res.json({ ok: true, content, provider: "openrouter", model });
         return;
@@ -3667,7 +3742,7 @@ app.post("/api/ai/call", async (req, res) => {
           message: error?.name === "AbortError" ? "timeout" : (error?.message || "network")
         };
         console.error("[OpenRouter] model request failed", model, lastError.message);
-        continue;
+        break;
       } finally {
         clearTimeout(timeout);
       }
@@ -3735,9 +3810,10 @@ app.post("/api/openrouter/stream", async (req, res) => {
   let sentAny = false;
   const requestText = `${effectiveSystemPrompt}\n${prompt}`;
   const isArabicRequest = language === "en" ? false : /[\u0600-\u06ff]/.test(requestText);
-  const requestModels = isArabicRequest
-    ? [ARABIC_MODEL, ...OPENROUTER_MODELS.filter((model) => model !== ARABIC_MODEL)]
-    : OPENROUTER_MODELS;
+  // طلب بث واحد إلى نموذج واحد فقط، حتى عند فشل المزود أو انقطاع الاتصال.
+  const requestModels = [
+    isArabicRequest ? ARABIC_MODEL : OPENROUTER_MODELS[0]
+  ];
   let clientGone = false;
   res.on("close", () => {
     if (!res.writableEnded) clientGone = true;
@@ -3752,8 +3828,7 @@ app.post("/api/openrouter/stream", async (req, res) => {
   for (const model of requestModels) {
     if (clientGone) return;
     if (sentAny) break;
-      /* لا نعيد الطلب نفسه مرتين لكل نموذج؛ ننتقل إلى النموذج الاحتياطي
-         حتى لا تتراكم الطلبات وتظهر للمستخدم كأن الخدمة متقطعة. */
+      /* محاولة واحدة فقط؛ لا ننتقل إلى مزود أو نموذج احتياطي. */
       for (let attempt = 0; attempt < 1; attempt++) {
       try {
         const ctrl = new AbortController();
@@ -3783,16 +3858,13 @@ app.post("/api/openrouter/stream", async (req, res) => {
         if (!upstream.ok) {
           const txt = await upstream.text().catch(() => "");
           lastErr = { status: upstream.status, body: txt };
-          if (upstream.status === 401 || upstream.status === 403) break;
-          if (upstream.status === 402) break;
-          if (upstream.status === 429) { await sleep(1500); continue; }
-          if (upstream.status >= 500) { await sleep(800); continue; }
+          // قد تكون الفاتورة احتُسبت حتى لو أعاد المزود خطأ؛ لا نكرر الإرسال.
           break;
         }
 
         if (!upstream.body) {
           lastErr = { status: 200, body: "empty_stream" };
-          continue;
+          break;
         }
         const reader = upstream.body.getReader();
         const decoder = new TextDecoder();
@@ -3830,20 +3902,18 @@ app.post("/api/openrouter/stream", async (req, res) => {
         }
         if (upstreamError && !attemptText.trim()) {
           lastErr = { status: 502, body: JSON.stringify(upstreamError) };
-          continue;
+          break;
         }
         if (!attemptText.trim()) {
           lastErr = { status: 200, body: "empty_stream" };
-          continue;
+          break;
         }
         res.write(`data: ${JSON.stringify({ msg: "done" })}\n\n`);
         res.end();
         return;
       } catch (e) {
         lastErr = e;
-        const m = (e?.message || e?.name || String(e)).toLowerCase();
-        if (m.includes("abort") || m.includes("timeout")) { await sleep(500); continue; }
-        await sleep(500);
+        // لا تكرر الطلب بعد انقطاع أو مهلة؛ نتيجة المحاولة الأولى قد تكون غير معلومة.
       }
     }
   }
@@ -3877,13 +3947,15 @@ app.post("/api/openrouter/vision", async (req, res) => {
     return;
   }
   const { imageBase64, prompt, maxTokens } = req.body || {};
-  if (!imageBase64 || !prompt) {
+  const images = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
+  const imageChars = images.reduce((total, image) => total + (typeof image === "string" ? image.length : 0), 0);
+  if (!images.length || images.length > 12 || images.some((image) => typeof image !== "string" || !image) || !prompt) {
     res.status(400).json({ ok: false, error: "missing_params" });
     return;
   }
   if (
     String(prompt).length > AI_MAX_PROMPT_CHARS ||
-    String(imageBase64).length > AI_MAX_IMAGE_CHARS
+    imageChars > AI_MAX_IMAGE_CHARS
   ) {
     res.status(413).json({ ok: false, error: "payload_too_large" });
     return;
@@ -3897,15 +3969,14 @@ app.post("/api/openrouter/vision", async (req, res) => {
   console.log("[AI] vision request", {
     user: aiUser.email,
     promptChars: String(prompt).length,
-    imageChars: String(imageBase64).length,
+    imageCount: images.length,
+    imageChars,
     maxTokens: safeMaxTokens
   });
+  // تحليل الصورة لا ينتقل تلقائياً إلى نماذج أخرى؛ هذا الاستدعاء هو المحاولة الوحيدة.
   const VISION_MODELS = [
-    safeOpenRouterModel(process.env.AI_VISION_MODEL, "google/gemini-2.5-pro"),
-    "google/gemini-2.5-flash",
-    "openai/gpt-4.1-mini",
-    "qwen/qwen2.5-vl-72b-instruct"
-  ].filter((model, index, all) => model && all.indexOf(model) === index);
+    safeOpenRouterModel(process.env.AI_VISION_MODEL, "google/gemini-2.5-pro")
+  ];
   let lastErr = null;
   for (const model of VISION_MODELS) {
     try {
@@ -3931,7 +4002,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
             {
               role: "user",
               content: [
-                { type: "image_url", image_url: { url: imageBase64 } },
+                ...images.map((image) => ({ type: "image_url", image_url: { url: image } })),
                 { type: "text", text: prompt }
               ]
             }
@@ -3953,8 +4024,7 @@ app.post("/api/openrouter/vision", async (req, res) => {
       } else {
         const txt = await upstream.text().catch(() => "");
         lastErr = { status: upstream.status, body: txt };
-        if (upstream.status === 401 || upstream.status === 403) break;
-        if (upstream.status === 402) break;
+        // لا توجد محاولة ثانية بعد أي استجابة أو خطأ.
       }
     } catch (e) {
       lastErr = e;
@@ -6995,8 +7065,19 @@ function startCleanup() {
   cleanupTimer = setInterval(async () => {
     if (shuttingDown) return;
     try {
-      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 يوم
+      const now = Date.now();
+      const cutoff = now - 30 * 24 * 60 * 60 * 1000; // 30 يوم
       await db.query("DELETE FROM sessions WHERE created_at < $1", [cutoff]);
+      for (const [key, usage] of aiUsage) {
+        if (!usage || now - Number(usage.dayStart || 0) >= 86_400_000) {
+          aiUsage.delete(key);
+        }
+      }
+      for (const [token, cached] of sessionCache) {
+        if (!cached || now - Number(cached.ts || 0) >= SESSION_CACHE_TTL) {
+          sessionCache.delete(token);
+        }
+      }
     } catch {}
   }, 6 * 60 * 60 * 1000); // كل 6 ساعات
   cleanupTimer.unref?.();
