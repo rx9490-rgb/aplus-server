@@ -319,6 +319,18 @@ async function initDB() {
       paid_at           BIGINT DEFAULT 0,
       created_at        BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS fatora_subscription_payments (
+      order_id                 TEXT PRIMARY KEY,
+      user_email               TEXT NOT NULL,
+      amount                   NUMERIC(10,2) NOT NULL,
+      currency                 TEXT NOT NULL,
+      status                   TEXT NOT NULL DEFAULT 'pending',
+      provider_transaction_id  TEXT DEFAULT '',
+      created_at               BIGINT NOT NULL,
+      paid_at                  BIGINT DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS fatora_subscription_payments_user_created_idx
+      ON fatora_subscription_payments(user_email, created_at DESC);
     CREATE TABLE IF NOT EXISTS private_tutor_rooms (
       id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
       booking_id TEXT REFERENCES private_tutor_bookings(id) ON DELETE SET NULL,
@@ -4916,114 +4928,187 @@ app.use(express.static(path.join(__dirname, "public"), { etag: true, lastModifie
 app.use(express.static(path.join(__dirname, "..", "public"), { etag: true, lastModified: true }));
 
 // ══════════════════════════════════════════════
-// Paylink Payment Gateway
-// Required Secrets:
-// PAYLINK_API_ID, PAYLINK_SECRET_KEY, PAYLINK_ENV=test|production
-// FRONTEND_URL must be https://aplus.blog
+// Fatora hosted checkout
+// Required server secret: FATORA_API_KEY
+// Optional: FATORA_CURRENCY=SAR, FATORA_MODE=live|test
 // ══════════════════════════════════════════════
-const PAYLINK_BASE = process.env.PAYLINK_ENV === "test"
-  ? "https://restpilot.paylink.sa"
-  : "https://restapi.paylink.sa";
-let paylinkToken = "";
-let paylinkTokenExpires = 0;
+const FATORA_API_BASE = "https://api.fatora.io/v1";
+const FATORA_CURRENCY = /^[A-Z]{3}$/.test(String(process.env.FATORA_CURRENCY || "SAR").trim().toUpperCase())
+  ? String(process.env.FATORA_CURRENCY || "SAR").trim().toUpperCase()
+  : "SAR";
 
-async function getPaylinkToken() {
-  if (paylinkToken && Date.now() < paylinkTokenExpires) return paylinkToken;
-  if (!process.env.PAYLINK_API_ID || !process.env.PAYLINK_SECRET_KEY) {
-    throw new Error("Paylink secrets are not configured");
-  }
-  const r = await fetch(`${PAYLINK_BASE}/api/auth`, {
-    method: "POST",
-    headers: { accept: "application/json", "content-type": "application/json" },
-    body: JSON.stringify({
-      apiId: process.env.PAYLINK_API_ID,
-      secretKey: process.env.PAYLINK_SECRET_KEY,
-      persistToken: false
-    })
-  });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || !d.id_token) throw new Error(d.detail || "Paylink authentication failed");
-  paylinkToken = d.id_token;
-  paylinkTokenExpires = Date.now() + 25 * 60 * 1000;
-  return paylinkToken;
+function fatoraFrontendUrl(query) {
+  const base = String(process.env.FRONTEND_URL || "https://aplus.blog").replace(/\/+$/, "");
+  return `${base}/?${new URLSearchParams(query).toString()}`;
 }
 
-async function paylinkFetch(endpoint, options = {}) {
-  const r = await fetch(`${PAYLINK_BASE}${endpoint}`, {
-    ...options,
-    headers: {
-      authorization: `Bearer ${await getPaylinkToken()}`,
-      accept: "application/json",
-      "content-type": "application/json"
-    }
-  });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.detail || d.title || "Paylink request failed");
-  return d;
-}
-
-app.post("/api/payment/paylink/create", async (req, res) => {
+async function fatoraRequest(endpoint, payload) {
+  const apiKey = String(process.env.FATORA_API_KEY || "").trim();
+  if (!apiKey) throw new Error("FATORA_API_KEY is not configured");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+  timeout.unref?.();
   try {
-    const { email, name, mobile } = req.body || {};
-    const amount = Number(req.body?.amount);
-    if (!email || !email.includes("@")) return res.status(400).json({ success: false, error: "email_required" });
-    if (!Number.isFinite(amount) || amount < 5) return res.status(400).json({ success: false, error: "minimum_amount_is_5_sar" });
-    const orderNumber = `APLUS-${Date.now()}-${randomBytes(3).toString("hex")}`;
-    const invoice = await paylinkFetch("/api/addInvoice", {
+    const response = await fetch(`${FATORA_API_BASE}${endpoint}`, {
       method: "POST",
-      body: JSON.stringify({
-        amount: Number(amount.toFixed(2)),
-        currency: "SAR",
-        orderNumber,
-        clientName: String(name || "A+ User").slice(0, 100),
-        clientEmail: email,
-        clientMobile: String(mobile || "0500000000"),
-        callBackUrl: `${(process.env.FRONTEND_URL || "https://aplus.blog").replace(/\/$/, "")}/?payment=paylink`,
-        note: "A+ Medical monthly subscription",
-        products: [{
-          title: "A+ Medical monthly subscription",
-          price: Number(amount.toFixed(2)),
-          qty: 1,
-          isDigital: true
-        }]
-      })
+      headers: {
+        "api_key": apiKey,
+        "content-type": "application/json",
+        "accept": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
-    if (!invoice.url || !invoice.transactionNo) throw new Error("Paylink returned an invalid invoice");
-    res.json({ success: true, url: invoice.url, transactionNo: invoice.transactionNo, orderNumber });
-  } catch (e) {
-    console.error("PAYLINK_CREATE:", e.message);
-    res.status(502).json({ success: false, error: "payment_invoice_failed" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || String(data.status || "").toUpperCase() !== "SUCCESS") {
+      const providerMessage = String(data?.error?.description || data?.description || "").slice(0, 180);
+      const error = new Error(providerMessage || `Fatora request failed (${response.status})`);
+      error.statusCode = response.status;
+      throw error;
+    }
+    return data.result || {};
+  } finally {
+    clearTimeout(timeout);
   }
-});
+}
 
-app.get("/api/payment/paylink/status/:transactionNo", async (req, res) => {
-  try {
-    const d = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(req.params.transactionNo)}`);
-    const paid = String(d.orderStatus || "").toLowerCase() === "paid";
-    res.json({ success: true, paid, orderStatus: d.orderStatus, amount: d.amount, transactionNo: d.transactionNo });
-  } catch (e) {
-    console.error("PAYLINK_STATUS:", e.message);
-    res.status(502).json({ success: false, error: "payment_verification_failed" });
+async function createFatoraCheckout({ orderId, amount, user, note, successQuery, failureQuery }) {
+  const result = await fatoraRequest("/payments/checkout", {
+    amount: Number(Number(amount).toFixed(2)),
+    currency: FATORA_CURRENCY,
+    order_id: String(orderId),
+    client: {
+      name: String(user?.full_name || user?.email || "A+ User").slice(0, 250),
+      email: String(user?.email || "").trim().toLowerCase(),
+    },
+    language: "ar",
+    success_url: fatoraFrontendUrl(successQuery),
+    failure_url: fatoraFrontendUrl(failureQuery),
+    note: String(note || "A+ Medical payment").slice(0, 250),
+  });
+  const checkoutUrl = String(result.checkout_url || "");
+  let parsedUrl;
+  try { parsedUrl = new URL(checkoutUrl); } catch {}
+  if (!parsedUrl || parsedUrl.protocol !== "https:" || !parsedUrl.hostname) {
+    throw new Error("Fatora returned an invalid checkout URL");
   }
-});
+  return { checkoutUrl, result };
+}
 
-app.post("/api/payment/paylink/confirm", async (req, res) => {
+async function verifyFatoraPayment(orderId, transactionId = "") {
+  const payload = { order_id: String(orderId) };
+  if (transactionId) payload.transaction_id = String(transactionId);
+  const result = await fatoraRequest("/payments/verify", payload);
+  return Array.isArray(result) ? result[0] || {} : result;
+}
+
+function fatoraPaymentIsValid(payment, expected) {
+  if (!payment || String(payment.order_id || "") !== String(expected.orderId)) return false;
+  if (String(payment.payment_status || "").toUpperCase() !== "SUCCESS") return false;
+  const amount = Number(payment.amount);
+  if (!Number.isFinite(amount) || Math.abs(amount - Number(expected.amount)) > 0.01) return false;
+  if (String(payment.currency || "").toUpperCase() !== String(expected.currency).toUpperCase()) return false;
+  const requiredMode = String(process.env.FATORA_MODE || "live").trim().toLowerCase();
+  const returnedMode = String(payment.mode || "").trim().toLowerCase();
+  if (returnedMode && requiredMode && returnedMode !== requiredMode) return false;
+  return true;
+}
+
+app.post("/api/payment/fatora/create", async (req, res) => {
+  let orderId = "";
   try {
     const user = await getSessionUser(req.headers["x-session-token"]);
-    if (!user) return res.status(401).json({ success: false, error: "login_required" });
-    const transactionNo = String(req.body?.transactionNo || "").trim();
-    if (!transactionNo) return res.status(400).json({ success: false, error: "transaction_required" });
-    const invoice = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(transactionNo)}`);
-    const paid = String(invoice.orderStatus || "").toLowerCase() === "paid";
-    if (!paid) return res.status(400).json({ success: false, error: "payment_not_paid" });
-    const expiry = Math.max(Date.now(), Number(user.premium_expiry) || 0) + 30 * 24 * 60 * 60 * 1000;
-    await db.query("UPDATE users SET premium_expiry=$1 WHERE email=$2", [expiry, user.email]);
+    if (!user) return res.status(401).json({ ok: false, error: "login_required" });
+    const setting = await db.query("SELECT value FROM settings WHERE key=$1 LIMIT 1", ["subscriptionPrice"]);
+    const configuredAmount = Number(setting.rows[0]?.value);
+    const amount = Number.isFinite(configuredAmount) && configuredAmount >= 1
+      ? Number(configuredAmount.toFixed(2))
+      : 29.99;
+    orderId = `APLUS-${Date.now()}-${randomBytes(6).toString("hex")}`;
+    await db.query(
+      `INSERT INTO fatora_subscription_payments
+       (order_id,user_email,amount,currency,status,created_at)
+       VALUES ($1,$2,$3,$4,'pending',$5)`,
+      [orderId, String(user.email).trim().toLowerCase(), amount, FATORA_CURRENCY, Date.now()]
+    );
+    const checkout = await createFatoraCheckout({
+      orderId,
+      amount,
+      user,
+      note: "A+ Medical monthly subscription",
+      successQuery: { payment: "fatora", kind: "subscription" },
+      failureQuery: { payment: "fatora", kind: "subscription", status: "failed" },
+    });
+    res.json({ ok: true, url: checkout.checkoutUrl, orderId, amount, currency: FATORA_CURRENCY });
+  } catch (error) {
+    if (orderId) {
+      await db.query(
+        "UPDATE fatora_subscription_payments SET status='failed' WHERE order_id=$1 AND status='pending'",
+        [orderId]
+      ).catch(() => {});
+    }
+    console.error("FATORA_SUBSCRIPTION_CREATE:", error?.message || error);
+    res.status(502).json({ ok: false, error: "payment_invoice_failed" });
+  }
+});
+
+app.post("/api/payment/fatora/confirm", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user) return res.status(401).json({ ok: false, error: "login_required" });
+    const orderId = String(req.body?.orderId || req.body?.order_id || "").trim();
+    const transactionId = String(req.body?.transactionId || req.body?.transaction_id || "").trim();
+    if (!orderId) return res.status(400).json({ ok: false, error: "order_required" });
+    const orderResult = await db.query(
+      `SELECT * FROM fatora_subscription_payments
+       WHERE order_id=$1 AND user_email=$2 LIMIT 1`,
+      [orderId, String(user.email).trim().toLowerCase()]
+    );
+    if (!orderResult.rows.length) return res.status(404).json({ ok: false, error: "payment_not_found" });
+    const order = orderResult.rows[0];
+    if (order.status === "paid") {
+      const current = await db.query("SELECT premium_expiry FROM users WHERE email=$1", [user.email]);
+      return res.json({ ok: true, paid: true, premiumExpiry: Number(current.rows[0]?.premium_expiry) || 0 });
+    }
+    const payment = await verifyFatoraPayment(orderId, transactionId);
+    if (!fatoraPaymentIsValid(payment, {
+      orderId,
+      amount: Number(order.amount),
+      currency: order.currency,
+    })) {
+      return res.status(400).json({ ok: false, error: "payment_not_verified" });
+    }
+    const now = Date.now();
+    const result = await withDbTransaction(async (client) => {
+      const lockedOrder = await client.query(
+        "SELECT * FROM fatora_subscription_payments WHERE order_id=$1 FOR UPDATE",
+        [orderId]
+      );
+      if (!lockedOrder.rows.length) throw new Error("payment_not_found");
+      if (lockedOrder.rows[0].status === "paid") {
+        const existingUser = await client.query("SELECT premium_expiry FROM users WHERE email=$1", [user.email]);
+        return { alreadyPaid: true, premiumExpiry: Number(existingUser.rows[0]?.premium_expiry) || 0 };
+      }
+      const lockedUser = await client.query("SELECT premium_expiry FROM users WHERE email=$1 FOR UPDATE", [user.email]);
+      if (!lockedUser.rows.length) throw new Error("user_not_found");
+      const expiry = Math.max(now, Number(lockedUser.rows[0].premium_expiry) || 0) + 30 * 24 * 60 * 60 * 1000;
+      await client.query("UPDATE users SET premium_expiry=$1 WHERE email=$2", [expiry, user.email]);
+      await client.query(
+        `UPDATE fatora_subscription_payments
+         SET status='paid',provider_transaction_id=$1,paid_at=$2
+         WHERE order_id=$3 AND status='pending'`,
+        [String(payment.transaction_id || transactionId).slice(0, 160), now, orderId]
+      );
+      return { alreadyPaid: false, premiumExpiry: expiry };
+    });
     invalidateSessionCache(user.email);
-    broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: expiry });
-    res.json({ success: true, premiumExpiry: expiry });
-  } catch (e) {
-    console.error("PAYLINK_CONFIRM:", e.message);
-    res.status(502).json({ success: false, error: "payment_confirmation_failed" });
+    if (!result.alreadyPaid) {
+      broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: result.premiumExpiry });
+    }
+    res.json({ ok: true, paid: true, premiumExpiry: result.premiumExpiry });
+  } catch (error) {
+    console.error("FATORA_SUBSCRIPTION_CONFIRM:", error?.message || error);
+    res.status(502).json({ ok: false, error: "payment_confirmation_failed" });
   }
 });
 
@@ -5565,38 +5650,27 @@ app.post("/api/private-tutors/:id/payment/create", async (req, res) => {
     if (!plan || !Number.isFinite(amount) || amount < 5) {
       return res.status(400).json({ ok: false, msg: "خيار الدفع غير متاح لهذا المعلم" });
     }
-    const orderNumber = `TUTOR-${Date.now()}-${randomBytes(3).toString("hex")}`;
-    const invoice = await paylinkFetch("/api/addInvoice", {
-      method: "POST",
-      body: JSON.stringify({
-        amount: Number(amount.toFixed(2)),
-        currency: "SAR",
-        orderNumber,
-        clientName: String(user.full_name || user.email || "A+ Student").slice(0, 100),
-        clientEmail: user.email,
-        clientMobile: String(req.body?.mobile || "0500000000"),
-        callBackUrl: `${(process.env.FRONTEND_URL || "https://aplus.blog").replace(/\/$/, "")}/?payment=tutor`,
-        note: `A+ Medical - ${tutor.name} - ${plan === "month" ? "اشتراك شهر" : "شرح واحد"}`,
-        products: [{
-          title: `${tutor.name} - ${plan === "month" ? "اشتراك شهر" : "شرح واحد"}`,
-          price: Number(amount.toFixed(2)),
-          qty: 1,
-          isDigital: true
-        }]
-      })
+    const orderNumber = `TUTOR-${Date.now()}-${randomBytes(6).toString("hex")}`;
+    const checkout = await createFatoraCheckout({
+      orderId: orderNumber,
+      amount,
+      user,
+      note: `A+ Medical - ${tutor.name} - ${plan === "month" ? "اشتراك شهر" : "شرح واحد"}`,
+      successQuery: { payment: "fatora", kind: "tutor", tutor_id: tutor.id },
+      failureQuery: { payment: "fatora", kind: "tutor", tutor_id: tutor.id, status: "failed" },
     });
-    if (!invoice.url || !invoice.transactionNo) throw new Error("Paylink returned an invalid invoice");
     await db.query(
       `INSERT INTO private_tutor_payments
        (id,transaction_no,order_number,tutor_id,student_email,plan,amount,status,lessons_remaining,expires_at,created_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0,0,$8)`,
-      [privateTutorId(), String(invoice.transactionNo), orderNumber, tutor.id,
+      [privateTutorId(), orderNumber, orderNumber, tutor.id,
         String(user.email).toLowerCase(), plan, Number(amount.toFixed(2)), Date.now()]
     );
     res.json({
       ok: true,
-      url: invoice.url,
-      transactionNo: String(invoice.transactionNo),
+      url: checkout.checkoutUrl,
+      transactionNo: orderNumber,
+      orderId: orderNumber,
       plan,
       amount: Number(amount.toFixed(2)),
       tutorName: tutor.name
@@ -5611,7 +5685,8 @@ app.post("/api/private-tutors/:id/payment/confirm", async (req, res) => {
   try {
     const user = await privateTutorUser(req);
     if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
-    const transactionNo = String(req.body?.transactionNo || "").trim();
+    const transactionNo = String(req.body?.transactionNo || req.body?.orderId || req.body?.order_id || "").trim();
+    const transactionId = String(req.body?.transactionId || req.body?.transaction_id || "").trim();
     if (!transactionNo) return res.status(400).json({ ok: false, msg: "رقم العملية مطلوب" });
     const paymentResult = await db.query(
       `SELECT p.*, t.name AS tutor_name
@@ -5625,11 +5700,12 @@ app.post("/api/private-tutors/:id/payment/confirm", async (req, res) => {
       const access = await tutorPaymentPlan(payment.tutor_id, user.email);
       return res.json({ ok: true, paid: true, access });
     }
-    const invoice = await paylinkFetch(`/api/getInvoice/${encodeURIComponent(transactionNo)}`);
-    const paid = String(invoice.orderStatus || "").toLowerCase() === "paid";
-    if (!paid) return res.status(400).json({ ok: false, msg: "لم يتم تأكيد الدفع بعد" });
-    const invoiceAmount = Number(invoice.amount);
-    if (Number.isFinite(invoiceAmount) && Math.abs(invoiceAmount - Number(payment.amount)) > 0.01) {
+    const invoice = await verifyFatoraPayment(transactionNo, transactionId);
+    if (!fatoraPaymentIsValid(invoice, {
+      orderId: transactionNo,
+      amount: Number(payment.amount),
+      currency: FATORA_CURRENCY,
+    })) {
       return res.status(400).json({ ok: false, msg: "قيمة الفاتورة لا تطابق سعر الخدمة" });
     }
     const now = Date.now();
