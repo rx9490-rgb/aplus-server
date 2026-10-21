@@ -457,6 +457,48 @@ async function initDB() {
       ON app_errors(status, created_at DESC);
   `);
 
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS admin_print_forms (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      assigned_email TEXT NOT NULL DEFAULT '',
+      details TEXT NOT NULL DEFAULT '',
+      created_by TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      printed_at BIGINT NOT NULL DEFAULT 0,
+      expires_at BIGINT NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'draft',
+      reserved_by TEXT NOT NULL DEFAULT '',
+      reserved_until BIGINT NOT NULL DEFAULT 0,
+      used_at BIGINT NOT NULL DEFAULT 0,
+      used_by TEXT NOT NULL DEFAULT '',
+      used_path TEXT NOT NULL DEFAULT '',
+      used_method TEXT NOT NULL DEFAULT '',
+      document_type TEXT NOT NULL DEFAULT 'إجراء إداري',
+      recipient TEXT NOT NULL DEFAULT '',
+      subject TEXT NOT NULL DEFAULT '',
+      document_link TEXT NOT NULL DEFAULT '',
+      attachment_name TEXT NOT NULL DEFAULT '',
+      attachment_mime TEXT NOT NULL DEFAULT '',
+      attachment_data TEXT NOT NULL DEFAULT '',
+      attachment_size INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS admin_print_forms_status_created_idx
+      ON admin_print_forms(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS admin_print_forms_assigned_status_idx
+      ON admin_print_forms(assigned_email, status, created_at DESC);
+  `);
+  await db.query(`
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS document_type TEXT NOT NULL DEFAULT 'إجراء إداري';
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS recipient TEXT NOT NULL DEFAULT '';
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT '';
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS document_link TEXT NOT NULL DEFAULT '';
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_name TEXT NOT NULL DEFAULT '';
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_mime TEXT NOT NULL DEFAULT '';
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_data TEXT NOT NULL DEFAULT '';
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_size INTEGER NOT NULL DEFAULT 0;
+  `);
+
   try {
     await db.query(
       `INSERT INTO community_members (email, display_name, joined_at)
@@ -685,6 +727,42 @@ async function getMonitoringAdmin(req) {
   const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
   if (user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)) return user;
   return user.is_moderator && sanitizePermissions(user.permissions).canManageErrors === true ? user : null;
+}
+
+async function getPrintFormActor(req, allowDashboardModerator = false) {
+  const token = String(req.headers["x-session-token"] || "");
+  const user = token ? await getSessionUser(token) : null;
+  if (!user || user.banned) return null;
+  const email = String(user.email || "").trim().toLowerCase();
+  const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  const isManager = !!(
+    user.is_admin || user.isAdmin ||
+    user.is_super_admin || user.isSuperAdmin ||
+    (configuredAdminEmail && email === configuredAdminEmail)
+  );
+  if (isManager) return { user, email, isManager: true };
+  if (allowDashboardModerator &&
+      (user.is_moderator || user.isModerator) &&
+      sanitizePermissions(user.permissions).canViewDashboard === true) {
+    return { user, email, isManager: false };
+  }
+  return null;
+}
+
+function isAdminManagementMutation(req) {
+  const method = String(req.method || "GET").toUpperCase();
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(method)) return false;
+  const path = String(req.originalUrl || req.path || "").split("?")[0].replace(/\/+$/, "");
+  if (/^\/api\/admin\//.test(path)) return !/^\/api\/admin\/print-forms(?:\/|$)/.test(path);
+  if (path === "/api/auth/admin-create") return true;
+  if (path === "/api/broadcast") return true;
+  if (path === "/api/settings") return true;
+  if (path === "/api/ads" || /^\/api\/ads\/[^/]+$/.test(path)) return true;
+  if (path === "/api/codes/generate" || /^\/api\/codes\/[^/]+$/.test(path)) return true;
+  if (/^\/api\/feedback\/[^/]+(?:\/read)?$/.test(path)) return true;
+  if (/^\/api\/users\/[^/]+(?:\/(?:ban|unlock|role|premium))?$/.test(path) &&
+      !/^\/api\/users\/(?:study-reward|game-reward)$/.test(path)) return true;
+  return false;
 }
 
 // حماية استخدام الذكاء الاصطناعي — لا تسمح لأي شخص باستنزاف مفتاح OpenRouter
@@ -1437,7 +1515,7 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type","Authorization","x-session-token",
-    "x-admin-key","Accept","Cache-Control","X-Requested-With"
+    "x-admin-key","x-aplus-print-id","Accept","Cache-Control","X-Requested-With"
   ],
   exposedHeaders: ["x-session-token"],
   optionsSuccessStatus: 204,
@@ -1489,6 +1567,85 @@ app.use("/api/openrouter", rateLimit({
 
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ extended: true, limit: "100mb" }));
+
+// كل تغيير إداري يحتاج نموذجاً مطبوعاً مسبقاً من المدير.
+app.use(async (req, res, next) => {
+  if (!String(req.path || "").startsWith("/api/")) return next();
+  if (!isAdminManagementMutation(req)) return next();
+  try {
+    if (!(await isAdminRequest(req))) return next();
+    const printId = String(req.headers["x-aplus-print-id"] || "").trim().slice(0, 80);
+    if (!printId) {
+      return res.status(428).json({
+        ok: false,
+        error: "admin_print_required",
+        msg: "يجب تفعيل نموذج طباعة معتمد قبل تنفيذ الإجراء الإداري",
+      });
+    }
+
+    const token = String(req.headers["x-session-token"] || "");
+    const actor = req.adminActor || (token ? await getSessionUser(token) : null);
+    const actorEmail = String(actor?.email || "").trim().toLowerCase();
+    const reservationId = randomBytes(12).toString("hex");
+    const now = Date.now();
+    const path = String(req.originalUrl || req.path || "").split("?")[0].slice(0, 300);
+    const method = String(req.method || "").toUpperCase().slice(0, 12);
+    const reserved = await db.query(
+      `UPDATE admin_print_forms
+       SET reserved_by=$2, reserved_until=$3
+       WHERE id=$1 AND status='printed' AND used_at=0 AND expires_at>$4
+         AND (assigned_email='' OR LOWER(assigned_email)=LOWER($5))
+         AND (reserved_until=0 OR reserved_until<$4)
+       RETURNING id`,
+      [printId, reservationId, now + 60_000, now, actorEmail]
+    );
+    if (!reserved.rowCount) {
+      return res.status(428).json({
+        ok: false,
+        error: "admin_print_invalid",
+        msg: "نموذج الطباعة غير صالح أو منتهي أو مخصص لموظف آخر",
+      });
+    }
+
+    req.aplusPrintAuthorization = {
+      id: printId,
+      reservationId,
+      actorEmail,
+      path,
+      method,
+    };
+    res.once("finish", () => {
+      const authorization = req.aplusPrintAuthorization;
+      if (!authorization) return;
+      const succeeded = res.statusCode >= 200 && res.statusCode < 400;
+      const update = succeeded
+        ? `UPDATE admin_print_forms
+           SET status='used', used_at=$1, used_by=$2, used_path=$3, used_method=$4,
+               reserved_by='', reserved_until=0
+           WHERE id=$5 AND reserved_by=$6`
+        : `UPDATE admin_print_forms
+           SET reserved_by='', reserved_until=0
+           WHERE id=$1 AND reserved_by=$2`;
+      const values = succeeded
+        ? [Date.now(), authorization.actorEmail, authorization.path, authorization.method, authorization.id, authorization.reservationId]
+        : [authorization.id, authorization.reservationId];
+      void db.query(update, values).catch((error) => {
+        console.warn("admin print authorization finalization failed:", error?.message || error);
+      });
+      if (succeeded) {
+        void auditLog("admin_print_form_used", authorization.actorEmail, {
+          printFormId: authorization.id,
+          path: authorization.path,
+          method: authorization.method,
+        });
+      }
+    });
+    next();
+  } catch (error) {
+    console.error("admin print authorization check failed:", error?.message || error);
+    res.status(503).json({ ok: false, error: "admin_print_service_unavailable", msg: "تعذر التحقق من نموذج الطباعة" });
+  }
+});
 
 // يضيف رقم دعم ثابتاً لكل استجابة خطأ، ويسجل استجابات الخادم 5xx تلقائياً.
 app.use((req, res, next) => {
@@ -1546,6 +1703,223 @@ app.get("/api/healthz", (_req, res) => {
     return res.status(503).json({ status: "starting", message: "قاعدة البيانات قيد التشغيل" });
   }
   res.json({ status: "ok", time: Date.now(), clients: sseClients.size });
+});
+
+// نماذج الطباعة الإدارية — ينشئها المدير قبل أي تغيير إداري.
+function formatAdminPrintForm(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    assignedEmail: row.assigned_email || "",
+    details: row.details || "",
+    createdBy: row.created_by,
+    createdAt: Number(row.created_at) || 0,
+    printedAt: Number(row.printed_at) || 0,
+    expiresAt: Number(row.expires_at) || 0,
+    status: row.status,
+    usedAt: Number(row.used_at) || 0,
+    usedBy: row.used_by || "",
+    usedPath: row.used_path || "",
+    usedMethod: row.used_method || "",
+    documentType: row.document_type || "إجراء إداري",
+    recipient: row.recipient || "",
+    subject: row.subject || "",
+    link: row.document_link || "",
+    attachmentName: row.attachment_name || "",
+    attachmentMime: row.attachment_mime || "",
+    attachmentSize: Number(row.attachment_size) || 0,
+  };
+}
+
+app.get("/api/admin/print-forms", async (req, res) => {
+  try {
+    const actor = await getPrintFormActor(req, true);
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const result = actor.isManager
+      ? await db.query(
+          `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,expires_at,status,
+                  used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
+                  attachment_name,attachment_mime,attachment_size
+           FROM admin_print_forms ORDER BY created_at DESC LIMIT 50`
+        )
+      : await db.query(
+          `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,expires_at,status,
+                  used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
+                  attachment_name,attachment_mime,attachment_size
+           FROM admin_print_forms
+           WHERE status='printed' AND used_at=0 AND expires_at>$1
+             AND (assigned_email='' OR LOWER(assigned_email)=LOWER($2))
+           ORDER BY created_at DESC LIMIT 50`,
+          [Date.now(), actor.email]
+        );
+    res.json({ ok: true, forms: result.rows.map(formatAdminPrintForm) });
+  } catch (error) {
+    console.error("admin print forms list failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "print_forms_list_failed", msg: "تعذر تحميل نماذج الطباعة" });
+  }
+});
+
+app.get("/api/admin/print-forms/:id/attachment", async (req, res) => {
+  try {
+    const actor = await getPrintFormActor(req, true);
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
+    const result = await db.query(
+      `SELECT id,assigned_email,status,expires_at,used_at,attachment_name,attachment_mime,attachment_data,attachment_size
+       FROM admin_print_forms WHERE id=$1`,
+      [id]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "نموذج الطباعة غير موجود" });
+    const form = result.rows[0];
+    if (!actor.isManager) {
+      if (form.assigned_email && form.assigned_email.toLowerCase() !== actor.email) {
+        return res.status(403).json({ ok: false, error: "print_form_assigned_to_other", msg: "هذا النموذج مخصص لموظف آخر" });
+      }
+      if (form.status !== "printed" || Number(form.used_at) > 0 || Number(form.expires_at) <= Date.now()) {
+        return res.status(409).json({ ok: false, error: "print_form_unavailable", msg: "المرفق متاح للنموذج المطبوع غير المنتهي فقط" });
+      }
+    }
+    if (!form.attachment_data) return res.status(404).json({ ok: false, error: "attachment_not_found", msg: "لا يوجد مرفق لهذا النموذج" });
+    res.json({
+      ok: true,
+      attachment: {
+        name: form.attachment_name,
+        mime: form.attachment_mime,
+        size: Number(form.attachment_size) || 0,
+        data: form.attachment_data,
+      },
+    });
+  } catch (error) {
+    console.error("admin print attachment fetch failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "print_attachment_fetch_failed", msg: "تعذر تحميل المرفق" });
+  }
+});
+
+app.post("/api/admin/print-forms", async (req, res) => {
+  try {
+    const actor = await getPrintFormActor(req, false);
+    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "إنشاء نموذج الطباعة للمدير فقط" });
+    const title = String(req.body?.title || "").trim().slice(0, 180);
+    const details = String(req.body?.details || "").trim().slice(0, 12000);
+    const assignedEmail = String(req.body?.assignedEmail || "").trim().toLowerCase().slice(0, 254);
+    const allowedTypes = ["letter", "announcement", "site_ad", "employee", "upload", "other"];
+    const requestedType = String(req.body?.documentType || "other").trim().slice(0, 40);
+    const documentType = allowedTypes.includes(requestedType) ? requestedType : "other";
+    const recipient = String(req.body?.recipient || "").trim().slice(0, 250);
+    const subject = String(req.body?.subject || "").trim().slice(0, 250);
+    const documentLink = String(req.body?.link || "").trim().slice(0, 1000);
+    if (documentLink) {
+      try {
+        const parsedLink = new URL(documentLink);
+        if (!["http:", "https:"].includes(parsedLink.protocol)) throw new Error("invalid protocol");
+      } catch {
+        return res.status(400).json({ ok: false, error: "invalid_document_link", msg: "الرابط يجب أن يبدأ بـ http أو https" });
+      }
+    }
+    const attachmentInput = req.body?.attachment && typeof req.body.attachment === "object" ? req.body.attachment : null;
+    let attachmentName = "";
+    let attachmentMime = "";
+    let attachmentData = "";
+    let attachmentSize = 0;
+    if (attachmentInput?.data) {
+      const dataUrl = String(attachmentInput.data);
+      if (dataUrl.length > 7 * 1024 * 1024 + 256) {
+        return res.status(400).json({ ok: false, error: "print_attachment_too_large", msg: "حجم المرفق الأقصى 5 ميجابايت" });
+      }
+      const match = /^data:(application\/pdf|application\/msword|application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document|image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(dataUrl);
+      if (!match) {
+        return res.status(400).json({ ok: false, error: "invalid_print_attachment", msg: "المرفق يجب أن يكون PDF أو DOC أو DOCX أو صورة PNG أو JPG أو WEBP" });
+      }
+      const decoded = Buffer.from(match[2], "base64");
+      if (!decoded.length || decoded.length > 5 * 1024 * 1024 || decoded.toString("base64") !== match[2]) {
+        return res.status(400).json({ ok: false, error: "print_attachment_too_large", msg: "حجم المرفق الأقصى 5 ميجابايت" });
+      }
+      attachmentName = String(attachmentInput.name || "attachment").replace(/[\\/\u0000-\u001f\u007f]/g, "_").trim().slice(0, 200) || "attachment";
+      attachmentMime = match[1];
+      attachmentData = dataUrl;
+      attachmentSize = decoded.length;
+    }
+    if (!title || !details) {
+      return res.status(400).json({ ok: false, error: "print_form_fields_required", msg: "اكتب نص المستند أو تفاصيل الإجراء قبل إنشائه" });
+    }
+    const id = randomBytes(10).toString("hex").toUpperCase();
+    const now = Date.now();
+    const result = await db.query(
+      `INSERT INTO admin_print_forms
+       (id,title,assigned_email,details,created_by,created_at,status,document_type,recipient,subject,document_link,attachment_name,attachment_mime,attachment_data,attachment_size)
+       VALUES ($1,$2,$3,$4,$5,$6,'draft',$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING *`,
+      [id, title, assignedEmail, details, actor.email, now, documentType, recipient, subject, documentLink, attachmentName, attachmentMime, attachmentData, attachmentSize]
+    );
+    await auditLog("admin_print_form_created", actor.email, {
+      printFormId: id,
+      title,
+      documentType,
+      recipient,
+      subject,
+      documentLink,
+      assignedEmail,
+      attachmentName,
+    });
+    res.status(201).json({ ok: true, form: formatAdminPrintForm(result.rows[0]) });
+  } catch (error) {
+    console.error("admin print form create failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "print_form_create_failed", msg: "تعذر إنشاء نموذج الطباعة" });
+  }
+});
+
+app.patch("/api/admin/print-forms/:id/printed", async (req, res) => {
+  try {
+    const actor = await getPrintFormActor(req, false);
+    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "تأكيد الطباعة للمدير فقط" });
+    const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
+    const now = Date.now();
+    const result = await db.query(
+      `UPDATE admin_print_forms
+       SET status='printed', printed_at=$2, expires_at=$3
+       WHERE id=$1 AND status='draft'
+       RETURNING *`,
+      [id, now, now + 24 * 60 * 60_000]
+    );
+    if (!result.rowCount) {
+      const existing = await db.query("SELECT * FROM admin_print_forms WHERE id=$1", [id]);
+      if (!existing.rowCount) return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "نموذج الطباعة غير موجود" });
+      if (existing.rows[0].status === "printed") {
+        return res.json({ ok: true, form: formatAdminPrintForm(existing.rows[0]) });
+      }
+      return res.status(409).json({ ok: false, error: "print_form_unavailable", msg: "تعذر اعتماد هذا النموذج" });
+    }
+    await auditLog("admin_print_form_printed", actor.email, { printFormId: id });
+    res.json({ ok: true, form: formatAdminPrintForm(result.rows[0]) });
+  } catch (error) {
+    console.error("admin print form confirmation failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "print_form_confirmation_failed", msg: "تعذر تأكيد الطباعة" });
+  }
+});
+
+app.post("/api/admin/print-forms/:id/activate", async (req, res) => {
+  try {
+    const actor = await getPrintFormActor(req, true);
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
+    const result = await db.query(
+      `SELECT id,assigned_email,status,expires_at,used_at
+       FROM admin_print_forms WHERE id=$1`,
+      [id]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "رقم النموذج غير موجود" });
+    const form = result.rows[0];
+    if (form.status !== "printed" || Number(form.used_at) > 0 || Number(form.expires_at) <= Date.now()) {
+      return res.status(409).json({ ok: false, error: "print_form_unavailable", msg: "النموذج غير مطبوع أو منتهي أو مستخدم" });
+    }
+    if (form.assigned_email && form.assigned_email.toLowerCase() !== actor.email) {
+      return res.status(403).json({ ok: false, error: "print_form_assigned_to_other", msg: "هذا النموذج مخصص لموظف آخر" });
+    }
+    res.json({ ok: true, printFormId: form.id });
+  } catch (error) {
+    console.error("admin print form activation failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "print_form_activation_failed", msg: "تعذر تفعيل النموذج" });
+  }
 });
 
 // يسجل أخطاء المتصفح لجميع المستخدمين، مع حد للحجم والمعدل ومن دون قبول هوية يرسلها العميل.
