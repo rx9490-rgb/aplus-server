@@ -1868,6 +1868,41 @@ app.post("/api/admin/print-forms", async (req, res) => {
   }
 });
 
+app.delete("/api/admin/print-forms/:id", async (req, res) => {
+  try {
+    const actor = await getPrintFormActor(req, false);
+    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "حذف المستند للمدير فقط" });
+    const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
+    const existing = await db.query(
+      "SELECT id,title,status,used_at,reserved_until FROM admin_print_forms WHERE id=$1",
+      [id]
+    );
+    if (!existing.rowCount) return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "المستند غير موجود" });
+    const form = existing.rows[0];
+    if (Number(form.used_at) > 0 || form.status === "used") {
+      return res.status(409).json({ ok: false, error: "print_form_already_used", msg: "لا يمكن حذف مستند استُخدم لتنفيذ إجراء إداري" });
+    }
+    const deleted = await db.query(
+      `DELETE FROM admin_print_forms
+       WHERE id=$1 AND used_at=0 AND status<>'used' AND reserved_until<=$2
+       RETURNING id`,
+      [id, Date.now()]
+    );
+    if (!deleted.rowCount) {
+      return res.status(409).json({ ok: false, error: "print_form_in_use", msg: "لا يمكن حذف المستند أثناء استخدامه" });
+    }
+    await auditLog("admin_print_form_deleted", actor.email, {
+      printFormId: id,
+      title: form.title,
+      status: form.status,
+    });
+    res.json({ ok: true, deleted: true });
+  } catch (error) {
+    console.error("admin print form delete failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "print_form_delete_failed", msg: "تعذر حذف المستند" });
+  }
+});
+
 app.patch("/api/admin/print-forms/:id/printed", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
