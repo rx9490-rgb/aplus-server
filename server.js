@@ -5889,7 +5889,6 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
     threeDSecure: true,
     save_card: false,
     description: String(description || "A+ Medical payment").slice(0, 120),
-    order: { id: String(orderId) },
     metadata: {
       udf1: String(orderId),
       udf2: email.slice(0, 100),
