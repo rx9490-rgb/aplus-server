@@ -498,6 +498,24 @@ async function initDB() {
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_data TEXT NOT NULL DEFAULT '';
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_size INTEGER NOT NULL DEFAULT 0;
   `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS moderator_messages (
+      id TEXT PRIMARY KEY,
+      sender_email TEXT NOT NULL REFERENCES users(email) ON DELETE CASCADE,
+      recipient_email TEXT NOT NULL REFERENCES users(email) ON DELETE CASCADE,
+      message TEXT NOT NULL DEFAULT '',
+      attachment_name TEXT NOT NULL DEFAULT '',
+      attachment_mime TEXT NOT NULL DEFAULT '',
+      attachment_data TEXT NOT NULL DEFAULT '',
+      attachment_size INTEGER NOT NULL DEFAULT 0,
+      created_at BIGINT NOT NULL,
+      read_at BIGINT NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS moderator_messages_thread_idx
+      ON moderator_messages(sender_email, recipient_email, created_at);
+    CREATE INDEX IF NOT EXISTS moderator_messages_unread_idx
+      ON moderator_messages(recipient_email, read_at, created_at DESC);
+  `);
 
   try {
     await db.query(
@@ -740,11 +758,14 @@ async function getPrintFormActor(req, allowDashboardModerator = false) {
     user.is_super_admin || user.isSuperAdmin ||
     (configuredAdminEmail && email === configuredAdminEmail)
   );
-  if (isManager) return { user, email, isManager: true };
-  if (allowDashboardModerator &&
-      (user.is_moderator || user.isModerator) &&
-      sanitizePermissions(user.permissions).canViewDashboard === true) {
-    return { user, email, isManager: false };
+  if (isManager) return { user, email, isManager: true, canUseStamp: true };
+  const isModerator = !!(user.is_moderator || user.isModerator);
+  const permissions = sanitizePermissions(user.permissions);
+  if (isModerator && permissions.canUseStamp === true) {
+    return { user, email, isManager: false, canUseStamp: true };
+  }
+  if (allowDashboardModerator && isModerator && permissions.canViewDashboard === true) {
+    return { user, email, isManager: false, canUseStamp: false };
   }
   return null;
 }
@@ -1224,7 +1245,7 @@ const MODERATOR_PERMISSION_KEYS = new Set([
   "canManageSettings", "canManageModerators", "canViewStats", "canManageServices",
   "canManageStore", "canManageDictionary", "canManageSocial", "canManageBanners",
   "canManageQuotes", "canManageServiceSettings", "canManageBans", "canManageApi",
-  "canManageTutors", "canManageErrors", "canSendBroadcasts"
+  "canManageTutors", "canManageErrors", "canSendBroadcasts", "canUseStamp"
 ]);
 
 function sanitizePermissions(value) {
@@ -1742,6 +1763,16 @@ app.get("/api/admin/print-forms", async (req, res) => {
                   attachment_name,attachment_mime,attachment_size
            FROM admin_print_forms ORDER BY created_at DESC LIMIT 50`
         )
+      : actor.canUseStamp
+      ? await db.query(
+          `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,expires_at,status,
+                  used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
+                  attachment_name,attachment_mime,attachment_size
+           FROM admin_print_forms
+           WHERE LOWER(created_by)=LOWER($1)
+           ORDER BY created_at DESC LIMIT 50`,
+          [actor.email]
+        )
       : await db.query(
           `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,expires_at,status,
                   used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
@@ -1765,13 +1796,13 @@ app.get("/api/admin/print-forms/:id/attachment", async (req, res) => {
     if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
     const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
     const result = await db.query(
-      `SELECT id,assigned_email,status,expires_at,used_at,attachment_name,attachment_mime,attachment_data,attachment_size
+      `SELECT id,assigned_email,created_by,status,expires_at,used_at,attachment_name,attachment_mime,attachment_data,attachment_size
        FROM admin_print_forms WHERE id=$1`,
       [id]
     );
     if (!result.rowCount) return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "نموذج الطباعة غير موجود" });
     const form = result.rows[0];
-    if (!actor.isManager) {
+    if (!actor.isManager && !(actor.canUseStamp && String(form.created_by || "").toLowerCase() === actor.email)) {
       if (form.assigned_email && form.assigned_email.toLowerCase() !== actor.email) {
         return res.status(403).json({ ok: false, error: "print_form_assigned_to_other", msg: "هذا النموذج مخصص لموظف آخر" });
       }
@@ -1798,7 +1829,7 @@ app.get("/api/admin/print-forms/:id/attachment", async (req, res) => {
 app.post("/api/admin/print-forms", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
-    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "إنشاء نموذج الطباعة للمدير فقط" });
+    if (!actor?.isManager && !actor?.canUseStamp) return res.status(403).json({ ok: false, error: "manager_required", msg: "إنشاء نموذج الطباعة للمدير أو الموظف المخوّل بالختم فقط" });
     const title = String(req.body?.title || "").trim().slice(0, 180);
     const details = String(req.body?.details || "").trim().slice(0, 12000);
     const assignedEmail = String(req.body?.assignedEmail || "").trim().toLowerCase().slice(0, 254);
@@ -1871,12 +1902,17 @@ app.post("/api/admin/print-forms", async (req, res) => {
 app.delete("/api/admin/print-forms/:id", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
-    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "حذف المستند للمدير فقط" });
+    if (!actor?.isManager && !actor?.canUseStamp) return res.status(403).json({ ok: false, error: "manager_required", msg: "حذف المستند للمخوّل بالختم فقط" });
     const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
-    const existing = await db.query(
-      "SELECT id,title,status,used_at,reserved_until FROM admin_print_forms WHERE id=$1",
-      [id]
-    );
+    const existing = actor.isManager
+      ? await db.query(
+          "SELECT id,title,status,used_at,reserved_until FROM admin_print_forms WHERE id=$1",
+          [id]
+        )
+      : await db.query(
+          "SELECT id,title,status,used_at,reserved_until FROM admin_print_forms WHERE id=$1 AND LOWER(created_by)=LOWER($2)",
+          [id, actor.email]
+        );
     if (!existing.rowCount) return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "المستند غير موجود" });
     const form = existing.rows[0];
     if (Number(form.used_at) > 0 || form.status === "used") {
@@ -1885,8 +1921,9 @@ app.delete("/api/admin/print-forms/:id", async (req, res) => {
     const deleted = await db.query(
       `DELETE FROM admin_print_forms
        WHERE id=$1 AND used_at=0 AND status<>'used' AND reserved_until<=$2
+         AND ($3::boolean OR LOWER(created_by)=LOWER($4))
        RETURNING id`,
-      [id, Date.now()]
+      [id, Date.now(), actor.isManager, actor.email]
     );
     if (!deleted.rowCount) {
       return res.status(409).json({ ok: false, error: "print_form_in_use", msg: "لا يمكن حذف المستند أثناء استخدامه" });
@@ -1906,18 +1943,20 @@ app.delete("/api/admin/print-forms/:id", async (req, res) => {
 app.patch("/api/admin/print-forms/:id/printed", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
-    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "تأكيد الطباعة للمدير فقط" });
+    if (!actor?.isManager && !actor?.canUseStamp) return res.status(403).json({ ok: false, error: "manager_required", msg: "تأكيد الطباعة للمخوّل بالختم فقط" });
     const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
     const now = Date.now();
     const result = await db.query(
       `UPDATE admin_print_forms
        SET status='printed', printed_at=$2, expires_at=$3
-       WHERE id=$1 AND status='draft'
+       WHERE id=$1 AND status='draft' AND ($4::boolean OR LOWER(created_by)=LOWER($5))
        RETURNING *`,
-      [id, now, now + 24 * 60 * 60_000]
+      [id, now, now + 24 * 60 * 60_000, actor.isManager, actor.email]
     );
     if (!result.rowCount) {
-      const existing = await db.query("SELECT * FROM admin_print_forms WHERE id=$1", [id]);
+      const existing = actor.isManager
+        ? await db.query("SELECT * FROM admin_print_forms WHERE id=$1", [id])
+        : await db.query("SELECT * FROM admin_print_forms WHERE id=$1 AND LOWER(created_by)=LOWER($2)", [id, actor.email]);
       if (!existing.rowCount) return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "نموذج الطباعة غير موجود" });
       if (existing.rows[0].status === "printed") {
         return res.json({ ok: true, form: formatAdminPrintForm(existing.rows[0]) });
@@ -1954,6 +1993,227 @@ app.post("/api/admin/print-forms/:id/activate", async (req, res) => {
   } catch (error) {
     console.error("admin print form activation failed:", error?.message || error);
     res.status(500).json({ ok: false, error: "print_form_activation_failed", msg: "تعذر تفعيل النموذج" });
+  }
+});
+
+function moderatorChatIsManager(user, email) {
+  const normalized = String(email || user?.email || "").trim().toLowerCase();
+  const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  return !!(
+    user?.is_admin || user?.isAdmin ||
+    user?.is_super_admin || user?.isSuperAdmin ||
+    (configuredAdminEmail && normalized === configuredAdminEmail)
+  );
+}
+
+async function getModeratorChatActor(req) {
+  const token = req.headers["x-session-token"];
+  if (!token) return null;
+  const user = await getSessionUser(token);
+  if (!user || user.banned) return null;
+  const email = String(user.email || "").trim();
+  if (!email) return null;
+  const isManager = moderatorChatIsManager(user, email);
+  const isModerator = !!(user.is_moderator || user.isModerator);
+  if (!isManager && !isModerator) return null;
+  return { user, email, isManager, isModerator };
+}
+
+async function getModeratorChatPeer(actor, requestedEmail) {
+  const email = String(requestedEmail || "").trim().toLowerCase().slice(0, 254);
+  if (!email || !email.includes("@")) return null;
+  const result = await db.query(
+    `SELECT email,full_name,is_admin,is_super_admin,is_moderator,banned,deleted_at
+     FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+    [email]
+  );
+  if (!result.rowCount) return null;
+  const peer = result.rows[0];
+  if (peer.banned || Number(peer.deleted_at) > 0) return null;
+  const peerIsManager = moderatorChatIsManager(peer, peer.email);
+  const peerIsModerator = !!peer.is_moderator && !peerIsManager;
+  if (actor.isManager ? !peerIsModerator : !peerIsManager) return null;
+  return peer;
+}
+
+function formatModeratorMessage(row) {
+  return {
+    id: row.id,
+    senderEmail: row.sender_email,
+    recipientEmail: row.recipient_email,
+    message: row.message || "",
+    attachmentName: row.attachment_name || "",
+    attachmentMime: row.attachment_mime || "",
+    attachmentSize: Number(row.attachment_size) || 0,
+    createdAt: Number(row.created_at) || 0,
+    readAt: Number(row.read_at) || 0,
+  };
+}
+
+app.get("/api/moderator-chat/contacts", async (req, res) => {
+  try {
+    const actor = await getModeratorChatActor(req);
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "التواصل متاح للمدير والمشرفين فقط" });
+    const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+    const result = actor.isManager
+      ? await db.query(
+          `SELECT u.email,u.full_name,
+                  (SELECT COUNT(*) FROM moderator_messages m
+                   WHERE m.sender_email=u.email AND m.recipient_email=$1 AND m.read_at=0) AS unread_count
+           FROM users u
+           WHERE u.is_moderator=TRUE AND COALESCE(u.is_admin,FALSE)=FALSE AND COALESCE(u.is_super_admin,FALSE)=FALSE
+             AND COALESCE(u.banned,FALSE)=FALSE AND COALESCE(u.deleted_at,0)=0
+           ORDER BY u.full_name,u.email`,
+          [actor.email]
+        )
+      : await db.query(
+          `SELECT u.email,u.full_name,
+                  (SELECT COUNT(*) FROM moderator_messages m
+                   WHERE m.sender_email=u.email AND m.recipient_email=$2 AND m.read_at=0) AS unread_count
+           FROM users u
+           WHERE (u.is_admin=TRUE OR u.is_super_admin=TRUE OR LOWER(u.email)=LOWER($1))
+             AND COALESCE(u.banned,FALSE)=FALSE AND COALESCE(u.deleted_at,0)=0
+           ORDER BY u.is_super_admin DESC,u.full_name,u.email`,
+          [adminEmail, actor.email]
+        );
+    res.json({
+      ok: true,
+      contacts: result.rows.map((row) => ({
+        email: row.email,
+        name: row.full_name || row.email,
+        unreadCount: Number(row.unread_count) || 0,
+      })),
+    });
+  } catch (error) {
+    console.error("moderator chat contacts failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "moderator_chat_contacts_failed", msg: "تعذر تحميل قائمة التواصل" });
+  }
+});
+
+app.get("/api/moderator-chat/messages", async (req, res) => {
+  try {
+    const actor = await getModeratorChatActor(req);
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const peer = await getModeratorChatPeer(actor, req.query.peer);
+    if (!peer) return res.status(404).json({ ok: false, error: "chat_peer_not_found", msg: "جهة التواصل غير متاحة" });
+    const now = Date.now();
+    await db.query(
+      `UPDATE moderator_messages SET read_at=$3
+       WHERE sender_email=$2 AND recipient_email=$1 AND read_at=0`,
+      [actor.email, peer.email, now]
+    );
+    const result = await db.query(
+      `SELECT id,sender_email,recipient_email,message,attachment_name,attachment_mime,
+              attachment_size,created_at,read_at
+       FROM moderator_messages
+       WHERE (sender_email=$1 AND recipient_email=$2)
+          OR (sender_email=$2 AND recipient_email=$1)
+       ORDER BY created_at ASC LIMIT 200`,
+      [actor.email, peer.email]
+    );
+    res.json({ ok: true, messages: result.rows.map(formatModeratorMessage) });
+  } catch (error) {
+    console.error("moderator chat messages failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "moderator_chat_messages_failed", msg: "تعذر تحميل الرسائل" });
+  }
+});
+
+app.post("/api/moderator-chat/messages", rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+}), async (req, res) => {
+  try {
+    const actor = await getModeratorChatActor(req);
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const peer = await getModeratorChatPeer(actor, req.body?.peer);
+    if (!peer) return res.status(404).json({ ok: false, error: "chat_peer_not_found", msg: "جهة التواصل غير متاحة" });
+    const message = String(req.body?.message || "").trim().slice(0, 4000);
+    const attachmentInput = req.body?.attachment && typeof req.body.attachment === "object" ? req.body.attachment : null;
+    let attachmentName = "";
+    let attachmentMime = "";
+    let attachmentData = "";
+    let attachmentSize = 0;
+    if (attachmentInput?.data) {
+      const dataUrl = String(attachmentInput.data);
+      if (dataUrl.length > 11 * 1024 * 1024) {
+        return res.status(400).json({ ok: false, error: "chat_attachment_too_large", msg: "الحد الأقصى للمرفق 8 ميجابايت" });
+      }
+      const match = /^data:([A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/]+={0,2})$/.exec(dataUrl);
+      const allowedMimes = new Set([
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "text/plain",
+        "text/csv",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+      ]);
+      if (!match || !allowedMimes.has(match[1])) {
+        return res.status(400).json({ ok: false, error: "invalid_chat_attachment", msg: "نوع الملف غير مسموح" });
+      }
+      const decoded = Buffer.from(match[2], "base64");
+      if (!decoded.length || decoded.length > 8 * 1024 * 1024 || decoded.toString("base64") !== match[2]) {
+        return res.status(400).json({ ok: false, error: "chat_attachment_too_large", msg: "الحد الأقصى للمرفق 8 ميجابايت" });
+      }
+      attachmentName = String(attachmentInput.name || "مرفق")
+        .replace(/[\\/\u0000-\u001f\u007f]/g, "_").trim().slice(0, 180) || "مرفق";
+      attachmentMime = match[1];
+      attachmentData = dataUrl;
+      attachmentSize = decoded.length;
+    }
+    if (!message && !attachmentData) {
+      return res.status(400).json({ ok: false, error: "empty_chat_message", msg: "اكتب رسالة أو أرفق ملفاً" });
+    }
+    const id = randomBytes(12).toString("hex");
+    const createdAt = Date.now();
+    const result = await db.query(
+      `INSERT INTO moderator_messages
+       (id,sender_email,recipient_email,message,attachment_name,attachment_mime,attachment_data,attachment_size,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING id,sender_email,recipient_email,message,attachment_name,attachment_mime,attachment_size,created_at,read_at`,
+      [id, actor.email, peer.email, message, attachmentName, attachmentMime, attachmentData, attachmentSize, createdAt]
+    );
+    res.status(201).json({ ok: true, message: formatModeratorMessage(result.rows[0]) });
+  } catch (error) {
+    console.error("moderator chat send failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "moderator_chat_send_failed", msg: "تعذر إرسال الرسالة" });
+  }
+});
+
+app.get("/api/moderator-chat/messages/:id/attachment", async (req, res) => {
+  try {
+    const actor = await getModeratorChatActor(req);
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const id = String(req.params.id || "").trim().slice(0, 80);
+    const result = await db.query(
+      `SELECT id,sender_email,recipient_email,attachment_name,attachment_mime,attachment_data,attachment_size
+       FROM moderator_messages WHERE id=$1 AND attachment_data<>'' LIMIT 1`,
+      [id]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "attachment_not_found", msg: "المرفق غير موجود" });
+    const row = result.rows[0];
+    if (row.sender_email !== actor.email && row.recipient_email !== actor.email) {
+      return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    }
+    res.json({
+      ok: true,
+      attachment: {
+        name: row.attachment_name,
+        mime: row.attachment_mime,
+        size: Number(row.attachment_size) || 0,
+        data: row.attachment_data,
+      },
+    });
+  } catch (error) {
+    console.error("moderator chat attachment failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "moderator_chat_attachment_failed", msg: "تعذر تحميل المرفق" });
   }
 });
 
