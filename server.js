@@ -5820,16 +5820,6 @@ const TAP_CURRENCY = /^[A-Z]{3}$/.test(
   ? String(process.env.TAP_CURRENCY || process.env.FATORA_CURRENCY || "SAR").trim().toUpperCase()
   : "SAR";
 
-app.get("/api/payment/tap/public-config", (_req, res) => {
-  const publicKey = String(process.env.TAP_PUBLIC_KEY || "").trim();
-  const merchantId = String(process.env.TAP_MERCHANT_ID || "").trim();
-  if (!publicKey || !merchantId) {
-    return res.status(503).json({ ok: false, error: "tap_public_config_missing" });
-  }
-  res.set("Cache-Control", "no-store");
-  res.json({ ok: true, publicKey, merchantId, currency: TAP_CURRENCY });
-});
-
 function tapFrontendUrl(query) {
   const base = String(process.env.FRONTEND_URL || "https://aplus.blog").replace(/\/+$/, "");
   return `${base}/?${new URLSearchParams(query || {}).toString()}`;
@@ -5882,10 +5872,7 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
     throw new Error("A valid customer phone number is required for Tap checkout");
   }
   const tapSourceId = String(sourceId || "src_card").trim();
-  if (
-    tapSourceId !== "src_card" &&
-    !/^tok_[A-Za-z0-9_-]{8,120}$/.test(tapSourceId)
-  ) {
+  if (!["src_card", "src_apple_pay"].includes(tapSourceId)) {
     throw new Error("Unsupported Tap payment source");
   }
   const fullName = String(user?.full_name || user?.name || email).trim().slice(0, 120);
@@ -5925,23 +5912,17 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
     redirect: { url: tapFrontendUrl(returnQuery) },
   });
   const checkoutUrl = String(charge?.transaction?.url || "");
-  const status = String(charge?.status || "").toUpperCase();
   let parsedUrl;
   try { parsedUrl = new URL(checkoutUrl); } catch {}
-  if (status !== "CAPTURED" && (
+  if (
     !parsedUrl ||
     parsedUrl.protocol !== "https:" ||
     !(parsedUrl.hostname === "tap.company" || parsedUrl.hostname.endsWith(".tap.company"))
-  )) {
+  ) {
     throw new Error("Tap returned an invalid checkout URL");
   }
   if (!String(charge?.id || "").trim()) throw new Error("Tap did not return a charge ID");
-  return {
-    checkoutUrl: status === "CAPTURED" ? "" : checkoutUrl,
-    chargeId: String(charge.id),
-    status,
-    charge
-  };
+  return { checkoutUrl, chargeId: String(charge.id), charge };
 }
 
 async function getTapCharge(chargeId) {
@@ -5996,15 +5977,7 @@ app.post("/api/payment/tap/create", async (req, res) => {
       "UPDATE tap_subscription_payments SET tap_charge_id=$1 WHERE order_id=$2 AND status='pending'",
       [checkout.chargeId, orderId]
     );
-    res.json({
-      ok: true,
-      url: checkout.checkoutUrl,
-      tapId: checkout.chargeId,
-      status: checkout.status,
-      orderId,
-      amount,
-      currency: TAP_CURRENCY
-    });
+    res.json({ ok: true, url: checkout.checkoutUrl, orderId, amount, currency: TAP_CURRENCY });
   } catch (error) {
     if (orderId) {
       await db.query(
@@ -6638,8 +6611,6 @@ app.post("/api/private-tutors/:id/payment/create", async (req, res) => {
     res.json({
       ok: true,
       url: checkout.checkoutUrl,
-      tapId: checkout.chargeId,
-      status: checkout.status,
       transactionNo: orderNumber,
       orderId: orderNumber,
       plan,
