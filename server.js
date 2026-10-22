@@ -319,6 +319,8 @@ async function initDB() {
       paid_at           BIGINT DEFAULT 0,
       created_at        BIGINT NOT NULL
     );
+    ALTER TABLE private_tutor_payments
+      ADD COLUMN IF NOT EXISTS tap_charge_id TEXT DEFAULT '';
     CREATE TABLE IF NOT EXISTS fatora_subscription_payments (
       order_id                 TEXT PRIMARY KEY,
       user_email               TEXT NOT NULL,
@@ -331,6 +333,18 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS fatora_subscription_payments_user_created_idx
       ON fatora_subscription_payments(user_email, created_at DESC);
+    CREATE TABLE IF NOT EXISTS tap_subscription_payments (
+      order_id                 TEXT PRIMARY KEY,
+      tap_charge_id            TEXT DEFAULT '',
+      user_email               TEXT NOT NULL,
+      amount                   NUMERIC(10,2) NOT NULL,
+      currency                 TEXT NOT NULL,
+      status                   TEXT NOT NULL DEFAULT 'pending',
+      created_at               BIGINT NOT NULL,
+      paid_at                  BIGINT DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS tap_subscription_payments_user_created_idx
+      ON tap_subscription_payments(user_email, created_at DESC);
     CREATE TABLE IF NOT EXISTS private_tutor_rooms (
       id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
       booking_id TEXT REFERENCES private_tutor_bookings(id) ON DELETE SET NULL,
@@ -5795,6 +5809,253 @@ app.post("/api/payment/fatora/confirm", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
+// Tap Payments — hosted checkout
+// Required server secrets: TAP_SECRET_KEY, TAP_MERCHANT_ID
+// Optional: TAP_CURRENCY=SAR, FRONTEND_URL=https://your-site.example
+// ══════════════════════════════════════════════
+const TAP_API_BASE = "https://api.tap.company/v2";
+const TAP_CURRENCY = /^[A-Z]{3}$/.test(
+  String(process.env.TAP_CURRENCY || process.env.FATORA_CURRENCY || "SAR").trim().toUpperCase()
+)
+  ? String(process.env.TAP_CURRENCY || process.env.FATORA_CURRENCY || "SAR").trim().toUpperCase()
+  : "SAR";
+
+function tapFrontendUrl(query) {
+  const base = String(process.env.FRONTEND_URL || "https://aplus.blog").replace(/\/+$/, "");
+  return `${base}/?${new URLSearchParams(query || {}).toString()}`;
+}
+
+async function tapRequest(endpoint, method = "POST", payload) {
+  const secretKey = String(process.env.TAP_SECRET_KEY || "").trim();
+  if (!secretKey) throw new Error("TAP_SECRET_KEY is not configured");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+  timeout.unref?.();
+  try {
+    const options = {
+      method,
+      headers: {
+        authorization: `Bearer ${secretKey}`,
+        "content-type": "application/json",
+        accept: "application/json",
+        lang_code: "ar",
+      },
+      signal: controller.signal,
+    };
+    if (payload !== undefined) options.body = JSON.stringify(payload);
+    const response = await fetch(`${TAP_API_BASE}${endpoint}`, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const providerMessage = String(
+        data?.errors?.[0]?.description || data?.errors?.[0]?.message || data?.message || ""
+      ).slice(0, 160);
+      const error = new Error(providerMessage || `Tap request failed (${response.status})`);
+      error.statusCode = response.status;
+      throw error;
+    }
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function createTapCharge({ orderId, amount, user, phone, description, kind, tutorId, sourceId }) {
+  const secretKey = String(process.env.TAP_SECRET_KEY || "").trim();
+  const merchantId = String(process.env.TAP_MERCHANT_ID || "").trim();
+  if (!secretKey) throw new Error("TAP_SECRET_KEY is not configured");
+  if (!merchantId) throw new Error("TAP_MERCHANT_ID is not configured");
+  const email = String(user?.email || "").trim().toLowerCase();
+  if (!email) throw new Error("A customer email is required for Tap checkout");
+  const phoneCountryCode = String(phone?.countryCode || phone?.country_code || "").replace(/\D/g, "").slice(0, 3);
+  const phoneNumber = String(phone?.number || "").replace(/\D/g, "").replace(/^0+/, "").slice(0, 15);
+  if (phoneCountryCode.length < 1 || phoneNumber.length < 5) {
+    throw new Error("A valid customer phone number is required for Tap checkout");
+  }
+  const tapSourceId = String(sourceId || "src_card").trim();
+  if (!["src_card", "src_apple_pay"].includes(tapSourceId)) {
+    throw new Error("Unsupported Tap payment source");
+  }
+  const fullName = String(user?.full_name || user?.name || email).trim().slice(0, 120);
+  const nameParts = fullName.split(/\s+/).filter(Boolean);
+  const firstName = String(nameParts.shift() || "A+").slice(0, 80);
+  const lastName = String(nameParts.join(" ") || firstName).slice(0, 80);
+  const amountValue = Number(Number(amount).toFixed(2));
+  const returnQuery = { payment: "tap", kind: String(kind || "subscription"), order_id: String(orderId) };
+  if (tutorId) returnQuery.tutor_id = String(tutorId);
+  const charge = await tapRequest("/charges/", "POST", {
+    amount: amountValue,
+    currency: TAP_CURRENCY,
+    customer_initiated: true,
+    threeDSecure: true,
+    save_card: false,
+    description: String(description || "A+ Medical payment").slice(0, 120),
+    order: { id: String(orderId) },
+    metadata: {
+      udf1: String(orderId),
+      udf2: email.slice(0, 100),
+      udf3: String(kind || "subscription").slice(0, 40),
+    },
+    reference: {
+      order: String(orderId),
+      transaction: String(orderId),
+    },
+    customer: {
+      first_name: firstName,
+      last_name: lastName,
+      email,
+      phone: {
+        country_code: phoneCountryCode,
+        number: phoneNumber,
+      },
+    },
+    merchant: { id: merchantId },
+    source: { id: tapSourceId },
+    redirect: { url: tapFrontendUrl(returnQuery) },
+  });
+  const checkoutUrl = String(charge?.transaction?.url || "");
+  let parsedUrl;
+  try { parsedUrl = new URL(checkoutUrl); } catch {}
+  if (
+    !parsedUrl ||
+    parsedUrl.protocol !== "https:" ||
+    !(parsedUrl.hostname === "tap.company" || parsedUrl.hostname.endsWith(".tap.company"))
+  ) {
+    throw new Error("Tap returned an invalid checkout URL");
+  }
+  if (!String(charge?.id || "").trim()) throw new Error("Tap did not return a charge ID");
+  return { checkoutUrl, chargeId: String(charge.id), charge };
+}
+
+async function getTapCharge(chargeId) {
+  const safeChargeId = String(chargeId || "").trim();
+  if (!/^chg_[A-Za-z0-9_-]{4,120}$/.test(safeChargeId)) throw new Error("Invalid Tap charge ID");
+  return tapRequest(`/charges/${encodeURIComponent(safeChargeId)}`, "GET");
+}
+
+function tapChargeIsValid(payment, expected) {
+  if (!payment || String(payment.id || "") !== String(expected.chargeId || "")) return false;
+  if (String(payment.status || "").toUpperCase() !== "CAPTURED") return false;
+  const amount = Number(payment.amount);
+  if (!Number.isFinite(amount) || Math.abs(amount - Number(expected.amount)) > 0.01) return false;
+  if (String(payment.currency || "").toUpperCase() !== String(expected.currency).toUpperCase()) return false;
+  const providerOrder = String(
+    payment?.reference?.order || payment?.order?.id || payment?.metadata?.udf1 || ""
+  );
+  if (providerOrder !== String(expected.orderId)) return false;
+  const responseMerchantId = String(payment?.merchant?.id || payment?.merchant_id || "");
+  const configuredMerchantId = String(process.env.TAP_MERCHANT_ID || "").trim();
+  if (responseMerchantId && configuredMerchantId && responseMerchantId !== configuredMerchantId) return false;
+  return true;
+}
+
+app.post("/api/payment/tap/create", async (req, res) => {
+  let orderId = "";
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user) return res.status(401).json({ ok: false, error: "login_required" });
+    const setting = await db.query("SELECT value FROM settings WHERE key=$1 LIMIT 1", ["subscriptionPrice"]);
+    const configuredAmount = Number(setting.rows[0]?.value);
+    const amount = Number.isFinite(configuredAmount) && configuredAmount >= 1
+      ? Number(configuredAmount.toFixed(2))
+      : 29.99;
+    orderId = `APLUS-TAP-${Date.now()}-${randomBytes(6).toString("hex")}`;
+    await db.query(
+      `INSERT INTO tap_subscription_payments
+       (order_id,user_email,amount,currency,status,created_at)
+       VALUES ($1,$2,$3,$4,'pending',$5)`,
+      [orderId, String(user.email).trim().toLowerCase(), amount, TAP_CURRENCY, Date.now()]
+    );
+    const checkout = await createTapCharge({
+      orderId,
+      amount,
+      user,
+      phone: req.body?.phone,
+      sourceId: req.body?.sourceId,
+      description: "A+ Medical monthly subscription",
+      kind: "subscription",
+    });
+    await db.query(
+      "UPDATE tap_subscription_payments SET tap_charge_id=$1 WHERE order_id=$2 AND status='pending'",
+      [checkout.chargeId, orderId]
+    );
+    res.json({ ok: true, url: checkout.checkoutUrl, orderId, amount, currency: TAP_CURRENCY });
+  } catch (error) {
+    if (orderId) {
+      await db.query(
+        "UPDATE tap_subscription_payments SET status='failed' WHERE order_id=$1 AND status='pending'",
+        [orderId]
+      ).catch(() => {});
+    }
+    console.error("TAP_SUBSCRIPTION_CREATE:", error?.message || error);
+    res.status(502).json({ ok: false, error: "payment_invoice_failed" });
+  }
+});
+
+app.post("/api/payment/tap/confirm", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user) return res.status(401).json({ ok: false, error: "login_required" });
+    const orderId = String(req.body?.orderId || req.body?.order_id || "").trim();
+    const tapId = String(req.body?.tapId || req.body?.tap_id || "").trim();
+    if (!orderId || !tapId) return res.status(400).json({ ok: false, error: "order_and_tap_id_required" });
+    const orderResult = await db.query(
+      `SELECT * FROM tap_subscription_payments
+       WHERE order_id=$1 AND user_email=$2 LIMIT 1`,
+      [orderId, String(user.email).trim().toLowerCase()]
+    );
+    if (!orderResult.rows.length) return res.status(404).json({ ok: false, error: "payment_not_found" });
+    const order = orderResult.rows[0];
+    if (order.status === "paid") {
+      const current = await db.query("SELECT premium_expiry FROM users WHERE email=$1", [user.email]);
+      return res.json({ ok: true, paid: true, premiumExpiry: Number(current.rows[0]?.premium_expiry) || 0 });
+    }
+    if (!order.tap_charge_id || String(order.tap_charge_id) !== tapId) {
+      return res.status(400).json({ ok: false, error: "tap_charge_mismatch" });
+    }
+    const payment = await getTapCharge(tapId);
+    if (!tapChargeIsValid(payment, {
+      chargeId: tapId,
+      orderId,
+      amount: Number(order.amount),
+      currency: order.currency,
+    })) {
+      return res.status(400).json({ ok: false, error: "payment_not_verified" });
+    }
+    const now = Date.now();
+    const result = await withDbTransaction(async (client) => {
+      const lockedOrder = await client.query(
+        "SELECT * FROM tap_subscription_payments WHERE order_id=$1 FOR UPDATE",
+        [orderId]
+      );
+      if (!lockedOrder.rows.length) throw new Error("payment_not_found");
+      if (lockedOrder.rows[0].status === "paid") {
+        const existingUser = await client.query("SELECT premium_expiry FROM users WHERE email=$1", [user.email]);
+        return { alreadyPaid: true, premiumExpiry: Number(existingUser.rows[0]?.premium_expiry) || 0 };
+      }
+      const lockedUser = await client.query("SELECT premium_expiry FROM users WHERE email=$1 FOR UPDATE", [user.email]);
+      if (!lockedUser.rows.length) throw new Error("user_not_found");
+      const expiry = Math.max(now, Number(lockedUser.rows[0].premium_expiry) || 0) + 30 * 24 * 60 * 60 * 1000;
+      await client.query("UPDATE users SET premium_expiry=$1 WHERE email=$2", [expiry, user.email]);
+      await client.query(
+        `UPDATE tap_subscription_payments
+         SET status='paid',tap_charge_id=$1,paid_at=$2
+         WHERE order_id=$3 AND status='pending'`,
+        [tapId, now, orderId]
+      );
+      return { alreadyPaid: false, premiumExpiry: expiry };
+    });
+    invalidateSessionCache(user.email);
+    if (!result.alreadyPaid) {
+      broadcastEvent({ type: "subscription_updated", email: user.email, premiumExpiry: result.premiumExpiry });
+    }
+    res.json({ ok: true, paid: true, premiumExpiry: result.premiumExpiry });
+  } catch (error) {
+    console.error("TAP_SUBSCRIPTION_CONFIRM:", error?.message || error);
+    res.status(502).json({ ok: false, error: "payment_confirmation_failed" });
+  }
+});
+
+// ══════════════════════════════════════════════
 // 18. المعلم الخصوصي الحقيقي
 // الدفع يتم عبر رابط سلة، ثم ينشئ المدير كود التفعيل
 // ══════════════════════════════════════════════
@@ -6425,6 +6686,137 @@ app.post("/api/private-tutors/:id/payment/confirm", async (req, res) => {
     res.json({ ok: true, paid: true, access });
   } catch (e) {
     console.error("private tutor payment confirm:", e.message);
+    res.status(502).json({ ok: false, msg: "تعذر تأكيد الدفع" });
+  }
+});
+
+app.post("/api/private-tutors/:id/payment/tap/create", async (req, res) => {
+  let orderNumber = "";
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const tutorResult = await db.query(
+      "SELECT * FROM private_tutors WHERE id=$1 AND active=TRUE LIMIT 1",
+      [String(req.params.id || "")]
+    );
+    if (!tutorResult.rows.length) return res.status(404).json({ ok: false, msg: "المعلم غير موجود" });
+    const tutor = tutorResult.rows[0];
+    const plan = req.body?.plan === "month" ? "month" : req.body?.plan === "lesson" ? "lesson" : "";
+    const amount = plan === "lesson" ? Number(tutor.lesson_price) : Number(tutor.monthly_price);
+    if (!plan || !Number.isFinite(amount) || amount < 5) {
+      return res.status(400).json({ ok: false, msg: "خيار الدفع غير متاح لهذا المعلم" });
+    }
+    orderNumber = `TUTOR-TAP-${Date.now()}-${randomBytes(6).toString("hex")}`;
+    const paymentId = privateTutorId();
+    await db.query(
+      `INSERT INTO private_tutor_payments
+       (id,transaction_no,order_number,tutor_id,student_email,plan,amount,status,lessons_remaining,expires_at,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0,0,$8)`,
+      [paymentId, orderNumber, orderNumber, tutor.id,
+        String(user.email).toLowerCase(), plan, Number(amount.toFixed(2)), Date.now()]
+    );
+    const checkout = await createTapCharge({
+      orderId: orderNumber,
+      amount,
+      user,
+      phone: req.body?.phone,
+      sourceId: req.body?.sourceId,
+      description: `A+ Medical - ${tutor.name} - ${plan === "month" ? "اشتراك شهر" : "شرح واحد"}`,
+      kind: "tutor",
+      tutorId: tutor.id,
+    });
+    await db.query(
+      "UPDATE private_tutor_payments SET tap_charge_id=$1 WHERE id=$2 AND status='pending'",
+      [checkout.chargeId, paymentId]
+    );
+    res.json({
+      ok: true,
+      url: checkout.checkoutUrl,
+      transactionNo: orderNumber,
+      orderId: orderNumber,
+      plan,
+      amount: Number(amount.toFixed(2)),
+      currency: TAP_CURRENCY,
+      tutorName: tutor.name,
+    });
+  } catch (error) {
+    if (orderNumber) {
+      await db.query(
+        "UPDATE private_tutor_payments SET status='failed' WHERE transaction_no=$1 AND status='pending'",
+        [orderNumber]
+      ).catch(() => {});
+    }
+    console.error("TAP_TUTOR_PAYMENT_CREATE:", error?.message || error);
+    res.status(502).json({ ok: false, msg: "تعذر إنشاء فاتورة الدفع" });
+  }
+});
+
+app.post("/api/private-tutors/:id/payment/tap/confirm", async (req, res) => {
+  try {
+    const user = await privateTutorUser(req);
+    if (!user) return res.status(401).json({ ok: false, msg: "سجل الدخول أولاً" });
+    const orderId = String(req.body?.orderId || req.body?.order_id || req.body?.transactionNo || "").trim();
+    const tapId = String(req.body?.tapId || req.body?.tap_id || "").trim();
+    if (!orderId || !tapId) return res.status(400).json({ ok: false, msg: "بيانات عملية الدفع غير مكتملة" });
+    const paymentResult = await db.query(
+      `SELECT p.*, t.name AS tutor_name
+       FROM private_tutor_payments p JOIN private_tutors t ON t.id=p.tutor_id
+       WHERE p.transaction_no=$1 AND p.tutor_id=$2 AND p.student_email=$3 LIMIT 1`,
+      [orderId, String(req.params.id || ""), String(user.email).toLowerCase()]
+    );
+    if (!paymentResult.rows.length) return res.status(404).json({ ok: false, msg: "عملية الدفع غير موجودة" });
+    const payment = paymentResult.rows[0];
+    if (payment.status === "paid") {
+      const access = await tutorPaymentPlan(payment.tutor_id, user.email);
+      return res.json({ ok: true, paid: true, access });
+    }
+    if (!payment.tap_charge_id || String(payment.tap_charge_id) !== tapId) {
+      return res.status(400).json({ ok: false, msg: "رقم عملية Tap لا يطابق الطلب" });
+    }
+    const charge = await getTapCharge(tapId);
+    if (!tapChargeIsValid(charge, {
+      chargeId: tapId,
+      orderId,
+      amount: Number(payment.amount),
+      currency: TAP_CURRENCY,
+    })) {
+      return res.status(400).json({ ok: false, msg: "لم يتم تأكيد الدفع أو لا تطابق قيمة الفاتورة" });
+    }
+    const now = Date.now();
+    await withDbTransaction(async (client) => {
+      const locked = await client.query(
+        "SELECT * FROM private_tutor_payments WHERE id=$1 FOR UPDATE",
+        [payment.id]
+      );
+      if (!locked.rows.length || locked.rows[0].status === "paid") return;
+      if (locked.rows[0].plan === "month") {
+        const current = await client.query(
+          `SELECT COALESCE(MAX(expires_at),0) AS expires_at
+           FROM private_tutor_payments
+           WHERE tutor_id=$1 AND student_email=$2 AND plan='month' AND status='paid'`,
+          [payment.tutor_id, String(user.email).toLowerCase()]
+        );
+        const expiresAt = Math.max(now, Number(current.rows[0]?.expires_at) || 0) + 30 * 86_400_000;
+        await client.query(
+          `UPDATE private_tutor_payments
+           SET status='paid',lessons_remaining=0,expires_at=$1,paid_at=$2
+           WHERE id=$3`,
+          [expiresAt, now, payment.id]
+        );
+      } else {
+        await client.query(
+          `UPDATE private_tutor_payments
+           SET status='paid',lessons_remaining=1,expires_at=$1,paid_at=$2
+           WHERE id=$3`,
+          [now + 90 * 86_400_000, now, payment.id]
+        );
+      }
+    });
+    const access = await tutorPaymentPlan(payment.tutor_id, user.email);
+    broadcastEvent({ type: "private_tutor_payment", tutorId: payment.tutor_id, email: user.email });
+    res.json({ ok: true, paid: true, access });
+  } catch (error) {
+    console.error("TAP_TUTOR_PAYMENT_CONFIRM:", error?.message || error);
     res.status(502).json({ ok: false, msg: "تعذر تأكيد الدفع" });
   }
 });
