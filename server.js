@@ -481,7 +481,8 @@ async function initDB() {
       attachment_name TEXT NOT NULL DEFAULT '',
       attachment_mime TEXT NOT NULL DEFAULT '',
       attachment_data TEXT NOT NULL DEFAULT '',
-      attachment_size INTEGER NOT NULL DEFAULT 0
+      attachment_size INTEGER NOT NULL DEFAULT 0,
+      approved_at BIGINT NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS admin_print_forms_status_created_idx
       ON admin_print_forms(status, created_at DESC);
@@ -497,6 +498,7 @@ async function initDB() {
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_mime TEXT NOT NULL DEFAULT '';
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_data TEXT NOT NULL DEFAULT '';
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS attachment_size INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS approved_at BIGINT NOT NULL DEFAULT 0;
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS moderator_messages (
@@ -1736,6 +1738,7 @@ function formatAdminPrintForm(row) {
     createdBy: row.created_by,
     createdAt: Number(row.created_at) || 0,
     printedAt: Number(row.printed_at) || 0,
+    approvedAt: Number(row.approved_at) || 0,
     expiresAt: Number(row.expires_at) || 0,
     status: row.status,
     usedAt: Number(row.used_at) || 0,
@@ -1754,35 +1757,14 @@ function formatAdminPrintForm(row) {
 
 app.get("/api/admin/print-forms", async (req, res) => {
   try {
-    const actor = await getPrintFormActor(req, true);
-    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
-    const result = actor.isManager
-      ? await db.query(
-          `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,expires_at,status,
+    const actor = await getPrintFormActor(req, false);
+    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "forbidden", msg: "أرشيف المستندات متاح للمدير فقط" });
+    const result = await db.query(
+          `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,approved_at,expires_at,status,
                   used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
                   attachment_name,attachment_mime,attachment_size
-           FROM admin_print_forms ORDER BY created_at DESC LIMIT 50`
-        )
-      : actor.canUseStamp
-      ? await db.query(
-          `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,expires_at,status,
-                  used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
-                  attachment_name,attachment_mime,attachment_size
-           FROM admin_print_forms
-           WHERE LOWER(created_by)=LOWER($1)
-           ORDER BY created_at DESC LIMIT 50`,
-          [actor.email]
-        )
-      : await db.query(
-          `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,expires_at,status,
-                  used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
-                  attachment_name,attachment_mime,attachment_size
-           FROM admin_print_forms
-           WHERE status='printed' AND used_at=0 AND expires_at>$1
-             AND (assigned_email='' OR LOWER(assigned_email)=LOWER($2))
-           ORDER BY created_at DESC LIMIT 50`,
-          [Date.now(), actor.email]
-        );
+           FROM admin_print_forms WHERE approved_at>0 ORDER BY approved_at DESC`
+         );
     res.json({ ok: true, forms: result.rows.map(formatAdminPrintForm) });
   } catch (error) {
     console.error("admin print forms list failed:", error?.message || error);
@@ -1829,7 +1811,7 @@ app.get("/api/admin/print-forms/:id/attachment", async (req, res) => {
 app.post("/api/admin/print-forms", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
-    if (!actor?.isManager && !actor?.canUseStamp) return res.status(403).json({ ok: false, error: "manager_required", msg: "إنشاء نموذج الطباعة للمدير أو الموظف المخوّل بالختم فقط" });
+    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "إنشاء المستندات المختومة متاح للمدير فقط" });
     const title = String(req.body?.title || "").trim().slice(0, 180);
     const details = String(req.body?.details || "").trim().slice(0, 12000);
     const assignedEmail = String(req.body?.assignedEmail || "").trim().toLowerCase().slice(0, 254);
@@ -1902,7 +1884,7 @@ app.post("/api/admin/print-forms", async (req, res) => {
 app.delete("/api/admin/print-forms/:id", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
-    if (!actor?.isManager && !actor?.canUseStamp) return res.status(403).json({ ok: false, error: "manager_required", msg: "حذف المستند للمخوّل بالختم فقط" });
+    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "إدارة مستندات الختم متاحة للمدير فقط" });
     const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
     const existing = actor.isManager
       ? await db.query(
@@ -1943,7 +1925,7 @@ app.delete("/api/admin/print-forms/:id", async (req, res) => {
 app.patch("/api/admin/print-forms/:id/printed", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
-    if (!actor?.isManager && !actor?.canUseStamp) return res.status(403).json({ ok: false, error: "manager_required", msg: "تأكيد الطباعة للمخوّل بالختم فقط" });
+    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "manager_required", msg: "تأكيد طباعة المستند متاح للمدير فقط" });
     const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
     const now = Date.now();
     const result = await db.query(
@@ -1968,6 +1950,37 @@ app.patch("/api/admin/print-forms/:id/printed", async (req, res) => {
   } catch (error) {
     console.error("admin print form confirmation failed:", error?.message || error);
     res.status(500).json({ ok: false, error: "print_form_confirmation_failed", msg: "تعذر تأكيد الطباعة" });
+  }
+});
+
+app.patch("/api/admin/print-forms/:id/approve", async (req, res) => {
+  try {
+    const actor = await getPrintFormActor(req, false);
+    if (!actor?.isManager) {
+      return res.status(403).json({ ok: false, error: "manager_required", msg: "اعتماد المستندات متاح للمدير فقط" });
+    }
+    const id = String(req.params.id || "").trim().toUpperCase().slice(0, 80);
+    const now = Date.now();
+    const result = await db.query(
+      `UPDATE admin_print_forms
+       SET approved_at=CASE WHEN approved_at=0 THEN $2 ELSE approved_at END
+       WHERE id=$1
+       RETURNING *`,
+      [id, now]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: "print_form_not_found", msg: "المستند غير موجود" });
+    }
+    const form = result.rows[0];
+    await auditLog("admin_print_form_approved", actor.email, {
+      printFormId: id,
+      title: form.title,
+      approvedAt: Number(form.approved_at) || now,
+    });
+    return res.json({ ok: true, form: formatAdminPrintForm(form) });
+  } catch (error) {
+    console.error("admin print form approval failed:", error?.message || error);
+    return res.status(500).json({ ok: false, error: "print_form_approval_failed", msg: "تعذر اعتماد المستند وحفظه في الأرشيف" });
   }
 });
 
