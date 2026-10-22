@@ -5809,7 +5809,8 @@ app.post("/api/payment/fatora/confirm", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// Tap Payments — hosted checkout
+// Tap Payments — in-page card/Apple Pay tokenization.
+// The issuer's 3-D Secure challenge may require a secure verification redirect.
 // Required server secrets: TAP_SECRET_KEY, TAP_MERCHANT_ID
 // Optional: TAP_CURRENCY=SAR, FRONTEND_URL=https://your-site.example
 // ══════════════════════════════════════════════
@@ -5881,12 +5882,9 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
   if (phoneCountryCode.length < 1 || phoneNumber.length < 5) {
     throw new Error("A valid customer phone number is required for Tap checkout");
   }
-  const tapSourceId = String(sourceId || "src_card").trim();
-  if (
-    !["src_card", "src_apple_pay"].includes(tapSourceId) &&
-    !/^tok_[A-Za-z0-9_-]{8,120}$/.test(tapSourceId)
-  ) {
-    throw new Error("Unsupported Tap payment source");
+  const tapSourceId = String(sourceId || "").trim();
+  if (!/^tok_[A-Za-z0-9_-]{8,120}$/.test(tapSourceId)) {
+    throw new Error("A valid in-page Tap token is required");
   }
   const fullName = String(user?.full_name || user?.name || email).trim().slice(0, 120);
   const nameParts = fullName.split(/\s+/).filter(Boolean);
@@ -6760,6 +6758,8 @@ app.post("/api/private-tutors/:id/payment/tap/create", async (req, res) => {
     res.json({
       ok: true,
       url: checkout.checkoutUrl,
+      tapId: checkout.chargeId,
+      status: checkout.status,
       transactionNo: orderNumber,
       orderId: orderNumber,
       plan,
