@@ -5872,7 +5872,7 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
     throw new Error("A valid customer phone number is required for Tap checkout");
   }
   const tapSourceId = String(sourceId || "src_card").trim();
-  if (!["src_card", "src_apple_pay"].includes(tapSourceId)) {
+  if (tapSourceId !== "src_card") {
     throw new Error("Unsupported Tap payment source");
   }
   const fullName = String(user?.full_name || user?.name || email).trim().slice(0, 120);
@@ -5889,6 +5889,7 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
     threeDSecure: true,
     save_card: false,
     description: String(description || "A+ Medical payment").slice(0, 120),
+    order: { id: String(orderId) },
     metadata: {
       udf1: String(orderId),
       udf2: email.slice(0, 100),
