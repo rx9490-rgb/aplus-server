@@ -5620,6 +5620,33 @@ app.delete("/api/admin/community/direct/:id", async (req, res) => {
 });
 
 // Static files — يخدم من public/ داخل standalone أو من ../public
+app.get(["/", "/index.html"], async (req, res, next) => {
+  try {
+    let html = "";
+    let lastError;
+    for (const indexPath of [
+      path.join(__dirname, "public", "index.html"),
+      path.join(__dirname, "..", "public", "index.html"),
+    ]) {
+      try {
+        html = await fs.readFile(indexPath, "utf8");
+        break;
+      } catch (error) {
+        lastError = error;
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    if (!html) return next(lastError || new Error("frontend_index_not_found"));
+    if (!html.includes("/tap-payment-methods.js")) {
+      const scriptTag = '<script src="/tap-payment-methods.js" defer></script>';
+      if (!/<\/body\s*>/i.test(html)) throw new Error("frontend_body_close_not_found");
+      html = html.replace(/<\/body\s*>/i, `${scriptTag}\n</body>`);
+    }
+    res.set("Cache-Control", "no-cache").type("html").send(html);
+  } catch (error) {
+    next(error);
+  }
+});
 app.use(express.static(path.join(__dirname, "public"), { etag: true, lastModified: true }));
 app.use(express.static(path.join(__dirname, "..", "public"), { etag: true, lastModified: true }));
 
@@ -5872,7 +5899,7 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
     throw new Error("A valid customer phone number is required for Tap checkout");
   }
   const tapSourceId = String(sourceId || "src_card").trim();
-  if (tapSourceId !== "src_card") {
+  if (!["src_card", "src_apple_pay"].includes(tapSourceId)) {
     throw new Error("Unsupported Tap payment source");
   }
   const fullName = String(user?.full_name || user?.name || email).trim().slice(0, 120);
