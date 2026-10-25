@@ -5639,10 +5639,13 @@ app.get(["/", "/index.html"], async (req, res, next) => {
     if (!html) return next(lastError || new Error("frontend_index_not_found"));
     const oldPaymentScript = '<script src="/tap-payment-methods.js" defer></script>';
     const inlinePaymentScript = '<script src="/tap-payment-inline.js" defer></script>';
-    if (html.includes(oldPaymentScript)) {
-      html = html.replace(oldPaymentScript, inlinePaymentScript);
+    const paymentScripts = `${oldPaymentScript}\n${inlinePaymentScript}`;
+    if (html.includes(oldPaymentScript) && !html.includes(inlinePaymentScript)) {
+      html = html.replace(oldPaymentScript, paymentScripts);
+    } else if (html.includes(inlinePaymentScript) && !html.includes(oldPaymentScript)) {
+      html = html.replace(inlinePaymentScript, paymentScripts);
     } else if (!html.includes("/tap-payment-inline.js")) {
-      const scriptTag = inlinePaymentScript;
+      const scriptTag = paymentScripts;
       if (!/<\/body\s*>/i.test(html)) throw new Error("frontend_body_close_not_found");
       html = html.replace(/<\/body\s*>/i, `${scriptTag}\n</body>`);
     }
