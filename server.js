@@ -5637,8 +5637,12 @@ app.get(["/", "/index.html"], async (req, res, next) => {
       }
     }
     if (!html) return next(lastError || new Error("frontend_index_not_found"));
-    if (!html.includes("/tap-payment-methods.js")) {
-      const scriptTag = '<script src="/tap-payment-methods.js" defer></script>';
+    const oldPaymentScript = '<script src="/tap-payment-methods.js" defer></script>';
+    const inlinePaymentScript = '<script src="/tap-payment-inline.js" defer></script>';
+    if (html.includes(oldPaymentScript)) {
+      html = html.replace(oldPaymentScript, inlinePaymentScript);
+    } else if (!html.includes("/tap-payment-inline.js")) {
+      const scriptTag = inlinePaymentScript;
       if (!/<\/body\s*>/i.test(html)) throw new Error("frontend_body_close_not_found");
       html = html.replace(/<\/body\s*>/i, `${scriptTag}\n</body>`);
     }
@@ -5838,6 +5842,7 @@ app.post("/api/payment/fatora/confirm", async (req, res) => {
 // ══════════════════════════════════════════════
 // Tap Payments — hosted checkout
 // Required server secrets: TAP_SECRET_KEY, TAP_MERCHANT_ID
+// Embedded card and Apple Pay also require TAP_PUBLIC_KEY from Tap.
 // Optional: TAP_CURRENCY=SAR, FRONTEND_URL=https://your-site.example
 // ══════════════════════════════════════════════
 const TAP_API_BASE = "https://api.tap.company/v2";
@@ -5846,6 +5851,7 @@ const TAP_CURRENCY = /^[A-Z]{3}$/.test(
 )
   ? String(process.env.TAP_CURRENCY || process.env.FATORA_CURRENCY || "SAR").trim().toUpperCase()
   : "SAR";
+const TAP_PUBLIC_KEY = String(process.env.TAP_PUBLIC_KEY || "").trim();
 
 function tapFrontendUrl(query) {
   const base = String(process.env.FRONTEND_URL || "https://aplus.blog").replace(/\/+$/, "");
@@ -5895,11 +5901,9 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
   if (!email) throw new Error("A customer email is required for Tap checkout");
   const phoneCountryCode = String(phone?.countryCode || phone?.country_code || "").replace(/\D/g, "").slice(0, 3);
   const phoneNumber = String(phone?.number || "").replace(/\D/g, "").replace(/^0+/, "").slice(0, 15);
-  if (phoneCountryCode.length < 1 || phoneNumber.length < 5) {
-    throw new Error("A valid customer phone number is required for Tap checkout");
-  }
   const tapSourceId = String(sourceId || "src_card").trim();
-  if (!["src_card", "src_apple_pay"].includes(tapSourceId)) {
+  const isTokenSource = /^tok_[A-Za-z0-9_-]{8,120}$/.test(tapSourceId);
+  if (!isTokenSource && !["src_card", "src_apple_pay"].includes(tapSourceId)) {
     throw new Error("Unsupported Tap payment source");
   }
   const fullName = String(user?.full_name || user?.name || email).trim().slice(0, 120);
@@ -5909,6 +5913,19 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
   const amountValue = Number(Number(amount).toFixed(2));
   const returnQuery = { payment: "tap", kind: String(kind || "subscription"), order_id: String(orderId) };
   if (tutorId) returnQuery.tutor_id = String(tutorId);
+  const customer = {
+    first_name: firstName,
+    last_name: lastName,
+    email,
+  };
+  if (phoneCountryCode.length && phoneNumber.length >= 5) {
+    customer.phone = {
+      country_code: phoneCountryCode,
+      number: phoneNumber,
+    };
+  } else if (!isTokenSource) {
+    throw new Error("A valid customer phone number is required for Tap checkout");
+  }
   const charge = await tapRequest("/charges/", "POST", {
     amount: amountValue,
     currency: TAP_CURRENCY,
@@ -5925,20 +5942,30 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
       order: String(orderId),
       transaction: String(orderId),
     },
-    customer: {
-      first_name: firstName,
-      last_name: lastName,
-      email,
-      phone: {
-        country_code: phoneCountryCode,
-        number: phoneNumber,
-      },
-    },
+    customer,
     merchant: { id: merchantId },
     source: { id: tapSourceId },
     redirect: { url: tapFrontendUrl(returnQuery) },
   });
+  const chargeId = String(charge?.id || "").trim();
+  if (!chargeId) throw new Error("Tap did not return a charge ID");
   const checkoutUrl = String(charge?.transaction?.url || "");
+  const status = String(charge?.status || "").toUpperCase();
+  if (isTokenSource) {
+    let redirectUrl = "";
+    if (status !== "CAPTURED" && checkoutUrl) {
+      let parsedRedirect;
+      try { parsedRedirect = new URL(checkoutUrl); } catch {}
+      if (!parsedRedirect || parsedRedirect.protocol !== "https:") {
+        throw new Error("Tap returned an invalid 3DS redirect URL");
+      }
+      redirectUrl = parsedRedirect.href;
+    }
+    if (status !== "CAPTURED" && !redirectUrl) {
+      throw new Error(`Tap charge requires follow-up (status: ${status || "unknown"})`);
+    }
+    return { checkoutUrl: "", redirectUrl, chargeId, charge, status };
+  }
   let parsedUrl;
   try { parsedUrl = new URL(checkoutUrl); } catch {}
   if (
@@ -5948,8 +5975,7 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
   ) {
     throw new Error("Tap returned an invalid checkout URL");
   }
-  if (!String(charge?.id || "").trim()) throw new Error("Tap did not return a charge ID");
-  return { checkoutUrl, chargeId: String(charge.id), charge };
+  return { checkoutUrl, chargeId, charge, status };
 }
 
 async function getTapCharge(chargeId) {
@@ -5973,6 +5999,32 @@ function tapChargeIsValid(payment, expected) {
   if (responseMerchantId && configuredMerchantId && responseMerchantId !== configuredMerchantId) return false;
   return true;
 }
+
+app.get("/api/payment/tap/inline-config", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.headers["x-session-token"]);
+    if (!user) return res.status(401).json({ ok: false, error: "login_required" });
+    const merchantId = String(process.env.TAP_MERCHANT_ID || "").trim();
+    if (!TAP_PUBLIC_KEY || !merchantId) {
+      return res.status(503).json({ ok: false, error: "tap_inline_not_configured" });
+    }
+    const setting = await db.query("SELECT value FROM settings WHERE key=$1 LIMIT 1", ["subscriptionPrice"]);
+    const configuredAmount = Number(setting.rows[0]?.value);
+    const amount = Number.isFinite(configuredAmount) && configuredAmount >= 1
+      ? Number(configuredAmount.toFixed(2))
+      : 29.99;
+    res.json({
+      ok: true,
+      publicKey: TAP_PUBLIC_KEY,
+      merchantId,
+      currency: TAP_CURRENCY,
+      amount,
+    });
+  } catch (error) {
+    console.error("TAP_INLINE_CONFIG:", error?.message || error);
+    res.status(500).json({ ok: false, error: "tap_inline_config_failed" });
+  }
+});
 
 app.post("/api/payment/tap/create", async (req, res) => {
   let orderId = "";
@@ -6004,7 +6056,16 @@ app.post("/api/payment/tap/create", async (req, res) => {
       "UPDATE tap_subscription_payments SET tap_charge_id=$1 WHERE order_id=$2 AND status='pending'",
       [checkout.chargeId, orderId]
     );
-    res.json({ ok: true, url: checkout.checkoutUrl, orderId, amount, currency: TAP_CURRENCY });
+    res.json({
+      ok: true,
+      url: checkout.checkoutUrl || "",
+      redirectUrl: checkout.redirectUrl || "",
+      tapId: checkout.chargeId,
+      status: checkout.status || "",
+      orderId,
+      amount,
+      currency: TAP_CURRENCY,
+    });
   } catch (error) {
     if (orderId) {
       await db.query(
