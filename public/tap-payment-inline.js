@@ -5,6 +5,9 @@
   var activeOverlay = null;
   var cardSdkPromise = null;
   var appleSdkPromise = null;
+  var legacyTapCheckout = typeof window.openSalaStore === "function"
+    ? window.openSalaStore
+    : null;
 
   function apiBase() {
     try {
@@ -415,6 +418,15 @@
     } catch (error) {
       checkoutBusy = false;
       var message = String(error && error.message || "");
+      if (message === "tap_inline_not_configured" && legacyTapCheckout) {
+        notify("الدفع المباشر غير جاهز؛ سيتم فتح Tap بالطريقة المعتادة.", "#f59e0b");
+        try {
+          legacyTapCheckout();
+          return;
+        } catch (fallbackError) {
+          console.error("[Tap hosted fallback]", fallbackError && fallbackError.message || "fallback_failed");
+        }
+      }
       notify(
         message === "tap_inline_not_configured"
           ? "إعداد الدفع المباشر في Tap غير مكتمل."
