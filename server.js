@@ -5637,6 +5637,13 @@ app.get(["/", "/index.html"], async (req, res, next) => {
       }
     }
     if (!html) return next(lastError || new Error("frontend_index_not_found"));
+    const tapSdkOrigin = "https://tap-sdks.b-cdn.net";
+    html = html.replace(/(script-src\s+[^;]*)(;)/i, (match, directive, end) =>
+      directive.includes(tapSdkOrigin) ? match : `${directive} ${tapSdkOrigin}${end}`
+    );
+    html = html.replace(/(style-src\s+[^;]*)(;)/i, (match, directive, end) =>
+      directive.includes(tapSdkOrigin) ? match : `${directive} ${tapSdkOrigin}${end}`
+    );
     const oldPaymentScript = '<script src="/tap-payment-methods.js" defer></script>';
     const inlinePaymentScript = '<script src="/tap-payment-inline.js" defer></script>';
     const paymentScripts = `${oldPaymentScript}\n${inlinePaymentScript}`;
