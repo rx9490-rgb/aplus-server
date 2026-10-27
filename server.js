@@ -681,6 +681,13 @@ function moderatorPermissionForRequest(req) {
   if (path === "/api/subscriptions/list") return "canManageSubscriptions";
   if (/^\/api\/admin\/community\//.test(path)) return "canManageBans";
   if (/^\/api\/admin\/private-tutor(?:s|-)/.test(path)) return "canManageTutors";
+  if (path === "/api/print-center/data" && method === "GET") {
+    const type = String(req.query?.type || body.type || "").trim().toLowerCase();
+    if (type === "invoices" || type === "subscriptions") return "canManageSubscriptions";
+    if (type === "users") return ["canManageUsers", "canManageSubscriptions"];
+    if (type === "services") return ["canManageServices", "canViewStats"];
+    return "canViewDashboard";
+  }
   if (path === "/api/settings") {
     if (method === "GET") return "canManageSettings";
     const keys = method === "POST" && typeof body.key === "string"
@@ -3643,6 +3650,34 @@ app.put("/api/settings", async (req, res) => {
   } catch { res.status(500).json({ error: "server error" }); }
 });
 
+// تحديث سعر الاشتراك عبر مسار مخصص، مع اشتراط جلسة مدير كاملة.
+// هذا المسار لا يغيّر آلية اعتماد النماذج لبقية الإجراءات الإدارية.
+app.put("/api/settings/subscription-price", async (req, res) => {
+  try {
+    const authorized = await isAdminRequest(req);
+    if (!authorized || req.adminActorIsModerator || !req.adminActor) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    const price = Number(req.body?.subscriptionPrice);
+    if (!Number.isFinite(price) || price < 1 || price > 9999) {
+      return res.status(400).json({ ok: false, error: "invalid_subscription_price" });
+    }
+
+    const subscriptionPrice = Math.round(price * 100) / 100;
+    await db.query(
+      "INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2",
+      ["subscriptionPrice", JSON.stringify(subscriptionPrice)]
+    );
+    broadcastEvent({ type: "settings_updated", key: "subscriptionPrice", value: subscriptionPrice });
+    res.set("Cache-Control", "no-store");
+    return res.json({ ok: true, subscriptionPrice });
+  } catch (error) {
+    console.error("subscription price update failed:", error?.message || error);
+    return res.status(500).json({ ok: false, error: "subscription_price_update_failed" });
+  }
+});
+
 // ══════════════════════════════════════════════
 // 13. User Settings
 // ══════════════════════════════════════════════
@@ -4069,6 +4104,131 @@ app.get("/api/subscriptions/list", async (req, res) => {
       daysLeft: Math.max(0, Math.ceil((Number(u.premium_expiry) - now) / 86_400_000)),
     })));
   } catch { res.json([]); }
+});
+
+app.get("/api/print-center/data", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+
+    const type = String(req.query?.type || "").trim().toLowerCase();
+    const limit = Math.min(1000, Math.max(1, Number.parseInt(req.query?.limit, 10) || 500));
+    const now = Date.now();
+
+    if (type === "invoices") {
+      const [fatora, tap] = await Promise.all([
+        db.query(
+          `SELECT 'fatora' AS provider, p.order_id, p.user_email, u.full_name,
+                  p.amount, p.currency, p.status, p.provider_transaction_id AS transaction_id,
+                  p.created_at, p.paid_at, u.premium_expiry
+           FROM fatora_subscription_payments p
+           LEFT JOIN users u ON LOWER(u.email)=LOWER(p.user_email)
+           ORDER BY p.created_at DESC LIMIT $1`,
+          [limit]
+        ),
+        db.query(
+          `SELECT 'tap' AS provider, p.order_id, p.user_email, u.full_name,
+                  p.amount, p.currency, p.status, p.tap_charge_id AS transaction_id,
+                  p.created_at, p.paid_at, u.premium_expiry
+           FROM tap_subscription_payments p
+           LEFT JOIN users u ON LOWER(u.email)=LOWER(p.user_email)
+           ORDER BY p.created_at DESC LIMIT $1`,
+          [limit]
+        ),
+      ]);
+      const records = [...fatora.rows, ...tap.rows]
+        .sort((a, b) => Number(b.created_at) - Number(a.created_at))
+        .slice(0, limit)
+        .map((row) => ({
+          id: String(row.order_id || ""),
+          orderId: String(row.order_id || ""),
+          provider: String(row.provider || ""),
+          email: String(row.user_email || ""),
+          fullName: String(row.full_name || ""),
+          amount: Number(row.amount) || 0,
+          currency: String(row.currency || ""),
+          status: String(row.status || "pending"),
+          transactionId: String(row.transaction_id || ""),
+          createdAt: Number(row.created_at) || 0,
+          paidAt: Number(row.paid_at) || 0,
+          premiumExpiry: Number(row.premium_expiry) || 0,
+          isActive: Number(row.premium_expiry) > now,
+        }));
+      res.set("Cache-Control", "no-store");
+      return res.json({ ok: true, type, generatedAt: now, records });
+    }
+
+    if (type === "subscriptions") {
+      const result = await db.query(
+        `SELECT email, full_name, premium_expiry, activation_code, created_at, banned
+         FROM users
+         WHERE premium_expiry > 0 AND deleted_at IS NULL
+         ORDER BY premium_expiry DESC
+         LIMIT $1`,
+        [limit]
+      );
+      const records = result.rows.map((row) => {
+        const expiry = Number(row.premium_expiry) || 0;
+        return {
+          id: String(row.email || ""),
+          email: String(row.email || ""),
+          fullName: String(row.full_name || ""),
+          premiumExpiry: expiry,
+          activationCode: String(row.activation_code || ""),
+          createdAt: Number(row.created_at) || 0,
+          status: expiry > now ? "active" : "expired",
+          isActive: expiry > now,
+          banned: !!row.banned,
+        };
+      });
+      res.set("Cache-Control", "no-store");
+      return res.json({ ok: true, type, generatedAt: now, records });
+    }
+
+    if (type === "users") {
+      const result = await db.query(
+        `SELECT email, full_name, created_at, premium_expiry, points, rank, banned
+         FROM users
+         WHERE deleted_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT $1`,
+        [limit]
+      );
+      const records = result.rows.map((row) => ({
+        id: String(row.email || ""),
+        email: String(row.email || ""),
+        fullName: String(row.full_name || ""),
+        createdAt: Number(row.created_at) || 0,
+        premiumExpiry: Number(row.premium_expiry) || 0,
+        points: Number(row.points) || 0,
+        rank: String(row.rank || ""),
+        banned: !!row.banned,
+      }));
+      res.set("Cache-Control", "no-store");
+      return res.json({ ok: true, type, generatedAt: now, records });
+    }
+
+    if (type === "services") {
+      const result = await db.query("SELECT value FROM settings WHERE key=$1 LIMIT 1", ["servicesOrder"]);
+      let serviceOrder = result.rows[0]?.value;
+      if (typeof serviceOrder === "string") {
+        try { serviceOrder = JSON.parse(serviceOrder); } catch { serviceOrder = []; }
+      }
+      const records = (Array.isArray(serviceOrder) ? serviceOrder : [])
+        .slice(0, 250)
+        .map((item, index) => ({
+          id: String(item?.id || item?.key || `service-${index + 1}`).slice(0, 120),
+          name: String(item?.name || item?.title || item?.label || item?.id || `خدمة ${index + 1}`).slice(0, 160),
+          visible: item?.visible !== false,
+        }));
+      res.set("Cache-Control", "no-store");
+      return res.json({ ok: true, type, generatedAt: now, records });
+    }
+
+    return res.status(400).json({ ok: false, error: "invalid_print_data_type" });
+  } catch (error) {
+    console.error("print center data fetch failed:", error?.message || error);
+    return res.status(500).json({ ok: false, error: "print_center_data_failed" });
+  }
 });
 
 // ══════════════════════════════════════════════
