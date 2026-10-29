@@ -504,6 +504,47 @@ async function initDB() {
       ON admin_print_forms(assigned_email, status, created_at DESC);
   `);
   await db.query(`
+    CREATE TABLE IF NOT EXISTS live_visitors (
+      visitor_id TEXT PRIMARY KEY,
+      page_id TEXT NOT NULL DEFAULT '',
+      page_title TEXT NOT NULL DEFAULT '',
+      source_host TEXT NOT NULL DEFAULT '',
+      device_type TEXT NOT NULL DEFAULT '',
+      browser TEXT NOT NULL DEFAULT '',
+      country_code TEXT NOT NULL DEFAULT '',
+      started_at BIGINT NOT NULL,
+      last_seen BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS live_visitors_last_seen_idx
+      ON live_visitors(last_seen DESC);
+    CREATE TABLE IF NOT EXISTS visitor_activity (
+      id BIGSERIAL PRIMARY KEY,
+      visitor_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      page_id TEXT NOT NULL DEFAULT '',
+      page_title TEXT NOT NULL DEFAULT '',
+      source_host TEXT NOT NULL DEFAULT '',
+      device_type TEXT NOT NULL DEFAULT '',
+      browser TEXT NOT NULL DEFAULT '',
+      country_code TEXT NOT NULL DEFAULT '',
+      happened_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS visitor_activity_happened_idx
+      ON visitor_activity(happened_at DESC);
+    CREATE TABLE IF NOT EXISTS visitor_daily_stats (
+      day DATE PRIMARY KEY,
+      visits INTEGER NOT NULL DEFAULT 0,
+      unique_sessions INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS visitor_daily_sessions (
+      day DATE NOT NULL,
+      visitor_id TEXT NOT NULL,
+      PRIMARY KEY(day, visitor_id)
+    );
+    CREATE INDEX IF NOT EXISTS visitor_daily_sessions_day_idx
+      ON visitor_daily_sessions(day);
+  `);
+  await db.query(`
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS document_type TEXT NOT NULL DEFAULT 'إجراء إداري';
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS recipient TEXT NOT NULL DEFAULT '';
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT '';
@@ -683,10 +724,11 @@ function moderatorPermissionForRequest(req) {
   if (/^\/api\/admin\/private-tutor(?:s|-)/.test(path)) return "canManageTutors";
   if (path === "/api/print-center/data" && method === "GET") {
     const type = String(req.query?.type || body.type || "").trim().toLowerCase();
-    if (type === "invoices" || type === "subscriptions") return "canManageSubscriptions";
-    if (type === "users") return ["canManageUsers", "canManageSubscriptions"];
-    if (type === "services") return ["canManageServices", "canViewStats"];
-    return "canViewDashboard";
+    if (type === "invoices") return "canPrintInvoices";
+    if (type === "subscriptions") return "canPrintSubscriptions";
+    if (type === "users") return "canPrintUsers";
+    if (type === "services") return "canPrintServices";
+    return null;
   }
   if (path === "/api/settings") {
     if (method === "GET") return "canManageSettings";
@@ -768,6 +810,20 @@ async function getMonitoringAdmin(req) {
   const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
   if (user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)) return user;
   return user.is_moderator && sanitizePermissions(user.permissions).canManageErrors === true ? user : null;
+}
+
+async function isManagerRequest(req) {
+  const token = String(req.headers["x-session-token"] || "");
+  if (!token) return false;
+  const user = await getSessionUser(token);
+  if (!user || user.banned) return false;
+  const email = String(user.email || "").trim().toLowerCase();
+  const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  return !!(
+    user.is_admin || user.isAdmin ||
+    user.is_super_admin || user.isSuperAdmin ||
+    (configuredAdminEmail && email === configuredAdminEmail)
+  );
 }
 
 async function getPrintFormActor(req, allowDashboardModerator = false) {
@@ -1268,7 +1324,9 @@ const MODERATOR_PERMISSION_KEYS = new Set([
   "canManageSettings", "canManageModerators", "canViewStats", "canManageServices",
   "canManageStore", "canManageDictionary", "canManageSocial", "canManageBanners",
   "canManageQuotes", "canManageServiceSettings", "canManageBans", "canManageApi",
-  "canManageTutors", "canManageErrors", "canSendBroadcasts", "canUseStamp"
+  "canManageTutors", "canManageErrors", "canSendBroadcasts", "canUseStamp",
+  "canPrintCustom", "canPrintServices", "canPrintUsers",
+  "canPrintSubscriptions", "canPrintInvoices"
 ]);
 
 function sanitizePermissions(value) {
@@ -1612,21 +1670,13 @@ app.use("/api/openrouter", rateLimit({
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
-// كل تغيير إداري يحتاج نموذجاً مطبوعاً مسبقاً من المدير.
+// نموذج الطباعة اختياري للإجراءات العامة؛ عند إرفاق نموذج مفعّل يظل لمرة واحدة.
 app.use(async (req, res, next) => {
-  if (!String(req.path || "").startsWith("/api/")) return next();
-  if (!isAdminManagementMutation(req)) return next();
+  if (!String(req.path || "").startsWith("/api/") || !isAdminManagementMutation(req)) return next();
+  const printId = String(req.headers["x-aplus-print-id"] || "").trim().slice(0, 80);
+  if (!printId) return next();
   try {
     if (!(await isAdminRequest(req))) return next();
-    const printId = String(req.headers["x-aplus-print-id"] || "").trim().slice(0, 80);
-    if (!printId) {
-      return res.status(428).json({
-        ok: false,
-        error: "admin_print_required",
-        msg: "يجب تفعيل نموذج طباعة معتمد قبل تنفيذ الإجراء الإداري",
-      });
-    }
-
     const token = String(req.headers["x-session-token"] || "");
     const actor = req.adminActor || (token ? await getSessionUser(token) : null);
     const actorEmail = String(actor?.email || "").trim().toLowerCase();
@@ -1650,43 +1700,25 @@ app.use(async (req, res, next) => {
         msg: "نموذج الطباعة غير صالح أو منتهي أو مخصص لموظف آخر",
       });
     }
-
-    req.aplusPrintAuthorization = {
-      id: printId,
-      reservationId,
-      actorEmail,
-      path,
-      method,
-    };
+    req.aplusPrintAuthorization = { id: printId, reservationId, actorEmail, path, method };
     res.once("finish", () => {
-      const authorization = req.aplusPrintAuthorization;
-      if (!authorization) return;
+      const auth = req.aplusPrintAuthorization;
+      if (!auth) return;
       const succeeded = res.statusCode >= 200 && res.statusCode < 400;
-      const update = succeeded
+      const query = succeeded
         ? `UPDATE admin_print_forms
-           SET status='used', used_at=$1, used_by=$2, used_path=$3, used_method=$4,
-               reserved_by='', reserved_until=0
+           SET status='used',used_at=$1,used_by=$2,used_path=$3,used_method=$4,reserved_by='',reserved_until=0
            WHERE id=$5 AND reserved_by=$6`
-        : `UPDATE admin_print_forms
-           SET reserved_by='', reserved_until=0
-           WHERE id=$1 AND reserved_by=$2`;
+        : `UPDATE admin_print_forms SET reserved_by='',reserved_until=0 WHERE id=$1 AND reserved_by=$2`;
       const values = succeeded
-        ? [Date.now(), authorization.actorEmail, authorization.path, authorization.method, authorization.id, authorization.reservationId]
-        : [authorization.id, authorization.reservationId];
-      void db.query(update, values).catch((error) => {
-        console.warn("admin print authorization finalization failed:", error?.message || error);
-      });
-      if (succeeded) {
-        void auditLog("admin_print_form_used", authorization.actorEmail, {
-          printFormId: authorization.id,
-          path: authorization.path,
-          method: authorization.method,
-        });
-      }
+        ? [Date.now(), auth.actorEmail, auth.path, auth.method, auth.id, auth.reservationId]
+        : [auth.id, auth.reservationId];
+      void db.query(query, values).catch((error) => console.warn("optional print authorization finalization failed:", error?.message || error));
+      if (succeeded) void auditLog("admin_print_form_used", auth.actorEmail, { printFormId: auth.id, path: auth.path, method: auth.method });
     });
     next();
   } catch (error) {
-    console.error("admin print authorization check failed:", error?.message || error);
+    console.error("optional print authorization check failed:", error?.message || error);
     res.status(503).json({ ok: false, error: "admin_print_service_unavailable", msg: "تعذر التحقق من نموذج الطباعة" });
   }
 });
@@ -1749,7 +1781,7 @@ app.get("/api/healthz", (_req, res) => {
   res.json({ status: "ok", time: Date.now(), clients: sseClients.size });
 });
 
-// نماذج الطباعة الإدارية — ينشئها المدير قبل أي تغيير إداري.
+// نماذج الطباعة الإدارية — اختيارية للإجراءات العامة، وتبقى مقيّدة عند استخدامها.
 function formatAdminPrintForm(row) {
   return {
     id: row.id,
@@ -1779,13 +1811,22 @@ function formatAdminPrintForm(row) {
 app.get("/api/admin/print-forms", async (req, res) => {
   try {
     const actor = await getPrintFormActor(req, false);
-    if (!actor?.isManager) return res.status(403).json({ ok: false, error: "forbidden", msg: "أرشيف المستندات متاح للمدير فقط" });
-    const result = await db.query(
+    if (!actor) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
+    const result = actor.isManager ? await db.query(
           `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,approved_at,expires_at,status,
                   used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
                   attachment_name,attachment_mime,attachment_size
            FROM admin_print_forms WHERE approved_at>0 ORDER BY approved_at DESC`
-         );
+    ) : await db.query(
+      `SELECT id,title,assigned_email,details,created_by,created_at,printed_at,approved_at,expires_at,status,
+              used_at,used_by,used_path,used_method,document_type,recipient,subject,document_link,
+              attachment_name,attachment_mime,attachment_size
+       FROM admin_print_forms
+       WHERE LOWER(assigned_email)=LOWER($1) AND status='printed'
+         AND used_at=0 AND expires_at>$2
+       ORDER BY printed_at DESC`,
+      [actor.email, Date.now()]
+    );
     res.json({ ok: true, forms: result.rows.map(formatAdminPrintForm) });
   } catch (error) {
     console.error("admin print forms list failed:", error?.message || error);
@@ -4228,6 +4269,228 @@ app.get("/api/print-center/data", async (req, res) => {
   } catch (error) {
     console.error("print center data fetch failed:", error?.message || error);
     return res.status(500).json({ ok: false, error: "print_center_data_failed" });
+  }
+});
+
+// تتبع تشغيلي محدود: لا نحفظ عنوان IP أو الموقع الدقيق.
+const VISITOR_ID_PATTERN = /^[a-f0-9-]{16,80}$/i;
+let lastVisitorCleanupAt = 0;
+
+function visitorPage(body = {}) {
+  const pageId = String(body.pageId || body.page || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+  const pageTitle = String(body.pageTitle || "").replace(/[\u0000-\u001f\u007f<>]/g, " ").trim().slice(0, 120);
+  return { pageId, pageTitle: pageTitle || pageId || "الصفحة الرئيسية" };
+}
+
+function visitorSourceHost(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    return url.hostname.toLowerCase().replace(/^www\./, "").slice(0, 120);
+  } catch {
+    return "";
+  }
+}
+
+function visitorDevice(req) {
+  const ua = String(req.headers["user-agent"] || "").slice(0, 700);
+  const deviceType = /ipad|tablet|silk/i.test(ua) ? "لوحي" : /mobile|android|iphone|ipod/i.test(ua) ? "هاتف" : "حاسوب";
+  const browser = /edg\//i.test(ua) ? "Edge" : /firefox\//i.test(ua) ? "Firefox" : /opr\/|opera/i.test(ua) ? "Opera" : /chrome\//i.test(ua) ? "Chrome" : /safari\//i.test(ua) ? "Safari" : "متصفح آخر";
+  const countryCode = String(
+    req.headers["cf-ipcountry"] || req.headers["x-vercel-ip-country"] || req.headers["cloudfront-viewer-country"] || ""
+  ).trim().toUpperCase().slice(0, 2).replace(/[^A-Z]/g, "");
+  return { deviceType, browser, countryCode };
+}
+
+async function expireLiveVisitors(now = Date.now()) {
+  await db.query(
+    `WITH stale AS (
+       DELETE FROM live_visitors WHERE last_seen<$1
+       RETURNING visitor_id,page_id,page_title,source_host,device_type,browser,country_code
+     )
+     INSERT INTO visitor_activity
+       (visitor_id,event_type,page_id,page_title,source_host,device_type,browser,country_code,happened_at)
+     SELECT visitor_id,'exit',page_id,page_title,source_host,device_type,browser,country_code,$2 FROM stale`,
+    [now - 90_000, now]
+  );
+}
+
+app.post("/api/track/visit", async (req, res) => {
+  try {
+    const visitorId = String(req.body?.visitorId || "").trim();
+    if (!VISITOR_ID_PATTERN.test(visitorId)) return res.status(400).json({ ok: false, error: "invalid_visitor_id" });
+    const day = new Date().toISOString().slice(0, 10);
+    const unique = await db.query(
+      "INSERT INTO visitor_daily_sessions(day,visitor_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING visitor_id",
+      [day, visitorId]
+    );
+    if (unique.rowCount) {
+      await db.query(
+        `INSERT INTO visitor_daily_stats(day,visits,unique_sessions) VALUES($1,1,1)
+         ON CONFLICT(day) DO UPDATE SET visits=visitor_daily_stats.visits+1,
+           unique_sessions=visitor_daily_stats.unique_sessions+1`,
+        [day]
+      );
+    }
+    res.set("Cache-Control", "no-store");
+    res.json({ ok: true, recorded: !!unique.rowCount });
+  } catch (error) {
+    console.error("visitor daily count failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "visitor_count_failed" });
+  }
+});
+
+app.get("/api/track/stats", async (_req, res) => {
+  try {
+    if (!(await isManagerRequest(_req))) return res.status(403).json({ ok: false, error: "manager_required" });
+    const result = await db.query(
+      `SELECT COALESCE(SUM(visits),0) AS total,
+              COALESCE(SUM(unique_sessions),0) AS unique_all_time,
+              COALESCE(SUM(visits) FILTER (WHERE day=CURRENT_DATE),0) AS today,
+              COALESCE(SUM(unique_sessions) FILTER (WHERE day=CURRENT_DATE),0) AS today_unique,
+              COALESCE(SUM(visits) FILTER (WHERE day>=CURRENT_DATE-6),0) AS last7,
+              COALESCE(SUM(visits) FILTER (WHERE day>=CURRENT_DATE-29),0) AS last30
+       FROM visitor_daily_stats`
+    );
+    const row = result.rows[0] || {};
+    res.set("Cache-Control", "no-store");
+    res.json({
+      total: Number(row.total) || 0,
+      uniqueAllTime: Number(row.unique_all_time) || 0,
+      today: Number(row.today) || 0,
+      todayUnique: Number(row.today_unique) || 0,
+      last7: Number(row.last7) || 0,
+      last30: Number(row.last30) || 0,
+    });
+  } catch (error) {
+    console.error("visitor statistics failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "visitor_stats_failed" });
+  }
+});
+
+app.post("/api/visitors/ping", async (req, res) => {
+  try {
+    const visitorId = String(req.body?.visitorId || "").trim();
+    if (!VISITOR_ID_PATTERN.test(visitorId)) return res.status(400).json({ ok: false, error: "invalid_visitor_id" });
+    const now = Date.now();
+    const { pageId, pageTitle } = visitorPage(req.body || {});
+    const sourceHost = visitorSourceHost(req.body?.referrer || "");
+    const { deviceType, browser, countryCode } = visitorDevice(req);
+    const prior = await db.query("SELECT page_id,last_seen FROM live_visitors WHERE visitor_id=$1", [visitorId]);
+    const wasStale = prior.rowCount && Number(prior.rows[0].last_seen) < now - 90_000;
+    const eventType = !prior.rowCount || wasStale ? "entry" : prior.rows[0].page_id !== pageId ? "page" : "";
+    await db.query(
+      `INSERT INTO live_visitors
+         (visitor_id,page_id,page_title,source_host,device_type,browser,country_code,started_at,last_seen)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)
+       ON CONFLICT(visitor_id) DO UPDATE SET
+         page_id=EXCLUDED.page_id,page_title=EXCLUDED.page_title,
+         source_host=CASE WHEN live_visitors.source_host='' THEN EXCLUDED.source_host ELSE live_visitors.source_host END,
+         device_type=EXCLUDED.device_type,browser=EXCLUDED.browser,
+         country_code=CASE WHEN EXCLUDED.country_code='' THEN live_visitors.country_code ELSE EXCLUDED.country_code END,
+         started_at=CASE WHEN live_visitors.last_seen<$9 THEN EXCLUDED.started_at ELSE live_visitors.started_at END,
+         last_seen=EXCLUDED.last_seen`,
+      [visitorId, pageId, pageTitle, sourceHost, deviceType, browser, countryCode, now, now - 90_000]
+    );
+    if (eventType) {
+      await db.query(
+        `INSERT INTO visitor_activity(visitor_id,event_type,page_id,page_title,source_host,device_type,browser,country_code,happened_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [visitorId, eventType, pageId, pageTitle, sourceHost, deviceType, browser, countryCode, now]
+      );
+      broadcastAdminEvent({ type: "live_visitor_update", action: eventType, pageTitle, happenedAt: now });
+    }
+    if (now - lastVisitorCleanupAt > 300_000) {
+      lastVisitorCleanupAt = now;
+      void db.query("DELETE FROM visitor_activity WHERE happened_at<$1", [now - 7 * 86_400_000]).catch(() => {});
+      void expireLiveVisitors(now).catch(() => {});
+      void db.query("DELETE FROM visitor_daily_sessions WHERE day<CURRENT_DATE-90").catch(() => {});
+    }
+    res.set("Cache-Control", "no-store");
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("live visitor update failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "visitor_ping_failed" });
+  }
+});
+
+app.post("/api/visitors/leave", express.text({ type: "text/plain", limit: "2kb" }), async (req, res) => {
+  try {
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const visitorId = String(body?.visitorId || "").trim();
+    if (!VISITOR_ID_PATTERN.test(visitorId)) return res.status(400).json({ ok: false, error: "invalid_visitor_id" });
+    const removed = await db.query("DELETE FROM live_visitors WHERE visitor_id=$1 RETURNING *", [visitorId]);
+    if (removed.rowCount) {
+      const row = removed.rows[0];
+      const now = Date.now();
+      await db.query(
+        `INSERT INTO visitor_activity(visitor_id,event_type,page_id,page_title,source_host,device_type,browser,country_code,happened_at)
+         VALUES($1,'exit',$2,$3,$4,$5,$6,$7,$8)`,
+        [visitorId, row.page_id, row.page_title, row.source_host, row.device_type, row.browser, row.country_code, now]
+      );
+      broadcastAdminEvent({ type: "live_visitor_update", action: "exit", happenedAt: now });
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("live visitor exit failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "visitor_leave_failed" });
+  }
+});
+
+app.get("/api/admin/live-visitors", async (req, res) => {
+  try {
+    if (!(await isManagerRequest(req))) return res.status(403).json({ ok: false, error: "manager_required" });
+    const now = Date.now();
+    const activeSince = now - 90_000;
+    await expireLiveVisitors(now);
+    const [visitors, pages, activity] = await Promise.all([
+      db.query(
+        `SELECT visitor_id,page_id,page_title,source_host,device_type,browser,country_code,started_at,last_seen
+         FROM live_visitors WHERE last_seen>=$1 ORDER BY last_seen DESC LIMIT 500`,
+        [activeSince]
+      ),
+      db.query(
+        `SELECT page_id,page_title,COUNT(*)::int AS visitors
+         FROM live_visitors WHERE last_seen>=$1 GROUP BY page_id,page_title ORDER BY COUNT(*) DESC LIMIT 30`,
+        [activeSince]
+      ),
+      db.query(
+        `SELECT visitor_id,event_type,page_title,source_host,device_type,browser,country_code,happened_at
+         FROM visitor_activity WHERE happened_at>=$1 ORDER BY happened_at DESC LIMIT 80`,
+        [now - 86_400_000]
+      ),
+    ]);
+    const visitorKey = (value) => String(value || "").slice(-6);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      ok: true,
+      generatedAt: now,
+      visitors: visitors.rows.map((row) => ({
+        visitorKey: visitorKey(row.visitor_id),
+        pageId: row.page_id,
+        pageTitle: row.page_title,
+        sourceHost: row.source_host,
+        device: row.device_type,
+        browser: row.browser,
+        countryCode: row.country_code,
+        startedAt: Number(row.started_at) || 0,
+        lastSeen: Number(row.last_seen) || 0,
+      })),
+      pages: pages.rows.map((row) => ({ pageId: row.page_id, pageTitle: row.page_title, visitors: Number(row.visitors) || 0 })),
+      activity: activity.rows.map((row) => ({
+        visitorKey: visitorKey(row.visitor_id),
+        eventType: row.event_type,
+        pageTitle: row.page_title,
+        sourceHost: row.source_host,
+        device: row.device_type,
+        browser: row.browser,
+        countryCode: row.country_code,
+        happenedAt: Number(row.happened_at) || 0,
+      })),
+    });
+  } catch (error) {
+    console.error("live visitor list failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "live_visitors_failed" });
   }
 });
 
