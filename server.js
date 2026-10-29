@@ -6334,9 +6334,9 @@ async function createTapCharge({ orderId, amount, user, phone, description, kind
   if (!email) throw new Error("A customer email is required for Tap checkout");
   const phoneCountryCode = String(phone?.countryCode || phone?.country_code || "").replace(/\D/g, "").slice(0, 3);
   const phoneNumber = String(phone?.number || "").replace(/\D/g, "").replace(/^0+/, "").slice(0, 15);
-  const tapSourceId = String(sourceId || "src_card").trim();
+  const tapSourceId = String(sourceId || "src_all").trim();
   const isTokenSource = /^tok_[A-Za-z0-9_-]{8,120}$/.test(tapSourceId);
-  if (!isTokenSource && !["src_card", "src_apple_pay"].includes(tapSourceId)) {
+  if (!isTokenSource && !["src_card", "src_apple_pay", "src_all"].includes(tapSourceId)) {
     throw new Error("Unsupported Tap payment source");
   }
   const fullName = String(user?.full_name || user?.name || email).trim().slice(0, 120);
