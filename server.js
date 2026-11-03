@@ -685,14 +685,15 @@ function safeKeyCompare(a, b) {
 }
 
 function checkAdmin(req) {
-  const key = req.headers["x-admin-key"] || req.query.adminKey || req.body?.adminKey;
+  // لا تقبل مفاتيح الإدارة من query أو body لتجنب تسريبها في السجلات.
+  const key = req.headers["x-admin-key"];
   return !!ADMIN_KEY && safeKeyCompare(String(key || ""), ADMIN_KEY);
 }
 
 // تحقق مزدوج: مفتاح المدير + جلسة صالحة لمستخدم مدير في DB
 async function checkAdminStrict(req) {
   if (!checkAdmin(req)) return null;
-  const token = req.headers["x-session-token"] || req.query.token;
+  const token = req.headers["x-session-token"];
   if (!token) return null;
   const user = await getSessionUser(token);
   if (!user) return null;
@@ -700,9 +701,8 @@ async function checkAdminStrict(req) {
   return user;
 }
 
-// مصادقة الإدارة بالطريقة الصحيحة للواجهة:
-// لا نضع ADMIN_KEY داخل JavaScript العام؛ نستخدم جلسة المدير، مع إبقاء
-// مفتاح البيئة متاحاً للطلبات الخلفية/التكاملات القديمة.
+// مصادقة واجهات الإدارة تعتمد على الجلسة وأدوار قاعدة البيانات؛
+// مفتاح البيئة لا يمنح وحده صلاحية عبر واجهات الويب.
 function moderatorCanDelegate(actor, requested) {
   const allowed = sanitizePermissions(actor?.permissions);
   const grants = sanitizePermissions(requested);
@@ -770,8 +770,9 @@ function moderatorPermissionForRequest(req) {
 }
 
 async function isAdminRequest(req) {
-  if (checkAdmin(req)) return true;
-  const token = req.headers["x-session-token"] || req.query.token;
+  // واجهات الإدارة العامة تعتمد على جلسة صالحة وصلاحيات قاعدة البيانات فقط.
+  // لا يكفي مفتاح ثابت/مكشوف من الواجهة لمنح صلاحيات إدارية.
+  const token = req.headers["x-session-token"];
   if (!token) return false;
   const user = await getSessionUser(token);
   if (!user) return false;
@@ -1575,12 +1576,22 @@ setInterval(() => {
 
 function broadcastEvent(data, targetEmail = null) {
   const eventType = data.type || "message";
-  const payload   = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  // الإعدادات تُجلب عبر endpoints المحمية/العامة؛ لا تُبث قيمها أو مفاتيحها.
+  const eventData = eventType === "settings_updated" ? { type: eventType } : data;
+  const payload   = `event: ${eventType}\ndata: ${JSON.stringify(eventData)}\n\n`;
+  const adminOnlyTypes = new Set(["users_updated", "codes_updated", "feedback_received"]);
+  const privateEmail = String(data.email || "").trim().toLowerCase();
+  const target = String(targetEmail || "").trim().toLowerCase();
   const dead = [];
 
   for (const [id, client] of sseClients) {
-    // إذا كان الحدث مخصصاً لمستخدم معين → أرسل فقط لذلك المستخدم (تجاهل المجهولين)
-    if (targetEmail && client._email !== targetEmail) continue;
+    const clientEmail = String(client._email || "").trim().toLowerCase();
+    // الرسائل الموجهة لا تصل إلا لصاحب الحساب.
+    if (target && clientEmail !== target) continue;
+    // قوائم الإدارة لا تُعلن للزوار أو المستخدمين العاديين.
+    if (adminOnlyTypes.has(eventType) && !client._isAdmin) continue;
+    // أي حدث يتضمن بريد مستخدم يقتصر على صاحب الحساب والمدير.
+    if (privateEmail && clientEmail !== privateEmail && !client._isAdmin) continue;
     try {
       client.write(payload);
     } catch {
@@ -2835,12 +2846,14 @@ app.get("/api/stream", async (req, res) => {
     userEmail = ticketData.email;
     isAdmin = ticketData.isAdmin;
   } else {
-    const token = req.headers["x-session-token"] || req.query.token;
+    const token = req.headers["x-session-token"];
     if (token) {
       try {
         const u = await getSessionUser(token);
         userEmail = u?.email || null;
-        isAdmin = !!(u && (u.is_admin || u.is_super_admin));
+        const email = String(u?.email || "").trim().toLowerCase();
+        const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+        isAdmin = !!(u && (u.is_admin || u.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)));
       } catch {}
     }
   }
@@ -2861,8 +2874,11 @@ app.get("/api/stream", async (req, res) => {
     "Access-Control-Allow-Headers": "*",
   });
 
-  // رسالة ترحيب فورية
-  res.write(`event: connected\ndata: ${JSON.stringify({ type: "connected", id, clients: sseClients.size + 1 })}\n\n`);
+  // لا تكشف أعداد الاتصالات أو معرفاتها للزوار غير المسجلين.
+  const connectedData = userEmail
+    ? { type: "connected", id, clients: sseClients.size + 1 }
+    : { type: "connected" };
+  res.write(`event: connected\ndata: ${JSON.stringify(connectedData)}\n\n`);
 
   res._email = userEmail;
   res._isAdmin = isAdmin;
@@ -4577,13 +4593,17 @@ app.get("/download-reset-page", (_req, res) => {
   });
 });
 
-app.get("/download-server", (_req, res) => {
+app.get("/download-server", async (req, res) => {
+  if (!(await isManagerRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
   res.setHeader("Content-Disposition", 'attachment; filename="server.js"');
   res.setHeader("Content-Type", "application/javascript");
+  res.setHeader("Cache-Control", "private, no-store");
   res.sendFile(path.join(__dirname, "server.js"));
 });
 
-app.get("/download-pkg", (_req, res) => {
+app.get("/download-pkg", async (req, res) => {
+  if (!(await isManagerRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+  res.setHeader("Cache-Control", "private, no-store");
   res.sendFile(path.join(__dirname, "package.json"));
 });
 
