@@ -1150,7 +1150,7 @@ async function sendVerificationEmail(toEmail, code, fullName) {
   if (RESEND_KEY) {
     try {
       await _sendViaResend(toEmail, "🔐 كود تأكيد حسابك — A+ الطبي", htmlBody);
-      console.log(`✅ [Resend] كود التحقق أُرسل إلى: ${toEmail}`);
+      console.log("✅ [Resend] verification email accepted");
       return true;
     } catch (err) {
       console.error("❌ [Resend] فشل إرسال التحقق:", err.message);
@@ -1171,14 +1171,18 @@ async function sendVerificationEmail(toEmail, code, fullName) {
         subject: "🔐 كود تأكيد حسابك — A+ الطبي",
         html: htmlBody
       });
-      console.log(`✅ [Gmail] كود التحقق أُرسل إلى: ${toEmail}`);
+      console.log("✅ [Gmail] verification email accepted");
       return true;
     } catch (err) {
       console.error("❌ [Gmail] فشل إرسال التحقق:", err.message);
     }
   }
-  console.log(`\n📧 [DEV] كود التحقق لـ ${toEmail}: ${code}\n`);
-  return true;
+  console.error(
+    RESEND_KEY || (GMAIL_USER && GMAIL_PASS)
+      ? "❌ Verification email failed through every configured provider"
+      : "❌ Verification email provider secrets are missing"
+  );
+  return false;
 }
 
 function hashPassword(password) {
@@ -3008,9 +3012,19 @@ app.post("/api/auth/register", async (req, res) => {
       "INSERT INTO email_verification_tokens (token, email, expires_at, used, created_at) VALUES ($1,$2,$3,FALSE,$4)",
       [verifyCode, norm, verifyExpiry, Date.now()]
     );
-    await sendVerificationEmail(norm, verifyCode, fullName?.trim() || "");
+    const emailSent = await sendVerificationEmail(norm, verifyCode, fullName?.trim() || "");
+    if (!emailSent) {
+      await db.query("DELETE FROM email_verification_tokens WHERE email=$1 AND token=$2", [norm, verifyCode]);
+      return res.status(503).json({
+        ok: true,
+        requiresVerification: true,
+        email: norm,
+        emailSent: false,
+        msg: "تم إنشاء الحساب، لكن تعذر إرسال الكود. أعد المحاولة بعد تفعيل خدمة البريد."
+      });
+    }
     broadcastEvent({ type: "users_updated" });
-    res.json({ ok: true, requiresVerification: true, email: norm, msg: "تم إرسال كود التأكيد على بريدك الإلكتروني" });
+    res.json({ ok: true, requiresVerification: true, email: norm, emailSent: true, msg: "تم إرسال كود التأكيد على بريدك الإلكتروني" });
   } catch (e) {
     console.error("register error:", e.message);
     res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
@@ -3154,8 +3168,12 @@ app.post("/api/auth/resend-verification", async (req, res) => {
       "INSERT INTO email_verification_tokens (token, email, expires_at, used, created_at) VALUES ($1,$2,$3,FALSE,$4)",
       [code, norm, expiry, Date.now()]
     );
-    await sendVerificationEmail(norm, code, uRow.rows[0].full_name || "");
-    res.json({ ok: true, msg: "تم إرسال كود جديد على بريدك" });
+    const emailSent = await sendVerificationEmail(norm, code, uRow.rows[0].full_name || "");
+    if (!emailSent) {
+      await db.query("DELETE FROM email_verification_tokens WHERE email=$1 AND token=$2", [norm, code]);
+      return res.status(503).json({ ok: false, emailSent: false, msg: "تعذر إرسال الكود. تحقق الإدارة من إعدادات البريد." });
+    }
+    res.json({ ok: true, emailSent: true, msg: "تم إرسال كود جديد على بريدك" });
   } catch (e) {
     console.error("resend-verification error:", e.message);
     res.status(500).json({ ok: false, msg: "خطأ في الخادم" });
