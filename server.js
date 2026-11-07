@@ -346,6 +346,25 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS tap_subscription_payments_user_created_idx
       ON tap_subscription_payments(user_email, created_at DESC);
+    CREATE TABLE IF NOT EXISTS business_expenses (
+      id TEXT PRIMARY KEY,
+      description TEXT NOT NULL,
+      category TEXT NOT NULL,
+      amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+      currency TEXT NOT NULL,
+      expense_date BIGINT NOT NULL,
+      reference_no TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '',
+      created_by TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      voided_at BIGINT NOT NULL DEFAULT 0,
+      voided_by TEXT NOT NULL DEFAULT '',
+      void_reason TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS business_expenses_date_idx
+      ON business_expenses(expense_date DESC);
+    CREATE INDEX IF NOT EXISTS business_expenses_currency_date_idx
+      ON business_expenses(currency, expense_date DESC);
     CREATE TABLE IF NOT EXISTS private_tutor_rooms (
       id TEXT PRIMARY KEY, tutor_id TEXT NOT NULL REFERENCES private_tutors(id) ON DELETE CASCADE,
       booking_id TEXT REFERENCES private_tutor_bookings(id) ON DELETE SET NULL,
@@ -722,6 +741,9 @@ function moderatorPermissionForRequest(req) {
   if (path === "/api/stats") return "canViewStats";
   if (path === "/api/admin/reports") return ["canViewReports", "canViewStats"];
   if (path === "/api/admin/audit-log") return "canViewAuditLog";
+  if (path === "/api/admin/finance/summary" && method === "GET") return ["canViewFinance", "canManageFinance"];
+  if (path === "/api/admin/finance/expenses" && method === "POST") return "canManageFinance";
+  if (/^\/api\/admin\/finance\/expenses\/[^/]+\/void$/.test(path) && method === "POST") return "canManageFinance";
   if (path === "/api/broadcast") return "canSendBroadcasts";
   if (path === "/api/subscriptions/list") return "canManageSubscriptions";
   if (/^\/api\/admin\/community\//.test(path)) return "canManageBans";
@@ -1336,7 +1358,8 @@ const MODERATOR_PERMISSION_KEYS = new Set([
   "canManageTutors", "canManageErrors", "canSendBroadcasts", "canUseStamp",
   "canViewReports", "canViewAuditLog",
   "canPrintCustom", "canPrintServices", "canPrintUsers",
-  "canPrintSubscriptions", "canPrintInvoices"
+  "canPrintSubscriptions", "canPrintInvoices",
+  "canViewFinance", "canManageFinance"
 ]);
 
 function sanitizePermissions(value) {
@@ -4700,6 +4723,213 @@ app.get("/api/admin/reports", async (req, res) => {
   }
 });
 
+const FINANCE_EXPENSE_CATEGORIES = new Set([
+  "hosting", "marketing", "software", "payment_fees", "salaries", "operations", "refund", "other"
+]);
+function financeParseUtcDay(value) {
+  const text = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const [year, month, day] = text.split("-").map(Number);
+  const time = Date.UTC(year, month - 1, day);
+  return new Date(time).toISOString().slice(0, 10) === text ? time : null;
+}
+
+app.get("/api/admin/finance/summary", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const now = Date.now();
+    const today = new Date(now).toISOString().slice(0, 10);
+    const defaultFrom = new Date(now - 29 * 86_400_000).toISOString().slice(0, 10);
+    const from = String(req.query.from || defaultFrom);
+    const to = String(req.query.to || today);
+    const start = financeParseUtcDay(from);
+    const endStart = financeParseUtcDay(to);
+    if (start === null || endStart === null || start > endStart) {
+      return res.status(400).json({ ok: false, error: "invalid_finance_period", msg: "حدد فترة صحيحة للتقرير" });
+    }
+    const endExclusive = endStart + 86_400_000;
+    const days = Math.ceil((endExclusive - start) / 86_400_000);
+    if (days > 366) return res.status(400).json({ ok: false, error: "finance_period_too_large", msg: "أقصى فترة للتقرير سنة واحدة" });
+    const limit = Math.max(1, Math.min(250, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
+    const tapCurrency = String(TAP_CURRENCY || "XXX").toUpperCase();
+    const fatoraCurrency = String(FATORA_CURRENCY || "XXX").toUpperCase();
+    const ledgerSql = `
+      SELECT 'income'::text AS kind,'subscription'::text AS source,
+             p.order_id::text AS id,p.order_id::text AS reference,p.user_email::text AS party,
+             'اشتراك A+ الطبي'::text AS description,''::text AS category,
+             p.amount::numeric AS amount,p.currency::text AS currency,p.status::text AS status,
+             COALESCE(NULLIF(p.paid_at,0),p.created_at)::bigint AS occurred_at,
+             ''::text AS created_by,0::bigint AS voided_at,''::text AS void_reason
+      FROM fatora_subscription_payments p
+      WHERE COALESCE(NULLIF(p.paid_at,0),p.created_at)>=$1 AND COALESCE(NULLIF(p.paid_at,0),p.created_at)<$2
+      UNION ALL
+      SELECT 'income','subscription',p.order_id::text,p.order_id::text,p.user_email::text,
+             'اشتراك A+ الطبي','',p.amount::numeric,p.currency::text,p.status::text,
+             COALESCE(NULLIF(p.paid_at,0),p.created_at)::bigint,'',0::bigint,''
+      FROM tap_subscription_payments p
+      WHERE COALESCE(NULLIF(p.paid_at,0),p.created_at)>=$1 AND COALESCE(NULLIF(p.paid_at,0),p.created_at)<$2
+      UNION ALL
+      SELECT 'income','private_tutor',p.id::text,p.transaction_no::text,p.student_email::text,
+             'خدمة معلم خصوصي','',p.amount::numeric,
+             CASE WHEN COALESCE(p.tap_charge_id,'')<>'' THEN $3::text ELSE $4::text END,p.status::text,
+             COALESCE(NULLIF(p.paid_at,0),p.created_at)::bigint,'',0::bigint,''
+      FROM private_tutor_payments p
+      WHERE COALESCE(NULLIF(p.paid_at,0),p.created_at)>=$1 AND COALESCE(NULLIF(p.paid_at,0),p.created_at)<$2
+      UNION ALL
+      SELECT 'expense','expense',e.id::text,e.reference_no::text,e.created_by::text,
+             e.description::text,e.category::text,e.amount::numeric,e.currency::text,
+             CASE WHEN e.voided_at>0 THEN 'voided' ELSE 'recorded' END,
+             e.expense_date::bigint,e.created_by::text,e.voided_at::bigint,e.void_reason::text
+      FROM business_expenses e
+      WHERE e.expense_date>=$1 AND e.expense_date<$2
+    `;
+    const [totalsResult, ledgerResult] = await Promise.all([
+      db.query(
+        `WITH ledger AS (${ledgerSql})
+         SELECT UPPER(COALESCE(NULLIF(currency,''),'غير محدد')) AS currency,
+                COALESCE(SUM(amount) FILTER (WHERE kind='income' AND status='paid'),0) AS income,
+                COALESCE(SUM(amount) FILTER (WHERE kind='income' AND status='pending'),0) AS pending,
+                COALESCE(SUM(amount) FILTER (WHERE kind='expense' AND voided_at=0),0) AS expenses,
+                COUNT(*) FILTER (WHERE kind='income' AND status='paid') AS income_count,
+                COUNT(*) FILTER (WHERE kind='income' AND status='pending') AS pending_count,
+                COUNT(*) FILTER (WHERE kind='expense' AND voided_at=0) AS expense_count,
+                COUNT(*) FILTER (WHERE kind='expense' AND voided_at>0) AS voided_expense_count
+         FROM ledger
+         GROUP BY UPPER(COALESCE(NULLIF(currency,''),'غير محدد'))
+         ORDER BY currency`,
+         [start, endExclusive, tapCurrency, fatoraCurrency]
+      ),
+      db.query(
+        `WITH ledger AS (${ledgerSql})
+         SELECT * FROM ledger
+         ORDER BY occurred_at DESC,id DESC
+         LIMIT $5`,
+        [start, endExclusive, tapCurrency, fatoraCurrency, limit]
+      )
+    ]);
+    const currencies = totalsResult.rows.map((row) => {
+      const income = Number(row.income) || 0;
+      const expenses = Number(row.expenses) || 0;
+      return {
+        currency: String(row.currency || "غير محدد"),
+        income,
+        expenses,
+        net: income - expenses,
+        pending: Number(row.pending) || 0,
+        incomeCount: Number(row.income_count) || 0,
+        pendingCount: Number(row.pending_count) || 0,
+        expenseCount: Number(row.expense_count) || 0,
+        voidedExpenseCount: Number(row.voided_expense_count) || 0,
+      };
+    });
+    res.set("Cache-Control", "no-store");
+    res.json({
+      ok: true,
+      period: { from, to, days },
+      generatedAt: now,
+      currencyPolicy: "Totals are grouped by currency; no currency conversion is applied.",
+      summary: currencies,
+      transactions: ledgerResult.rows.map((row) => ({
+        id: String(row.id || ""),
+        kind: String(row.kind || ""),
+        source: String(row.source || ""),
+        reference: String(row.reference || ""),
+        party: String(row.party || ""),
+        description: String(row.description || ""),
+        category: String(row.category || ""),
+        amount: Number(row.amount) || 0,
+        currency: String(row.currency || ""),
+        status: String(row.status || ""),
+        occurredAt: Number(row.occurred_at) || 0,
+        createdBy: String(row.created_by || ""),
+        voidedAt: Number(row.voided_at) || 0,
+        voidReason: String(row.void_reason || ""),
+      })),
+      recordLimit: limit,
+    });
+  } catch (error) {
+    console.error("admin finance summary failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "finance_summary_failed", msg: "تعذر تحميل التقرير المالي" });
+  }
+});
+
+app.post("/api/admin/finance/expenses", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const description = String(body.description || "").trim().slice(0, 160);
+    const category = String(body.category || "").trim().toLowerCase();
+    const currency = String(body.currency || "").trim().toUpperCase();
+    const amountInput = Number(body.amount);
+    const expenseDate = financeParseUtcDay(body.expenseDate);
+    const referenceNo = String(body.referenceNo || "").trim().slice(0, 100);
+    const notes = String(body.notes || "").trim().slice(0, 1000);
+    if (description.length < 3 || !FINANCE_EXPENSE_CATEGORIES.has(category) ||
+        !Number.isFinite(amountInput) || amountInput <= 0 || amountInput > 1_000_000_000 ||
+        !/^[A-Z]{3}$/.test(currency) || expenseDate === null) {
+      return res.status(400).json({ ok: false, error: "invalid_expense", msg: "تحقق من وصف المصروف والمبلغ والعملة والتاريخ" });
+    }
+    const amount = Number(amountInput.toFixed(2));
+    if (amount <= 0) return res.status(400).json({ ok: false, error: "invalid_expense_amount", msg: "المبلغ غير صالح" });
+    const actorEmail = String(req.adminActor?.email || "").trim().toLowerCase();
+    if (!actorEmail) return res.status(403).json({ ok: false, error: "forbidden" });
+    const id = `EXP-${Date.now()}-${randomBytes(8).toString("hex")}`;
+    const createdAt = Date.now();
+    const result = await db.query(
+      `INSERT INTO business_expenses
+       (id,description,category,amount,currency,expense_date,reference_no,notes,created_by,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING id,description,category,amount,currency,expense_date,reference_no,notes,created_by,created_at`,
+      [id, description, category, amount, currency, expenseDate, referenceNo, notes, actorEmail, createdAt]
+    );
+    await auditLog("finance_expense_created", actorEmail, {
+      expenseId: id, amount, currency, category, expenseDate, referenceNo
+    });
+    const row = result.rows[0];
+    res.status(201).json({
+      ok: true,
+      expense: {
+        id: row.id, description: row.description, category: row.category,
+        amount: Number(row.amount) || 0, currency: row.currency,
+        expenseDate: Number(row.expense_date) || 0, referenceNo: row.reference_no,
+        notes: row.notes, createdBy: row.created_by, createdAt: Number(row.created_at) || 0
+      }
+    });
+  } catch (error) {
+    console.error("admin finance expense create failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "finance_expense_create_failed", msg: "تعذر تسجيل المصروف" });
+  }
+});
+
+app.post("/api/admin/finance/expenses/:id/void", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const actorEmail = String(req.adminActor?.email || "").trim().toLowerCase();
+    const id = String(req.params.id || "").trim().slice(0, 100);
+    const reason = String(req.body?.reason || "").trim().slice(0, 300);
+    if (!actorEmail || !id || reason.length < 3) {
+      return res.status(400).json({ ok: false, error: "void_reason_required", msg: "اكتب سببًا واضحًا لإلغاء القيد" });
+    }
+    const voidedAt = Date.now();
+    const result = await db.query(
+      `UPDATE business_expenses
+       SET voided_at=$2,voided_by=$3,void_reason=$4
+       WHERE id=$1 AND voided_at=0
+       RETURNING id,amount,currency,category`,
+      [id, voidedAt, actorEmail, reason]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "expense_not_found_or_voided", msg: "القيد غير موجود أو ملغى مسبقًا" });
+    await auditLog("finance_expense_voided", actorEmail, {
+      expenseId: id, amount: Number(result.rows[0].amount) || 0,
+      currency: result.rows[0].currency, category: result.rows[0].category, reason
+    });
+    res.json({ ok: true, id, voidedAt });
+  } catch (error) {
+    console.error("admin finance expense void failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "finance_expense_void_failed", msg: "تعذر إلغاء القيد" });
+  }
+});
+
 app.get("/api/admin/audit-log", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
@@ -4725,20 +4955,74 @@ app.get("/api/stats", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
     const now = Date.now();
-    const [users, codes, subs, feedback] = await Promise.all([
-      db.query("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL"),
-      db.query("SELECT COUNT(*) FROM codes WHERE active=TRUE"),
-      db.query("SELECT COUNT(*) FROM users WHERE premium_expiry>$1 AND deleted_at IS NULL", [now]),
-      db.query("SELECT COUNT(*) FROM feedback WHERE read=FALSE"),
+    const today = new Date(now).toISOString().slice(0, 10);
+    const [users, codes, ads, feedback, liveVisitors, openErrors, pendingTutorApplications, pendingTutorBookings, todayVisits] = await Promise.all([
+      db.query(
+        `SELECT COUNT(*) FILTER (WHERE deleted_at IS NULL) AS total_users,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND last_seen >= $1) AS active_users_30d,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND created_at >= $1) AS new_users_30d,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND premium_expiry > $2) AS active_subscriptions,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND premium_expiry > $2 AND premium_expiry <= $3) AS expiring_subscriptions_7d,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND banned=TRUE) AS banned_users,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_moderator=TRUE) AS moderators
+         FROM users`,
+        [now - 30 * 24 * 60 * 60 * 1000, now, now + 7 * 24 * 60 * 60 * 1000]
+      ),
+      db.query(
+        `SELECT COUNT(*) AS total_codes,
+                COUNT(*) FILTER (WHERE active=TRUE) AS active_codes,
+                COUNT(*) FILTER (WHERE used_count > 0) AS used_codes,
+                COUNT(*) FILTER (WHERE active=TRUE AND used_count < max_uses) AS available_codes
+         FROM codes`
+      ),
+      db.query(
+        "SELECT COUNT(*) AS total_ads, COUNT(*) FILTER (WHERE active=TRUE) AS active_ads FROM ads"
+      ),
+      db.query("SELECT COUNT(*) AS unread_feedback FROM feedback WHERE read=FALSE"),
+      db.query("SELECT COUNT(*) AS live_visitors FROM live_visitors WHERE last_seen >= $1", [now - 90_000]),
+      db.query("SELECT COUNT(*) AS open_errors FROM app_errors WHERE status='open'"),
+      db.query("SELECT COUNT(*) AS pending_applications FROM private_tutor_applications WHERE status='pending'"),
+      db.query("SELECT COUNT(*) AS pending_bookings FROM private_tutor_bookings WHERE status='pending'"),
+      db.query("SELECT visits,unique_sessions FROM visitor_daily_stats WHERE day=$1::date", [today]),
     ]);
+    const numeric = (row, key) => Number.parseInt(row?.[key] || "0", 10) || 0;
+    const userStats = users.rows[0] || {};
+    const codeStats = codes.rows[0] || {};
+    const adStats = ads.rows[0] || {};
+    const todayStats = todayVisits.rows[0] || {};
+    const permissions = sanitizePermissions(req.adminActor?.permissions);
+    const isScopedModerator = req.adminActorIsModerator === true;
+    res.set("Cache-Control", "no-store");
     res.json({
-      totalUsers:     parseInt(users.rows[0].count),
-      activeCodes:    parseInt(codes.rows[0].count),
-      activeSubcriptions: parseInt(subs.rows[0].count),
-      unreadFeedback: parseInt(feedback.rows[0].count),
-      onlineClients:  sseClients.size,
+      ok: true,
+      generatedAt: now,
+      totalUsers: numeric(userStats, "total_users"),
+      activeCodes: numeric(codeStats, "active_codes"),
+      totalCodes: numeric(codeStats, "total_codes"),
+      usedCodes: numeric(codeStats, "used_codes"),
+      availableCodes: numeric(codeStats, "available_codes"),
+      activeSubcriptions: numeric(userStats, "active_subscriptions"),
+      activeSubscriptions: numeric(userStats, "active_subscriptions"),
+      unreadFeedback: !isScopedModerator || permissions.canViewFeedback === true ? numeric(feedback.rows[0], "unread_feedback") : null,
+      activeUsers30d: numeric(userStats, "active_users_30d"),
+      newUsers30d: numeric(userStats, "new_users_30d"),
+      expiringSubscriptions7d: numeric(userStats, "expiring_subscriptions_7d"),
+      bannedUsers: numeric(userStats, "banned_users"),
+      moderators: numeric(userStats, "moderators"),
+      totalAds: numeric(adStats, "total_ads"),
+      activeAds: numeric(adStats, "active_ads"),
+      liveVisitors: numeric(liveVisitors.rows[0], "live_visitors"),
+      todayVisits: numeric(todayStats, "visits"),
+      todayUniqueSessions: numeric(todayStats, "unique_sessions"),
+      openApplicationErrors: !isScopedModerator || permissions.canManageErrors === true ? numeric(openErrors.rows[0], "open_errors") : null,
+      pendingTutorApplications: !isScopedModerator || permissions.canManageTutors === true ? numeric(pendingTutorApplications.rows[0], "pending_applications") : null,
+      pendingTutorBookings: !isScopedModerator || permissions.canManageTutors === true ? numeric(pendingTutorBookings.rows[0], "pending_bookings") : null,
+      onlineClients: sseClients.size,
     });
-  } catch { res.json({}); }
+  } catch (error) {
+    console.error("admin stats failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "stats_failed" });
+  }
 });
 
 // ══════════════════════════════════════════════
