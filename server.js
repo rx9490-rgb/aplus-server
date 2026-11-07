@@ -110,6 +110,7 @@ async function initDB() {
       is_admin          BOOLEAN DEFAULT FALSE,
       is_super_admin    BOOLEAN DEFAULT FALSE,
       is_moderator      BOOLEAN DEFAULT FALSE,
+      staff_role        TEXT DEFAULT '',
       permissions       JSONB DEFAULT '{}',
       premium_expiry    BIGINT DEFAULT 0,
       trial_counters    JSONB DEFAULT '{}',
@@ -599,6 +600,7 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_code TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS staff_role TEXT DEFAULT ''`,
     `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_url TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS tutor_email TEXT DEFAULT ''`,
     `ALTER TABLE private_tutors ADD COLUMN IF NOT EXISTS zoom_url TEXT DEFAULT ''`,
@@ -718,6 +720,8 @@ function moderatorPermissionForRequest(req) {
   if (/^\/api\/ads(?:\/|$)/.test(path)) return "canManageAds";
   if (/^\/api\/feedback\/list$/.test(path) || /^\/api\/feedback\/[^/]+(?:\/read)?$/.test(path)) return "canViewFeedback";
   if (path === "/api/stats") return "canViewStats";
+  if (path === "/api/admin/reports") return ["canViewReports", "canViewStats"];
+  if (path === "/api/admin/audit-log") return "canViewAuditLog";
   if (path === "/api/broadcast") return "canSendBroadcasts";
   if (path === "/api/subscriptions/list") return "canManageSubscriptions";
   if (/^\/api\/admin\/community\//.test(path)) return "canManageBans";
@@ -758,7 +762,7 @@ function moderatorPermissionForRequest(req) {
   if (/^\/api\/users\/[^/]+\/ban$/.test(path) || /^\/api\/users\/[^/]+\/unlock$/.test(path)) return "canManageUsers";
   if (/^\/api\/users\/[^/]+$/.test(path)) {
     const required = [];
-    const roleEdit = ["isModerator", "isAdmin", "permissions", "employeeCode"].some((key) => Object.prototype.hasOwnProperty.call(body, key));
+    const roleEdit = ["isModerator", "isAdmin", "permissions", "employeeCode", "staffRole"].some((key) => Object.prototype.hasOwnProperty.call(body, key));
     if (roleEdit) required.push("canManageModerators");
     if (["premiumExpiry", "activationCode"].some((key) => Object.prototype.hasOwnProperty.call(body, key))) required.push("canManageSubscriptions");
     if (["banned", "password"].some((key) => Object.prototype.hasOwnProperty.call(body, key)) ||
@@ -1330,6 +1334,7 @@ const MODERATOR_PERMISSION_KEYS = new Set([
   "canManageStore", "canManageDictionary", "canManageSocial", "canManageBanners",
   "canManageQuotes", "canManageServiceSettings", "canManageBans", "canManageApi",
   "canManageTutors", "canManageErrors", "canSendBroadcasts", "canUseStamp",
+  "canViewReports", "canViewAuditLog",
   "canPrintCustom", "canPrintServices", "canPrintUsers",
   "canPrintSubscriptions", "canPrintInvoices"
 ]);
@@ -1350,6 +1355,7 @@ function formatUser(u) {
     isAdmin: u.is_admin,
     isSuperAdmin: u.is_super_admin,
     isModerator: u.is_moderator,
+    staffRole: u.staff_role || (u.is_moderator ? "moderator" : ""),
     permissions: u.permissions || {},
     premiumExpiry: Number(u.premium_expiry) || 0,
     trialCounters: u.trial_counters || {},
@@ -2915,11 +2921,18 @@ app.post("/api/auth/admin-create", async (req, res) => {
     const email = String(body.email || "").toLowerCase().trim();
     const password = String(body.password || "");
     const isModerator = body.isModerator !== false;
+    const staffRole = isModerator ? String(body.staffRole || "moderator").trim() : "";
     const permissions = sanitizePermissions(body.permissions);
     const requestedEmployeeCode = String(body.employeeCode || "").trim();
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
       return res.status(400).json({ ok: false, msg: "صيغة البريد الإلكتروني غير صحيحة" });
+    }
+    if (isModerator && !["moderator", "deputy_manager"].includes(staffRole)) {
+      return res.status(400).json({ ok: false, msg: "نوع الدور الإداري غير صحيح" });
+    }
+    if (req.adminActorIsModerator && staffRole === "deputy_manager") {
+      return res.status(403).json({ ok: false, error: "forbidden", msg: "نائب المدير يعيّنه المدير الرئيسي فقط" });
     }
     if (password.length < 6) {
       return res.status(400).json({ ok: false, msg: "كلمة المرور 6 أحرف على الأقل" });
@@ -2952,20 +2965,20 @@ app.post("/api/auth/admin-create", async (req, res) => {
     let row;
     if (existing.rows.length) {
       const updated = await db.query(
-        "UPDATE users SET full_name=$1, password_hash=$2, is_admin=FALSE, is_super_admin=FALSE, is_moderator=$3, permissions=$4, employee_code=$5, banned=FALSE, deleted_at=NULL, email_verified=TRUE, login_attempts=0, locked_until=0, last_seen=$6 WHERE email=$7 RETURNING *",
-        [fullName || email.split("@")[0], hashPassword(password), isModerator, JSON.stringify(permissions), employeeCode, now, email]
+        "UPDATE users SET full_name=$1, password_hash=$2, is_admin=FALSE, is_super_admin=FALSE, is_moderator=$3, staff_role=$4, permissions=$5, employee_code=$6, banned=FALSE, deleted_at=NULL, email_verified=TRUE, login_attempts=0, locked_until=0, last_seen=$7 WHERE email=$8 RETURNING *",
+        [fullName || email.split("@")[0], hashPassword(password), isModerator, staffRole, JSON.stringify(permissions), employeeCode, now, email]
       );
       row = updated.rows[0];
     } else {
       const inserted = await db.query(
-        "INSERT INTO users (email, full_name, password_hash, is_admin, is_super_admin, is_moderator, permissions, employee_code, email_verified, created_at, last_seen) VALUES ($1,$2,$3,FALSE,FALSE,$4,$5,$6,TRUE,$7,$7) RETURNING *",
-        [email, fullName || email.split("@")[0], hashPassword(password), isModerator, JSON.stringify(permissions), employeeCode, now]
+        "INSERT INTO users (email, full_name, password_hash, is_admin, is_super_admin, is_moderator, staff_role, permissions, employee_code, email_verified, created_at, last_seen) VALUES ($1,$2,$3,FALSE,FALSE,$4,$5,$6,$7,TRUE,$8,$8) RETURNING *",
+        [email, fullName || email.split("@")[0], hashPassword(password), isModerator, staffRole, JSON.stringify(permissions), employeeCode, now]
       );
       row = inserted.rows[0];
     }
 
     invalidateSessionCache(email);
-    await auditLog("admin_create_user", email, { email, isModerator, permissions, ip: getClientIp(req) });
+    await auditLog("admin_create_user", req.adminActor?.email || email, { email, isModerator, staffRole, permissions, ip: getClientIp(req) });
     broadcastEvent({ type: "users_updated" });
     res.status(existing.rows.length ? 200 : 201).json({ ok: true, created: !existing.rows.length, user: formatUser(row) });
   } catch (e) {
@@ -3925,6 +3938,13 @@ app.patch("/api/users/:email", async (req, res) => {
       if (body.permissions !== undefined && !moderatorCanDelegate(req.adminActor, body.permissions)) {
         return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكنك منح صلاحيات لا تملكها" });
       }
+      if (body.staffRole === "deputy_manager") {
+        const actorIsDeputy = String(req.adminActor.staff_role || "") === "deputy_manager";
+        const targetIsDeputy = String(found.rows[0].staff_role || "") === "deputy_manager";
+        if (!actorIsDeputy || !targetIsDeputy) {
+          return res.status(403).json({ ok: false, error: "forbidden", msg: "نائب المدير يعيّنه المدير الرئيسي فقط" });
+        }
+      }
     }
     const setParts = [];
     const values = [];
@@ -3935,6 +3955,17 @@ app.patch("/api/users/:email", async (req, res) => {
 
     if (typeof body.fullName !== "undefined") add("full_name", String(body.fullName || "").trim().slice(0, 120));
     if (typeof body.isModerator !== "undefined") add("is_moderator", body.isModerator === true);
+    if (body.isModerator === false) {
+      add("staff_role", "");
+    } else if (typeof body.staffRole !== "undefined") {
+      const staffRole = String(body.staffRole || "").trim();
+      if (staffRole && !["moderator", "deputy_manager"].includes(staffRole)) {
+        return res.status(400).json({ ok: false, msg: "نوع الدور الإداري غير صحيح" });
+      }
+      add("staff_role", staffRole);
+    } else if (body.isModerator === true) {
+      add("staff_role", "moderator");
+    }
     if (typeof body.isAdmin !== "undefined") add("is_admin", body.isAdmin === true);
     if (typeof body.permissions !== "undefined") add("permissions", JSON.stringify(sanitizePermissions(body.permissions)));
     if (typeof body.banned !== "undefined") add("banned", body.banned === true);
@@ -3981,9 +4012,10 @@ app.patch("/api/users/:email", async (req, res) => {
     if (!updated.rows.length) return res.status(404).json({ ok: false, msg: "المستخدم غير موجود" });
 
     invalidateSessionCache(email);
-    await auditLog("admin_update_user", email, {
+    await auditLog("admin_update_user", req.adminActor?.email || email, {
       email,
       fields: setParts.map((part) => part.split("=")[0]),
+      staffRole: updated.rows[0].staff_role || "",
       ip: getClientIp(req)
     });
     broadcastEvent({ type: "users_updated" });
@@ -4045,9 +4077,12 @@ app.patch("/api/users/:email/role", async (req, res) => {
       if (isAdmin === true || target.rows[0].is_admin || target.rows[0].is_super_admin) {
         return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكن منح أو تعديل صلاحية مدير" });
       }
+      if (isModerator === false) {
+        return res.status(403).json({ ok: false, error: "forbidden", msg: "لا يمكن إزالة دور المشرف" });
+      }
     }
     await db.query(
-      "UPDATE users SET is_admin=$1, is_moderator=$2 WHERE email=$3",
+      "UPDATE users SET is_admin=$1, is_moderator=$2, staff_role=CASE WHEN $2 THEN COALESCE(NULLIF(staff_role,''),'moderator') ELSE '' END WHERE email=$3",
       [!!isAdmin, !!isModerator, email]
     );
     invalidateSessionCache(email);
@@ -4565,6 +4600,127 @@ app.post("/api/broadcast", async (req, res) => {
 // ══════════════════════════════════════════════
 // 17. Stats — إحصائيات لوحة التحكم
 // ══════════════════════════════════════════════
+app.get("/api/admin/reports", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const requestedDays = Number.parseInt(String(req.query.days || "30"), 10);
+    const days = new Set([7, 30, 90]).has(requestedDays) ? requestedDays : 30;
+    const now = Date.now();
+    const since = now - days * 24 * 60 * 60 * 1000;
+    const sinceDate = new Date(since).toISOString().slice(0, 10);
+    const [health, userSummary, codeSummary, feedbackSummary, userTrend, visitorTrend] = await Promise.all([
+      db.query("SELECT 1 AS ok"),
+      db.query(
+        `SELECT COUNT(*) FILTER (WHERE deleted_at IS NULL) AS total_users,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND created_at >= $1) AS new_users,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND last_seen >= $2) AS active_30d,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND premium_expiry > $3) AS active_subscriptions,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND premium_expiry > $3 AND premium_expiry <= $4) AS expiring_7d,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND banned=TRUE) AS banned_users,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_moderator=TRUE) AS moderators
+         FROM users`,
+        [since, now - 30 * 24 * 60 * 60 * 1000, now, now + 7 * 24 * 60 * 60 * 1000]
+      ),
+      db.query(
+        `SELECT COUNT(*) AS total_codes,
+                COUNT(*) FILTER (WHERE active=TRUE) AS active_codes,
+                COUNT(*) FILTER (WHERE used_count > 0) AS used_codes,
+                COUNT(*) FILTER (WHERE active=TRUE AND used_count < max_uses) AS available_codes
+         FROM codes`
+      ),
+      db.query(
+        `SELECT COUNT(*) FILTER (WHERE read=FALSE) AS unread_feedback,
+                COUNT(*) FILTER (WHERE created_at >= $1) AS period_feedback
+         FROM feedback`,
+        [since]
+      ),
+      db.query(
+        `SELECT to_char(date_trunc('day',to_timestamp(created_at/1000.0))::date,'YYYY-MM-DD') AS day,
+                COUNT(*) AS new_users
+         FROM users
+         WHERE deleted_at IS NULL AND created_at >= $1
+         GROUP BY 1 ORDER BY 1`,
+        [since]
+      ),
+      db.query(
+        `SELECT to_char(day,'YYYY-MM-DD') AS day,
+                COALESCE(SUM(visits),0) AS visits,
+                COALESCE(SUM(unique_sessions),0) AS unique_sessions
+         FROM visitor_daily_stats
+         WHERE day >= $1::date
+         GROUP BY day ORDER BY day`,
+        [sinceDate]
+      )
+    ]);
+    const byDay = new Map();
+    for (const row of userTrend.rows) {
+      byDay.set(row.day, { day: row.day, newUsers: Number(row.new_users) || 0, visits: 0, uniqueSessions: 0 });
+    }
+    for (const row of visitorTrend.rows) {
+      const current = byDay.get(row.day) || { day: row.day, newUsers: 0, visits: 0, uniqueSessions: 0 };
+      current.visits = Number(row.visits) || 0;
+      current.uniqueSessions = Number(row.unique_sessions) || 0;
+      byDay.set(row.day, current);
+    }
+    for (let offset = 0; offset < days; offset++) {
+      const day = new Date(now - offset * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      if (!byDay.has(day)) byDay.set(day, { day, newUsers: 0, visits: 0, uniqueSessions: 0 });
+    }
+    const daily = [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
+    const usersRow = userSummary.rows[0] || {};
+    const codesRow = codeSummary.rows[0] || {};
+    const feedbackRow = feedbackSummary.rows[0] || {};
+    const numeric = (value) => Number(value) || 0;
+    res.set("Cache-Control", "no-store");
+    res.json({
+      ok: true, days, generatedAt: now,
+      health: { database: health.rowCount === 1 ? "connected" : "unknown" },
+      summary: {
+        totalUsers: numeric(usersRow.total_users),
+        newUsers: numeric(usersRow.new_users),
+        activeUsers30d: numeric(usersRow.active_30d),
+        activeSubscriptions: numeric(usersRow.active_subscriptions),
+        expiringSubscriptions7d: numeric(usersRow.expiring_7d),
+        bannedUsers: numeric(usersRow.banned_users),
+        moderators: numeric(usersRow.moderators),
+        totalCodes: numeric(codesRow.total_codes),
+        activeCodes: numeric(codesRow.active_codes),
+        usedCodes: numeric(codesRow.used_codes),
+        availableCodes: numeric(codesRow.available_codes),
+        unreadFeedback: numeric(feedbackRow.unread_feedback),
+        periodFeedback: numeric(feedbackRow.period_feedback),
+        visits: daily.reduce((sum, row) => sum + row.visits, 0),
+        uniqueSessions: daily.reduce((sum, row) => sum + row.uniqueSessions, 0)
+      },
+      daily
+    });
+  } catch (error) {
+    console.error("admin report failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "report_failed", msg: "تعذر إنشاء التقرير" });
+  }
+});
+
+app.get("/api/admin/audit-log", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    await db.query(
+      `CREATE TABLE IF NOT EXISTS audit_log (
+        id SERIAL PRIMARY KEY, action TEXT NOT NULL, actor TEXT, details JSONB, ip TEXT, ts BIGINT NOT NULL
+      )`
+    );
+    const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
+    const result = await db.query(
+      "SELECT id,action,actor,details,ip,ts FROM audit_log ORDER BY ts DESC,id DESC LIMIT $1",
+      [limit]
+    );
+    res.set("Cache-Control", "no-store");
+    res.json({ ok: true, events: result.rows });
+  } catch (error) {
+    console.error("admin audit log failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "audit_log_failed", msg: "تعذر تحميل سجل النشاط" });
+  }
+});
+
 app.get("/api/stats", async (req, res) => {
   try {
     if (!(await isAdminRequest(req))) return res.status(403).json({ error: "forbidden" });
