@@ -481,7 +481,10 @@ async function initDB() {
       created_at BIGINT NOT NULL,
       last_seen BIGINT NOT NULL,
       occurrences INTEGER NOT NULL DEFAULT 1,
-      status TEXT NOT NULL DEFAULT 'open'
+      status TEXT NOT NULL DEFAULT 'open',
+      resolution_note TEXT NOT NULL DEFAULT '',
+      resolved_by TEXT NOT NULL DEFAULT '',
+      resolved_at BIGINT NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS app_errors_created_idx
       ON app_errors(created_at DESC);
@@ -489,6 +492,9 @@ async function initDB() {
       ON app_errors(error_number, created_at DESC);
     CREATE INDEX IF NOT EXISTS app_errors_status_created_idx
       ON app_errors(status, created_at DESC);
+    ALTER TABLE app_errors ADD COLUMN IF NOT EXISTS resolution_note TEXT NOT NULL DEFAULT '';
+    ALTER TABLE app_errors ADD COLUMN IF NOT EXISTS resolved_by TEXT NOT NULL DEFAULT '';
+    ALTER TABLE app_errors ADD COLUMN IF NOT EXISTS resolved_at BIGINT NOT NULL DEFAULT 0;
   `);
 
   await db.query(`
@@ -563,6 +569,17 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS visitor_daily_sessions_day_idx
       ON visitor_daily_sessions(day);
+    CREATE TABLE IF NOT EXISTS service_usage_events (
+      id BIGSERIAL PRIMARY KEY,
+      visitor_id TEXT NOT NULL,
+      service_id TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK (event_type IN ('open','request')),
+      happened_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS service_usage_events_time_idx
+      ON service_usage_events(happened_at DESC);
+    CREATE INDEX IF NOT EXISTS service_usage_events_service_time_idx
+      ON service_usage_events(service_id,happened_at DESC);
   `);
   await db.query(`
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS document_type TEXT NOT NULL DEFAULT 'إجراء إداري';
@@ -739,6 +756,7 @@ function moderatorPermissionForRequest(req) {
   if (/^\/api\/ads(?:\/|$)/.test(path)) return "canManageAds";
   if (/^\/api\/feedback\/list$/.test(path) || /^\/api\/feedback\/[^/]+(?:\/read)?$/.test(path)) return "canViewFeedback";
   if (path === "/api/stats") return "canViewStats";
+  if (path === "/api/admin/service-analytics") return "canViewStats";
   if (path === "/api/admin/reports") return ["canViewReports", "canViewStats"];
   if (path === "/api/admin/audit-log") return "canViewAuditLog";
   if (path === "/api/admin/finance/summary" && method === "GET") return ["canViewFinance", "canManageFinance"];
@@ -1452,7 +1470,9 @@ function broadcastAdminEvent(data) {
   const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
   const dead = [];
   for (const [id, client] of sseClients) {
-    if (!client._isAdmin) continue;
+    if (eventType === "service_analytics_update") {
+      if (!client._isAdmin && !client._canViewStats) continue;
+    } else if (!client._isAdmin) continue;
     try { client.write(payload); } catch { dead.push(id); }
   }
   dead.forEach((id) => sseClients.delete(id));
@@ -1467,11 +1487,16 @@ async function persistApplicationError(item) {
      ON CONFLICT (fingerprint) DO UPDATE
        SET occurrences = app_errors.occurrences + 1,
             last_seen = EXCLUDED.last_seen,
-            status = 'open'
+             status = 'open',
+             resolution_note = '',
+             resolved_by = '',
+             resolved_at = 0
      RETURNING id, error_number AS "errorNumber", category, message, source,
                user_email AS "userEmail", request_path AS path, http_method AS method,
                status_code AS "statusCode", stack, created_at AS "createdAt",
-               last_seen AS "lastSeen", occurrences, status`,
+                last_seen AS "lastSeen", occurrences, status,
+                resolution_note AS "resolutionNote", resolved_by AS "resolvedBy",
+                resolved_at AS "resolvedAt"`,
     [
       item.fingerprint, item.errorNumber, item.category, item.message, item.source,
       item.userEmail, item.path, item.method, item.statusCode, item.stack, item.createdAt,
@@ -2400,7 +2425,9 @@ app.get("/api/admin/errors", async (req, res) => {
       `SELECT id, error_number AS "errorNumber", category, message, source,
               user_email AS "userEmail", request_path AS path, http_method AS method,
               status_code AS "statusCode", stack, created_at AS "createdAt",
-              last_seen AS "lastSeen", occurrences, status
+               last_seen AS "lastSeen", occurrences, status,
+               resolution_note AS "resolutionNote", resolved_by AS "resolvedBy",
+               resolved_at AS "resolvedAt"
        FROM app_errors ${where}
        ORDER BY last_seen DESC LIMIT $${values.length}`,
       values
@@ -2433,12 +2460,19 @@ app.patch("/api/admin/errors/:id/resolve", async (req, res) => {
     if (!admin) return res.status(403).json({ ok: false, error: "forbidden", msg: "غير مصرح" });
     const id = String(req.params.id || "");
     if (!/^\d{1,18}$/.test(id)) return res.status(400).json({ ok: false, msg: "رقم السجل غير صحيح" });
+    const resolutionNote = sanitizeMonitorText(req.body?.resolutionNote || "", 1000);
+    const resolvedAt = Date.now();
     const updated = await db.query(
-      "UPDATE app_errors SET status='resolved' WHERE id=$1 RETURNING id, error_number AS \"errorNumber\", status",
-      [id]
+      `UPDATE app_errors
+       SET status='resolved', resolution_note=$2, resolved_by=$3, resolved_at=$4
+       WHERE id=$1
+       RETURNING id, error_number AS "errorNumber", status,
+                 resolution_note AS "resolutionNote", resolved_by AS "resolvedBy",
+                 resolved_at AS "resolvedAt"`,
+      [id, resolutionNote, String(admin.email || "").trim().toLowerCase().slice(0, 255), resolvedAt]
     );
     if (!updated.rowCount) return res.status(404).json({ ok: false, msg: "سجل الخطأ غير موجود" });
-    await auditLog("application_error_resolved", admin.email, { errorId: id });
+    await auditLog("application_error_resolved", admin.email, { errorId: id, hasResolutionNote: !!resolutionNote });
     res.json({ ok: true, error: updated.rows[0] });
   } catch (error) {
     console.error("admin error resolve failed:", error?.message || error);
@@ -2855,9 +2889,15 @@ app.post("/api/stream-ticket", async (req, res) => {
     const ticket = randomBytes(24).toString("hex");
     const email = String(user.email || "").trim().toLowerCase();
     const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+    const isAdmin = !!(user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail));
+    const canViewStats = isAdmin || (
+      (user.is_moderator || user.isModerator) &&
+      sanitizePermissions(user.permissions).canViewStats === true
+    );
     streamTickets.set(ticket, {
       email,
-      isAdmin: !!(user.is_admin || user.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)),
+      isAdmin,
+      canViewStats,
       expiresAt: Date.now() + 60_000,
     });
     res.json({ ok: true, ticket, expiresIn: 60 });
@@ -2871,6 +2911,7 @@ app.get("/api/stream", async (req, res) => {
   const id = ++sseIdCounter;
   let userEmail = null;
   let isAdmin = false;
+  let canViewStats = false;
 
   const ticket = String(req.query.ticket || "");
   const ticketData = ticket ? streamTickets.get(ticket) : null;
@@ -2878,6 +2919,7 @@ app.get("/api/stream", async (req, res) => {
     streamTickets.delete(ticket);
     userEmail = ticketData.email;
     isAdmin = ticketData.isAdmin;
+    canViewStats = ticketData.canViewStats === true;
   } else {
     const token = req.headers["x-session-token"];
     if (token) {
@@ -2887,6 +2929,10 @@ app.get("/api/stream", async (req, res) => {
         const email = String(u?.email || "").trim().toLowerCase();
         const configuredAdminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
         isAdmin = !!(u && (u.is_admin || u.is_super_admin || (configuredAdminEmail && email === configuredAdminEmail)));
+        canViewStats = isAdmin || (
+          !!u && (u.is_moderator || u.isModerator) &&
+          sanitizePermissions(u.permissions).canViewStats === true
+        );
       } catch {}
     }
   }
@@ -2895,6 +2941,7 @@ app.get("/api/stream", async (req, res) => {
     try {
       const matchingUser = await db.query("SELECT is_admin,is_super_admin FROM users WHERE email=$1", [userEmail]);
       isAdmin = !!(matchingUser.rows[0]?.is_admin || matchingUser.rows[0]?.is_super_admin);
+      if (isAdmin) canViewStats = true;
     } catch {}
   }
 
@@ -2915,6 +2962,7 @@ app.get("/api/stream", async (req, res) => {
 
   res._email = userEmail;
   res._isAdmin = isAdmin;
+  res._canViewStats = canViewStats;
   sseClients.set(id, res);
 
   req.on("close", () => {
@@ -4374,6 +4422,73 @@ function visitorPage(body = {}) {
   return { pageId, pageTitle: pageTitle || pageId || "الصفحة الرئيسية" };
 }
 
+const ANALYTICS_PAGE_SERVICES = Object.freeze({
+  explainPage: "explain",
+  summaryPage: "summary",
+  quizPage: "quiz",
+  termquizPage: "termquiz",
+  assignmentPage: "assignment",
+  presentationPage: "presentation",
+  projectPage: "project",
+  researchPage: "research",
+  thesisPage: "thesis",
+  dosagePage: "dosage",
+  patientPage: "patient",
+  oscePage: "osce",
+  imagePage: "image",
+  comparePage: "compare",
+  translatePage: "translate",
+  assistantPage: "assistant",
+  tutorPage: "tutor",
+  humanTutorPage: "tutor",
+  studyPage: "study",
+  communityPage: "community-room",
+  notesPage: "notes",
+  feedbackPage: "feedback",
+  healthCommissionPage: "healthcomm",
+  kablanPage: "kablan",
+  dictPage: "dict",
+  medicalAtlasPage: "medical-atlas",
+  salaPage: "sala",
+  myAccountPage: "myaccount",
+  usagePage: "guide",
+  flashcardsPage: "flashcards",
+  quickrevPage: "quickrev",
+});
+const ANALYTICS_SERVICE_LABELS = Object.freeze({
+  explain: "شرح تفصيلي",
+  summary: "ملخص ذكي",
+  quiz: "اختبار متعدد",
+  termquiz: "اختبار المصطلحات",
+  assignment: "واجب أكاديمي",
+  project: "بروجيكت",
+  research: "بحث جامعي",
+  thesis: "مشروع تخرج",
+  presentation: "برزنتيشن",
+  dosage: "حاسبة الجرعات",
+  patient: "تشخيص حالة",
+  osce: "الاختبار العملي OSCE",
+  image: "تحليل الصور",
+  "medical-atlas": "المكتبة الطبية المصوّرة",
+  compare: "مقارنة الأمراض",
+  translate: "ترجمة طبية",
+  assistant: "مساعد ذكي",
+  tutor: "المعلم الخصوصي",
+  "community-room": "مجتمع التعلّم الصحي",
+  notes: "ملاحظاتي",
+  study: "خطة وتقدّم",
+  feedback: "الاقتراحات",
+  flashcards: "بطاقات تعليمية",
+  quickrev: "مراجعة 60 ثانية",
+  healthcomm: "اختبار الهيئة",
+  kablan: "خدمة كيربلان",
+  dict: "القاموس الطبي",
+  sala: "متجر صلة",
+  myaccount: "حسابي الشخصي",
+  guide: "دليل النظام",
+});
+const ANALYTICS_SERVICE_IDS = new Set(Object.keys(ANALYTICS_SERVICE_LABELS));
+
 function visitorSourceHost(value) {
   try {
     const url = new URL(String(value || ""));
@@ -4490,11 +4605,21 @@ app.post("/api/visitors/ping", async (req, res) => {
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
         [visitorId, eventType, pageId, pageTitle, sourceHost, deviceType, browser, countryCode, now]
       );
+      const serviceId = ANALYTICS_PAGE_SERVICES[pageId];
+      if (serviceId) {
+        await db.query(
+          `INSERT INTO service_usage_events(visitor_id,service_id,event_type,happened_at)
+           VALUES($1,$2,'open',$3)`,
+          [visitorId, serviceId, now]
+        );
+        broadcastAdminEvent({ type: "service_analytics_update", serviceId, happenedAt: now });
+      }
       broadcastAdminEvent({ type: "live_visitor_update", action: eventType, pageTitle, happenedAt: now });
     }
     if (now - lastVisitorCleanupAt > 300_000) {
       lastVisitorCleanupAt = now;
       void db.query("DELETE FROM visitor_activity WHERE happened_at<$1", [now - 7 * 86_400_000]).catch(() => {});
+      void db.query("DELETE FROM service_usage_events WHERE happened_at<$1", [now - 90 * 86_400_000]).catch(() => {});
       void expireLiveVisitors(now).catch(() => {});
       void db.query("DELETE FROM visitor_daily_sessions WHERE day<CURRENT_DATE-90").catch(() => {});
     }
@@ -4526,6 +4651,102 @@ app.post("/api/visitors/leave", express.text({ type: "text/plain", limit: "2kb" 
   } catch (error) {
     console.error("live visitor exit failed:", error?.message || error);
     res.status(500).json({ ok: false, error: "visitor_leave_failed" });
+  }
+});
+
+const serviceAnalyticsTrackLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.post("/api/analytics/service-event", serviceAnalyticsTrackLimiter, async (req, res) => {
+  try {
+    const visitorId = String(req.body?.visitorId || "").trim();
+    const serviceId = String(req.body?.serviceId || "").trim().toLowerCase();
+    if (!VISITOR_ID_PATTERN.test(visitorId) || !ANALYTICS_SERVICE_IDS.has(serviceId)) {
+      return res.status(400).json({ ok: false, error: "invalid_service_event" });
+    }
+    const happenedAt = Date.now();
+    await db.query(
+      `INSERT INTO service_usage_events(visitor_id,service_id,event_type,happened_at)
+       VALUES($1,$2,'request',$3)`,
+      [visitorId, serviceId, happenedAt]
+    );
+    broadcastAdminEvent({ type: "service_analytics_update", serviceId, happenedAt });
+    res.set("Cache-Control", "no-store");
+    res.status(202).json({ ok: true });
+  } catch (error) {
+    console.error("service analytics event failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "service_event_failed" });
+  }
+});
+
+app.get("/api/admin/service-analytics", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const requestedDays = Number.parseInt(String(req.query.days || "7"), 10);
+    const days = [7, 30, 90].includes(requestedDays) ? requestedDays : 7;
+    const now = Date.now();
+    const currentFrom = now - days * 86_400_000;
+    const previousFrom = now - days * 2 * 86_400_000;
+    const [aggregate, settingsResult] = await Promise.all([
+      db.query(
+        `SELECT service_id,
+                COUNT(*) FILTER (WHERE event_type='open' AND happened_at >= $1)::int AS opens,
+                COUNT(*) FILTER (WHERE event_type='request' AND happened_at >= $1)::int AS requests,
+                COUNT(DISTINCT visitor_id) FILTER (WHERE happened_at >= $1)::int AS visitors,
+                COUNT(*) FILTER (WHERE event_type='open' AND happened_at >= $2 AND happened_at < $1)::int AS previous_opens,
+                COUNT(*) FILTER (WHERE event_type='request' AND happened_at >= $2 AND happened_at < $1)::int AS previous_requests
+         FROM service_usage_events
+         WHERE happened_at >= $2
+         GROUP BY service_id`,
+        [currentFrom, previousFrom]
+      ),
+      db.query("SELECT key,value FROM settings WHERE key IN ($1,$2)", ["servicesOrder", "svcSettings"]),
+    ]);
+    const settings = Object.fromEntries(settingsResult.rows.map((row) => [row.key, row.value]));
+    const configuredServices = Array.isArray(settings.servicesOrder) ? settings.servicesOrder : [];
+    const customSettings = settings.svcSettings && typeof settings.svcSettings === "object"
+      ? settings.svcSettings : {};
+    const configuredById = new Map(configuredServices
+      .filter((item) => item && typeof item.id === "string")
+      .map((item) => [item.id, item]));
+    const metricsById = new Map(aggregate.rows.map((row) => [row.service_id, row]));
+    const ids = new Set([...ANALYTICS_SERVICE_IDS, ...configuredById.keys()]);
+    const number = (row, key) => Math.max(0, Number(row?.[key]) || 0);
+    const services = [...ids].map((serviceId) => {
+      const configured = configuredById.get(serviceId) || {};
+      const custom = customSettings[serviceId] && typeof customSettings[serviceId] === "object"
+        ? customSettings[serviceId] : {};
+      const row = metricsById.get(serviceId);
+      return {
+        id: serviceId,
+        name: String(custom.name || configured.name || ANALYTICS_SERVICE_LABELS[serviceId] || serviceId).slice(0, 160),
+        visible: configured.visible !== false,
+        opens: number(row, "opens"),
+        requests: number(row, "requests"),
+        visitors: number(row, "visitors"),
+        previousOpens: number(row, "previous_opens"),
+        previousRequests: number(row, "previous_requests"),
+      };
+    }).sort((a, b) => b.requests - a.requests || b.opens - a.opens || a.name.localeCompare(b.name, "ar"));
+    const totalOpens = services.reduce((sum, item) => sum + item.opens, 0);
+    const totalRequests = services.reduce((sum, item) => sum + item.requests, 0);
+    const totalVisitors = aggregate.rows.reduce((sum, row) => sum + number(row, "visitors"), 0);
+    res.set("Cache-Control", "no-store");
+    return res.json({
+      ok: true,
+      generatedAt: now,
+      days,
+      retentionDays: 90,
+      totals: { opens: totalOpens, requests: totalRequests, serviceVisitors: totalVisitors },
+      services,
+    });
+  } catch (error) {
+    console.error("service analytics fetch failed:", error?.message || error);
+    return res.status(500).json({ ok: false, error: "service_analytics_failed" });
   }
 });
 
