@@ -4315,30 +4315,53 @@ app.get("/api/print-center/data", async (req, res) => {
     const now = Date.now();
 
     if (type === "invoices") {
-      const [fatora, tap] = await Promise.all([
-        db.query(
-          `SELECT 'fatora' AS provider, p.order_id, p.user_email, u.full_name,
-                  p.amount, p.currency, p.status, p.provider_transaction_id AS transaction_id,
-                  p.created_at, p.paid_at, u.premium_expiry
+      const parseInvoiceBound = (value) => {
+        if (value === undefined || value === null || value === "") return null;
+        const parsed = Number(value);
+        return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : NaN;
+      };
+      const from = parseInvoiceBound(req.query?.from);
+      const to = parseInvoiceBound(req.query?.to);
+      const invoice = String(req.query?.invoice || "").trim().slice(0, 160);
+      const paidOnly = String(req.query?.paidOnly || "").toLowerCase() === "true";
+      const offsetValue = Number.parseInt(String(req.query?.offset || "0"), 10);
+      const offset = Number.isSafeInteger(offsetValue) && offsetValue > 0
+        ? Math.min(offsetValue, 1_000_000)
+        : 0;
+      if (Number.isNaN(from) || Number.isNaN(to) || (from !== null && to !== null && from >= to)) {
+        return res.status(400).json({ ok: false, error: "invalid_invoice_period", msg: "حدد فترة فواتير صحيحة" });
+      }
+      const result = await db.query(
+        `WITH all_invoices AS (
+           SELECT 'fatora'::text AS provider, p.order_id::text AS order_id,
+                  p.user_email::text AS user_email, u.full_name::text AS full_name,
+                  p.amount::numeric AS amount, p.currency::text AS currency,
+                  p.status::text AS status, p.provider_transaction_id::text AS transaction_id,
+                  p.created_at::bigint AS created_at, COALESCE(p.paid_at,0)::bigint AS paid_at,
+                  COALESCE(u.premium_expiry,0)::bigint AS premium_expiry,
+                  COALESCE(NULLIF(p.paid_at,0),p.created_at)::bigint AS occurred_at
            FROM fatora_subscription_payments p
            LEFT JOIN users u ON LOWER(u.email)=LOWER(p.user_email)
-           ORDER BY p.created_at DESC LIMIT $1`,
-          [limit]
-        ),
-        db.query(
-          `SELECT 'tap' AS provider, p.order_id, p.user_email, u.full_name,
-                  p.amount, p.currency, p.status, p.tap_charge_id AS transaction_id,
-                  p.created_at, p.paid_at, u.premium_expiry
+           UNION ALL
+           SELECT 'tap'::text, p.order_id::text, p.user_email::text, u.full_name::text,
+                  p.amount::numeric, p.currency::text, p.status::text,
+                  p.tap_charge_id::text, p.created_at::bigint, COALESCE(p.paid_at,0)::bigint,
+                  COALESCE(u.premium_expiry,0)::bigint,
+                  COALESCE(NULLIF(p.paid_at,0),p.created_at)::bigint
            FROM tap_subscription_payments p
            LEFT JOIN users u ON LOWER(u.email)=LOWER(p.user_email)
-           ORDER BY p.created_at DESC LIMIT $1`,
-          [limit]
-        ),
-      ]);
-      const records = [...fatora.rows, ...tap.rows]
-        .sort((a, b) => Number(b.created_at) - Number(a.created_at))
-        .slice(0, limit)
-        .map((row) => ({
+         )
+         SELECT *, COUNT(*) OVER()::bigint AS total_count
+         FROM all_invoices
+         WHERE ($1::bigint IS NULL OR occurred_at >= $1)
+           AND ($2::bigint IS NULL OR occurred_at < $2)
+           AND ($3::text = '' OR POSITION(LOWER($3) IN LOWER(COALESCE(order_id,''))) > 0)
+           AND ($4::boolean = false OR LOWER(COALESCE(status,'')) = 'paid')
+         ORDER BY occurred_at DESC, order_id DESC
+         LIMIT $5 OFFSET $6`,
+        [from, to, invoice, paidOnly, limit, offset]
+      );
+      const records = result.rows.map((row) => ({
           id: String(row.order_id || ""),
           orderId: String(row.order_id || ""),
           provider: String(row.provider || ""),
@@ -4350,11 +4373,16 @@ app.get("/api/print-center/data", async (req, res) => {
           transactionId: String(row.transaction_id || ""),
           createdAt: Number(row.created_at) || 0,
           paidAt: Number(row.paid_at) || 0,
+          occurredAt: Number(row.occurred_at) || 0,
           premiumExpiry: Number(row.premium_expiry) || 0,
           isActive: Number(row.premium_expiry) > now,
         }));
+      const totalCount = result.rows.length ? Number(result.rows[0].total_count) || 0 : 0;
       res.set("Cache-Control", "no-store");
-      return res.json({ ok: true, type, generatedAt: now, records });
+      return res.json({
+        ok: true, type, generatedAt: now, records, totalCount, offset,
+        limit, hasMore: offset + records.length < totalCount,
+      });
     }
 
     if (type === "subscriptions") {
