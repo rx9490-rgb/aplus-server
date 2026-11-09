@@ -573,13 +573,32 @@ async function initDB() {
       id BIGSERIAL PRIMARY KEY,
       visitor_id TEXT NOT NULL,
       service_id TEXT NOT NULL,
-      event_type TEXT NOT NULL CHECK (event_type IN ('open','request')),
-      happened_at BIGINT NOT NULL
+      event_type TEXT NOT NULL CHECK (event_type IN ('open','request','interaction')),
+      happened_at BIGINT NOT NULL,
+      page_id TEXT NOT NULL DEFAULT '',
+      page_title TEXT NOT NULL DEFAULT '',
+      source_host TEXT NOT NULL DEFAULT '',
+      device_type TEXT NOT NULL DEFAULT '',
+      browser TEXT NOT NULL DEFAULT '',
+      country_code TEXT NOT NULL DEFAULT '',
+      outcome TEXT NOT NULL DEFAULT '',
+      duration_ms INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS service_usage_events_time_idx
       ON service_usage_events(happened_at DESC);
     CREATE INDEX IF NOT EXISTS service_usage_events_service_time_idx
       ON service_usage_events(service_id,happened_at DESC);
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS page_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS page_title TEXT NOT NULL DEFAULT '';
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS source_host TEXT NOT NULL DEFAULT '';
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS device_type TEXT NOT NULL DEFAULT '';
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS browser TEXT NOT NULL DEFAULT '';
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS country_code TEXT NOT NULL DEFAULT '';
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS outcome TEXT NOT NULL DEFAULT '';
+    ALTER TABLE service_usage_events ADD COLUMN IF NOT EXISTS duration_ms INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE service_usage_events DROP CONSTRAINT IF EXISTS service_usage_events_event_type_check;
+    ALTER TABLE service_usage_events ADD CONSTRAINT service_usage_events_event_type_check
+      CHECK (event_type IN ('open','request','interaction'));
   `);
   await db.query(`
     ALTER TABLE admin_print_forms ADD COLUMN IF NOT EXISTS document_type TEXT NOT NULL DEFAULT 'إجراء إداري';
@@ -756,7 +775,7 @@ function moderatorPermissionForRequest(req) {
   if (/^\/api\/ads(?:\/|$)/.test(path)) return "canManageAds";
   if (/^\/api\/feedback\/list$/.test(path) || /^\/api\/feedback\/[^/]+(?:\/read)?$/.test(path)) return "canViewFeedback";
   if (path === "/api/stats") return "canViewStats";
-  if (path === "/api/admin/service-analytics") return "canViewStats";
+  if (/^\/api\/admin\/service-analytics(?:\/|$)/.test(path)) return "canViewStats";
   if (path === "/api/admin/reports") return ["canViewReports", "canViewStats"];
   if (path === "/api/admin/audit-log") return "canViewAuditLog";
   if (path === "/api/admin/finance/summary" && method === "GET") return ["canViewFinance", "canManageFinance"];
@@ -4510,7 +4529,7 @@ function visitorDevice(req) {
 }
 
 async function expireLiveVisitors(now = Date.now()) {
-  await db.query(
+  const expired = await db.query(
     `WITH stale AS (
        DELETE FROM live_visitors WHERE last_seen<$1
        RETURNING visitor_id,page_id,page_title,source_host,device_type,browser,country_code
@@ -4520,6 +4539,9 @@ async function expireLiveVisitors(now = Date.now()) {
      SELECT visitor_id,'exit',page_id,page_title,source_host,device_type,browser,country_code,$2 FROM stale`,
     [now - 90_000, now]
   );
+  if (expired.rowCount) {
+    broadcastAdminEvent({ type: "service_analytics_update", eventType: "exit", happenedAt: now });
+  }
 }
 
 app.post("/api/track/visit", async (req, res) => {
@@ -4608,17 +4630,18 @@ app.post("/api/visitors/ping", async (req, res) => {
       const serviceId = ANALYTICS_PAGE_SERVICES[pageId];
       if (serviceId) {
         await db.query(
-          `INSERT INTO service_usage_events(visitor_id,service_id,event_type,happened_at)
-           VALUES($1,$2,'open',$3)`,
-          [visitorId, serviceId, now]
+          `INSERT INTO service_usage_events
+             (visitor_id,service_id,event_type,happened_at,page_id,page_title,source_host,device_type,browser,country_code)
+           VALUES($1,$2,'open',$3,$4,$5,$6,$7,$8,$9)`,
+          [visitorId, serviceId, now, pageId, pageTitle, sourceHost, deviceType, browser, countryCode]
         );
-        broadcastAdminEvent({ type: "service_analytics_update", serviceId, happenedAt: now });
       }
+      broadcastAdminEvent({ type: "service_analytics_update", serviceId: serviceId || "", eventType, pageId, happenedAt: now });
       broadcastAdminEvent({ type: "live_visitor_update", action: eventType, pageTitle, happenedAt: now });
     }
     if (now - lastVisitorCleanupAt > 300_000) {
       lastVisitorCleanupAt = now;
-      void db.query("DELETE FROM visitor_activity WHERE happened_at<$1", [now - 7 * 86_400_000]).catch(() => {});
+      void db.query("DELETE FROM visitor_activity WHERE happened_at<$1", [now - 90 * 86_400_000]).catch(() => {});
       void db.query("DELETE FROM service_usage_events WHERE happened_at<$1", [now - 90 * 86_400_000]).catch(() => {});
       void expireLiveVisitors(now).catch(() => {});
       void db.query("DELETE FROM visitor_daily_sessions WHERE day<CURRENT_DATE-90").catch(() => {});
@@ -4645,6 +4668,7 @@ app.post("/api/visitors/leave", express.text({ type: "text/plain", limit: "2kb" 
          VALUES($1,'exit',$2,$3,$4,$5,$6,$7,$8)`,
         [visitorId, row.page_id, row.page_title, row.source_host, row.device_type, row.browser, row.country_code, now]
       );
+      broadcastAdminEvent({ type: "service_analytics_update", eventType: "exit", pageId: row.page_id, happenedAt: now });
       broadcastAdminEvent({ type: "live_visitor_update", action: "exit", happenedAt: now });
     }
     res.json({ ok: true });
@@ -4669,12 +4693,21 @@ app.post("/api/analytics/service-event", serviceAnalyticsTrackLimiter, async (re
       return res.status(400).json({ ok: false, error: "invalid_service_event" });
     }
     const happenedAt = Date.now();
+    const { pageId, pageTitle } = visitorPage(req.body || {});
+    const { deviceType, browser, countryCode } = visitorDevice(req);
+    const sourceHost = visitorSourceHost(req.body?.referrer || req.headers.referer || "");
+    const requestedOutcome = String(req.body?.outcome || "").trim().toLowerCase();
+    const outcome = ["success", "failure"].includes(requestedOutcome) ? requestedOutcome : "";
+    const requestedEventType = String(req.body?.eventType || "").trim().toLowerCase();
+    const eventType = requestedEventType === "interaction" ? "interaction" : "request";
+    const durationMs = Math.max(0, Math.min(600_000, Math.trunc(Number(req.body?.durationMs) || 0)));
     await db.query(
-      `INSERT INTO service_usage_events(visitor_id,service_id,event_type,happened_at)
-       VALUES($1,$2,'request',$3)`,
-      [visitorId, serviceId, happenedAt]
+      `INSERT INTO service_usage_events
+         (visitor_id,service_id,event_type,happened_at,page_id,page_title,source_host,device_type,browser,country_code,outcome,duration_ms)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [visitorId, serviceId, eventType, happenedAt, pageId, pageTitle, sourceHost, deviceType, browser, countryCode, outcome, durationMs]
     );
-    broadcastAdminEvent({ type: "service_analytics_update", serviceId, happenedAt });
+    broadcastAdminEvent({ type: "service_analytics_update", serviceId, eventType, outcome, happenedAt });
     res.set("Cache-Control", "no-store");
     res.status(202).json({ ok: true });
   } catch (error) {
@@ -4696,6 +4729,10 @@ app.get("/api/admin/service-analytics", async (req, res) => {
         `SELECT service_id,
                 COUNT(*) FILTER (WHERE event_type='open' AND happened_at >= $1)::int AS opens,
                 COUNT(*) FILTER (WHERE event_type='request' AND happened_at >= $1)::int AS requests,
+                COUNT(*) FILTER (WHERE event_type='interaction' AND happened_at >= $1)::int AS interactions,
+                COUNT(*) FILTER (WHERE event_type='request' AND outcome='success' AND happened_at >= $1)::int AS successful_requests,
+                COUNT(*) FILTER (WHERE event_type='request' AND outcome='failure' AND happened_at >= $1)::int AS failed_requests,
+                COALESCE(AVG(duration_ms) FILTER (WHERE event_type='request' AND outcome IN ('success','failure') AND happened_at >= $1),0)::int AS average_response_ms,
                 COUNT(DISTINCT visitor_id) FILTER (WHERE happened_at >= $1)::int AS visitors,
                 COUNT(*) FILTER (WHERE event_type='open' AND happened_at >= $2 AND happened_at < $1)::int AS previous_opens,
                 COUNT(*) FILTER (WHERE event_type='request' AND happened_at >= $2 AND happened_at < $1)::int AS previous_requests
@@ -4727,6 +4764,10 @@ app.get("/api/admin/service-analytics", async (req, res) => {
         visible: configured.visible !== false,
         opens: number(row, "opens"),
         requests: number(row, "requests"),
+        interactions: number(row, "interactions"),
+        successfulRequests: number(row, "successful_requests"),
+        failedRequests: number(row, "failed_requests"),
+        averageResponseMs: number(row, "average_response_ms"),
         visitors: number(row, "visitors"),
         previousOpens: number(row, "previous_opens"),
         previousRequests: number(row, "previous_requests"),
@@ -4734,19 +4775,128 @@ app.get("/api/admin/service-analytics", async (req, res) => {
     }).sort((a, b) => b.requests - a.requests || b.opens - a.opens || a.name.localeCompare(b.name, "ar"));
     const totalOpens = services.reduce((sum, item) => sum + item.opens, 0);
     const totalRequests = services.reduce((sum, item) => sum + item.requests, 0);
+    const totalInteractions = services.reduce((sum, item) => sum + item.interactions, 0);
     const totalVisitors = aggregate.rows.reduce((sum, row) => sum + number(row, "visitors"), 0);
+    const totalSuccessfulRequests = services.reduce((sum, item) => sum + item.successfulRequests, 0);
+    const totalFailedRequests = services.reduce((sum, item) => sum + item.failedRequests, 0);
+    const measuredRequests = totalSuccessfulRequests + totalFailedRequests;
+    const averageResponseMs = measuredRequests
+      ? Math.round(services.reduce((sum, item) => sum + item.averageResponseMs * (item.successfulRequests + item.failedRequests), 0) / measuredRequests)
+      : 0;
     res.set("Cache-Control", "no-store");
     return res.json({
       ok: true,
       generatedAt: now,
       days,
       retentionDays: 90,
-      totals: { opens: totalOpens, requests: totalRequests, serviceVisitors: totalVisitors },
+      totals: {
+        opens: totalOpens,
+        requests: totalRequests,
+        interactions: totalInteractions,
+        successfulRequests: totalSuccessfulRequests,
+        failedRequests: totalFailedRequests,
+        averageResponseMs,
+        serviceVisitors: totalVisitors,
+      },
       services,
     });
   } catch (error) {
     console.error("service analytics fetch failed:", error?.message || error);
     return res.status(500).json({ ok: false, error: "service_analytics_failed" });
+  }
+});
+
+app.get("/api/admin/service-analytics/events", async (req, res) => {
+  try {
+    if (!(await isAdminRequest(req))) return res.status(403).json({ ok: false, error: "forbidden" });
+    const requestedDays = Number.parseInt(String(req.query.days || "7"), 10);
+    const days = [1, 7, 30, 90].includes(requestedDays) ? requestedDays : 7;
+    const requestedType = String(req.query.type || "").trim().toLowerCase();
+    const allowedTypes = new Set(["entry", "page", "exit", "open", "interaction", "request"]);
+    if (requestedType && !allowedTypes.has(requestedType)) {
+      return res.status(400).json({ ok: false, error: "invalid_event_type" });
+    }
+    const serviceId = String(req.query.serviceId || "").trim().toLowerCase();
+    if (serviceId && !ANALYTICS_SERVICE_IDS.has(serviceId)) {
+      return res.status(400).json({ ok: false, error: "invalid_service_id" });
+    }
+    const query = String(req.query.q || "").trim().slice(0, 100);
+    const requestedLimit = Number.parseInt(String(req.query.limit || "50"), 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(200, Math.max(1, requestedLimit)) : 50;
+    const requestedOffset = Number.parseInt(String(req.query.offset || "0"), 10);
+    const offset = Number.isFinite(requestedOffset) ? Math.min(200_000, Math.max(0, requestedOffset)) : 0;
+    const since = Date.now() - days * 86_400_000;
+    const pageServiceCase = `CASE page_id ${
+      Object.entries(ANALYTICS_PAGE_SERVICES)
+        .map(([pageId, mappedService]) => `WHEN '${pageId}' THEN '${mappedService}'`)
+        .join(" ")
+    } ELSE '' END`;
+    const eventCte = `
+      WITH events AS (
+        SELECT ('visit-' || id::TEXT) AS id, visitor_id, event_type, page_id, page_title,
+               source_host, device_type, browser, country_code, happened_at,
+               ${pageServiceCase} AS service_id, ''::TEXT AS outcome, 0::INTEGER AS duration_ms
+        FROM visitor_activity WHERE happened_at >= $1
+        UNION ALL
+        SELECT ('service-' || id::TEXT) AS id, visitor_id, event_type, page_id, page_title,
+               source_host, device_type, browser, country_code, happened_at,
+               service_id, outcome, duration_ms
+        FROM service_usage_events WHERE happened_at >= $1
+      )
+    `;
+    const where = `($2::TEXT = '' OR event_type = $2)
+      AND ($3::TEXT = '' OR service_id = $3)
+      AND ($4::TEXT = '' OR CONCAT_WS(' ', visitor_id, RIGHT(visitor_id,6), page_id, page_title,
+            source_host, device_type, browser, country_code, service_id, outcome) ILIKE $4)`;
+    const values = [since, requestedType, serviceId, query ? `%${query}%` : ""];
+    const [eventsResult, countResult] = await Promise.all([
+      db.query(
+        `${eventCte}
+         SELECT id,visitor_id,event_type,page_id,page_title,source_host,device_type,browser,country_code,
+                happened_at,service_id,outcome,duration_ms
+         FROM events WHERE ${where}
+         ORDER BY happened_at DESC,id DESC
+         LIMIT $5 OFFSET $6`,
+        [...values, limit, offset]
+      ),
+      db.query(`${eventCte} SELECT COUNT(*)::INTEGER AS total FROM events WHERE ${where}`, values),
+    ]);
+    const total = Math.max(0, Number(countResult.rows[0]?.total) || 0);
+    const visitorKey = (value) => String(value || "").slice(-6);
+    const events = eventsResult.rows.map((row) => {
+      const mappedService = row.service_id || ANALYTICS_PAGE_SERVICES[row.page_id] || "";
+      return {
+        id: row.id,
+        visitorKey: visitorKey(row.visitor_id),
+        eventType: row.event_type,
+        serviceId: mappedService,
+        serviceName: ANALYTICS_SERVICE_LABELS[mappedService] || row.page_title || row.page_id || "—",
+        pageId: row.page_id || "",
+        pageTitle: row.page_title || row.page_id || "",
+        sourceHost: row.source_host || "",
+        device: row.device_type || "",
+        browser: row.browser || "",
+        countryCode: row.country_code || "",
+        outcome: row.outcome || "",
+        durationMs: Math.max(0, Number(row.duration_ms) || 0),
+        happenedAt: Number(row.happened_at) || 0,
+      };
+    });
+    res.set("Cache-Control", "no-store");
+    res.json({
+      ok: true,
+      generatedAt: Date.now(),
+      days,
+      retentionDays: 90,
+      total,
+      offset,
+      limit,
+      hasMore: offset + events.length < total,
+      events,
+    });
+  } catch (error) {
+    console.error("service analytics events fetch failed:", error?.message || error);
+    res.status(500).json({ ok: false, error: "service_analytics_events_failed" });
   }
 });
 
