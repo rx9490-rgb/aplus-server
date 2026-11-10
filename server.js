@@ -194,6 +194,7 @@ async function initDB() {
       item_type  TEXT NOT NULL,
       title      TEXT NOT NULL DEFAULT '',
       content    TEXT NOT NULL DEFAULT '',
+      rendered_html TEXT NOT NULL DEFAULT '',
       metadata   JSONB NOT NULL DEFAULT '{}',
       created_at BIGINT NOT NULL,
       deleted_at BIGINT
@@ -691,6 +692,7 @@ async function initDB() {
     try { await db.query(sql); } catch {}
   }
   await db.query("ALTER TABLE academic_archive ADD COLUMN IF NOT EXISTS deleted_at BIGINT");
+  await db.query("ALTER TABLE academic_archive ADD COLUMN IF NOT EXISTS rendered_html TEXT NOT NULL DEFAULT ''");
   await db.query("ALTER TABLE community_blocks ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT ''");
   await db.query(
     "CREATE INDEX IF NOT EXISTS academic_archive_user_deleted_created_idx " +
@@ -2676,7 +2678,7 @@ app.get("/api/academic/archive/:id", async (req, res) => {
     }
     const id = String(req.params.id || "").slice(0, 64);
     const result = await db.query(
-      `SELECT id,item_type,title,content,metadata,created_at,deleted_at
+      `SELECT id,item_type,title,content,rendered_html,metadata,created_at,deleted_at
        FROM academic_archive
        WHERE id=$1 AND user_email=$2
        LIMIT 1`,
@@ -2713,11 +2715,14 @@ app.post("/api/academic/archive", async (req, res) => {
     const content = String(body.content || "")
       .replace(/\u0000/g, "")
       .slice(0, 250000);
+    const renderedHtml = typeof body.renderedHtml === "string"
+      ? body.renderedHtml.slice(0, 200000)
+      : "";
     const metadata = body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
       ? body.metadata
       : {};
 
-    if (!allowedTypes.has(itemType) || !title || (!content && !Object.keys(metadata).length)) {
+    if (!allowedTypes.has(itemType) || !title || (!content && !renderedHtml && !Object.keys(metadata).length)) {
       return res.status(400).json({ ok: false, error: "archive_item_invalid" });
     }
     if (Buffer.byteLength(JSON.stringify(metadata), "utf8") > 12000) {
@@ -2728,9 +2733,9 @@ app.post("/api/academic/archive", async (req, res) => {
     const createdAt = Date.now();
     await db.query(
       `INSERT INTO academic_archive
-         (id,user_email,item_type,title,content,metadata,created_at,deleted_at)
-       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,NULL)`,
-      [id, user.email, itemType, title, content, JSON.stringify(metadata), createdAt]
+         (id,user_email,item_type,title,content,rendered_html,metadata,created_at,deleted_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,NULL)`,
+      [id, user.email, itemType, title, content, renderedHtml, JSON.stringify(metadata), createdAt]
     );
     res.status(201).json({
       ok: true,
